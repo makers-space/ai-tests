@@ -1121,6 +1121,22 @@ describe('Model endpoints', () => {
             expect(verdict('qwen3-coder:30b')).toBe('mixed');
             expect(verdict('llama3.3:70b')).toBe('too_large');
             expect(response.data.models.slice(0, 3).map((model) => model.pick)).toEqual(['fast', 'balanced', 'best']);
+            expect(response.data.reserved).toEqual({ gpuMemoryMb: 1536, memoryMb: 4096 });
+            expect(response.data.notes.join(' ')).toMatch(/mixture-of-experts/);
+            expect(response.data.notes.join(' ')).not.toMatch(/two 7 to 8B/);
+        });
+
+        test('explains what the specs mean: two models at once, no graphics card, nothing fits', async () => {
+            signOut();
+            const notes = async (query) => (await get(`/catalogue?${query}`)).data.notes.join(' ');
+            expect(await notes('memoryMb=65536&gpuMemoryMb=24576')).toMatch(/two 7 to 8B models at once/);
+            const noCard = await get('/catalogue?memoryMb=16384&gpuMemoryMb=0');
+            expect(noCard.data.notes.join(' ')).toMatch(/No graphics card/);
+            expect(noCard.data.models.filter((model) => model.fit.fits).every((model) => model.fit.verdict === 'cpu')).toBe(true);
+            const small = await get('/catalogue?memoryMb=8192&gpuMemoryMb=4096');
+            expect(small.data.models.some((model) => model.pick)).toBe(true);
+            expect(await notes('memoryMb=1024&gpuMemoryMb=0')).toMatch(/None of the listed models fits/);
+            expect((await get('/catalogue')).data.notes).toEqual([]);
         });
 
         test('rejects nonsense specs', async () => {
