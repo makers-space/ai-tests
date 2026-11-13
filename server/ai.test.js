@@ -1,4 +1,6 @@
 import fs from 'node:fs';
+import { createRequire } from 'node:module';
+import { Readable } from 'node:stream';
 import { describe, test, expect, beforeAll, afterAll, beforeEach } from 'vitest';
 import TestStartup from '../utils/test.startup.js';
 import { ROLES, RIGHTS, hasRight } from '../../server/config/rights.js';
@@ -6,10 +8,12 @@ import {
     setOllamaClientFactory, resetOllamaClientFactory, createOllamaClient,
     mapOllamaError, OllamaError, ERROR_CODES,
     parseNvidiaSmi, detectHardware,
-    fitModel, rankCatalogue, memoryNeededMb, VERDICTS
+    fitModel, rankCatalogue, memoryNeededMb, VERDICTS,
+    GenerationQueue, extractText, estimateTokens, setFilesFetch, MAX_ATTACHMENT_BYTES,
+    isPublicAddress, setRemoteTransport, MAX_REMOTE_BYTES, setSearchFetch
 } from '../../server/middleware/ai.middleware.js';
-import { Device, Setting, Download, PersonalModel, deviceSchemas, modelSchemas } from '../../server/models/ai.model.js';
-import { downloads, health } from '../../server/controllers/ai.controller.js';
+import { Device, Setting, Download, PersonalModel, Chat, Prompt, deviceSchemas, modelSchemas, chatSchemas, promptSchemas } from '../../server/models/ai.model.js';
+import { downloads, health, queue, COMPONENT_GUIDE, SEARCH_GUIDE, PLAN_GUIDE, RESULTS_GUIDE, REVIEW_GUIDE, writtenToolCalls } from '../../server/controllers/ai.controller.js';
 
 const MB = 1024 * 1024;
 
@@ -497,8 +501,79 @@ const resetState = () => {
         pullFailsMidway: false,
         hold: null,
         stall: false,
-        silent: false
+        silent: false,
+        chatReply: 'A short answer',
+        chatCalls: [],
+        guidesSeen: 0,
+        toolPlan: [],
+        toolsAsText: false,
+        plan: { searches: [] },
+        planCalls: [],
+        planAborted: 0,
+        searchRequests: [],
+        reviews: [],
+        reviewCalls: [],
+        freshResults: false,
+        enginesLimited: false,
+        junkResults: false,
+        planHold: false,
+        searches: [],
+        fetches: [],
+        searchFails: false,
+        searchStatus: null,
+        searchUrls: [],
+        searchGuides: 0,
+        noTools: false,
+        chatAborted: 0,
+        chatHold: false,
+        chatError: null,
+        chatFailsMidway: false,
+        thinkingModel: false,
+        contextLength: 32768,
+        filesDown: false
     });
+};
+
+const fakeChat = (request) => {
+    let aborted = false;
+    let wake = () => {};
+    const check = () => {
+        if (aborted) throw Object.assign(new Error('The operation was aborted'), { name: 'AbortError' });
+    };
+    const pause = (ms) => new Promise((resolve) => {
+        wake = resolve;
+        setTimeout(resolve, ms);
+    });
+    const words = state.chatReply.split(' ');
+
+    return {
+        abort() {
+            if (!aborted) state.chatAborted += 1;
+            aborted = true;
+            wake();
+        },
+        async *[Symbol.asyncIterator]() {
+            if (request.think) yield { message: { role: 'assistant', content: '', thinking: 'Let me consider this.' } };
+            for (let index = 0; index < words.length; index++) {
+                await pause(2);
+                check();
+                yield { message: { role: 'assistant', content: index < words.length - 1 ? `${words[index]} ` : words[index] } };
+                if (state.chatFailsMidway) throw refused();
+                while (state.chatHold) {
+                    await pause(10);
+                    check();
+                }
+            }
+            yield {
+                message: { role: 'assistant', content: '' },
+                done: true,
+                eval_count: words.length,
+                prompt_eval_count: 20,
+                total_duration: 2e9,
+                eval_duration: 1e9
+            };
+        }
+    };
 };
 
 const fakePull = (model) => {
@@ -567,8 +642,8 @@ const fakeOllama = () => ({
             modelfile: `FROM ${model}`,
             parameters: 'temperature 0.7',
             template: '{{ .Prompt }}',
-            capabilities: ['completion', 'tools'],
-            model_info: { 'testfam.context_length': 32768 },
+            capabilities: state.noTools ? ['completion'] : state.thinkingModel ? ['completion', 'tools', 'thinking'] : ['completion', 'tools'],
+            model_info: { 'testfam.context_length': state.contextLength },
             details: { family: 'testfam' }
         };
     },
@@ -583,10 +658,75 @@ const fakeOllama = () => ({
         state.models.push(installed(`${request.model}:latest`, 1));
         return { status: 'success' };
     },
-    generate: async ({ model, keep_alive }) => {
+    generate: async ({ model, keep_alive, options }) => {
         if (!state.models.some((existing) => existing.name === model)) throw notFound(model);
-        state.unloaded.push({ model, keep_alive });
+        state.unloaded.push(options ? { model, keep_alive, num_ctx: options.num_ctx } : { model, keep_alive });
         return { done: true };
+    },
+    chat: async (request) => {
+        if (!state.up) throw refused();
+        if (!state.models.some((existing) => existing.name === request.model)) throw notFound(request.model);
+        const lead = request.messages[0];
+        if (lead?.role === 'system' && lead.content.startsWith(COMPONENT_GUIDE)) {
+            state.guidesSeen += 1;
+            let own = lead.content.slice(COMPONENT_GUIDE.length).replace(/^\n\n/, '');
+            if (own.endsWith(SEARCH_GUIDE)) {
+                state.searchGuides += 1;
+                own = own.slice(0, own.length - SEARCH_GUIDE.length).replace(/\n\n$/, '');
+            }
+            request = { ...request, messages: own ? [{ role: 'system', content: own }, ...request.messages.slice(1)] : request.messages.slice(1) };
+        }
+        state.chatCalls.push(request);
+        if (state.chatError) throw Object.assign(new Error(state.chatError), { error: state.chatError });
+        if (request.format) {
+            const answer = (content) => {
+                const result = { message: { role: 'assistant', content }, done: true };
+                if (request.stream === false) return result;
+                let aborted = false;
+                return {
+                    abort() {
+                        aborted = true;
+                        state.planAborted += 1;
+                    },
+                    async *[Symbol.asyncIterator]() {
+                        while (state.planHold && !aborted) await new Promise((resolve) => setTimeout(resolve, 10));
+                        if (aborted) throw Object.assign(new Error('aborted'), { name: 'AbortError' });
+                        yield result;
+                    }
+                };
+            };
+            state.chatCalls.pop();
+            if (request.format.properties?.enough) {
+                state.reviewCalls.push(request);
+                const review = state.reviews.shift() ?? { enough: true, searches: [], pages: [] };
+                return answer(typeof review === 'string' ? review : JSON.stringify(review));
+            }
+            state.planCalls.push(request);
+            return answer(typeof state.plan === 'string' ? state.plan : JSON.stringify(state.plan));
+        }
+        if (request.stream === false) return { message: { role: 'assistant', content: state.chatReply }, done: true };
+        if (request.tools && state.toolPlan.length > 0) {
+            const calls = state.toolPlan.shift().map(([name, args]) => ({ function: { name, arguments: args } }));
+            if (state.toolsAsText) {
+                const text = calls.map((call) => JSON.stringify({ name: call.function.name, arguments: call.function.arguments })).join('\n');
+                return {
+                    abort() {},
+                    async *[Symbol.asyncIterator]() {
+                        yield { message: { role: 'assistant', content: text.slice(0, 20) } };
+                        yield { message: { role: 'assistant', content: text.slice(20) } };
+                        yield { message: { role: 'assistant', content: '' }, done: true, eval_count: 3, prompt_eval_count: 20, total_duration: 2e8, eval_duration: 1e8 };
+                    }
+                };
+            }
+            return {
+                abort() {},
+                async *[Symbol.asyncIterator]() {
+                    yield { message: { role: 'assistant', content: '', tool_calls: calls } };
+                    yield { message: { role: 'assistant', content: '' }, done: true, eval_count: 3, prompt_eval_count: 20, total_duration: 2e8, eval_duration: 1e8 };
+                }
+            };
+        }
+        return fakeChat(request);
     },
     pull: async ({ model }) => {
         if (!state.up) throw refused();
@@ -905,6 +1045,33 @@ describe('Model endpoints', () => {
             expect(mine).toMatchObject({ personal: true, displayName: 'Careful reviewer', basedOn: 'qwen2.5-coder:7b' });
             const base = list.data.models.find((model) => model.name === 'qwen2.5-coder:7b');
             expect(base.usedBy).toEqual(['Careful reviewer']);
+        });
+
+        test('a personal model shows its instructions and can be edited', async () => {
+            await testStartup.loginAsUser('admin');
+            await post('/models/create', careful);
+            const before = (await get('/models')).data.models.find((model) => model.name === 'careful-reviewer:latest');
+            expect(before).toMatchObject({ system: 'Check the work for mistakes.', parameters: { temperature: 0.2 } });
+            expect((await get('/models')).data.models.find((model) => model.name === 'qwen2.5-coder:7b')).toMatchObject({ system: null, parameters: null });
+
+            const response = await post('/models/update', {
+                name: 'careful-reviewer:latest', displayName: 'Very careful reviewer', system: 'Check twice.', parameters: { temperature: 0.7, num_ctx: 4096 }
+            });
+            expect(response.status).toBe(200);
+            expect(state.created[1]).toMatchObject({
+                model: 'careful-reviewer', from: 'qwen2.5-coder:7b', system: 'Check twice.', parameters: { temperature: 0.7, num_ctx: 4096 }, stream: false
+            });
+            const after = (await get('/models')).data.models.find((model) => model.name === 'careful-reviewer:latest');
+            expect(after).toMatchObject({ displayName: 'Very careful reviewer', basedOn: 'qwen2.5-coder:7b', system: 'Check twice.', parameters: { temperature: 0.7, num_ctx: 4096 } });
+
+            expect((await post('/models/update', { name: 'qwen2.5-coder:7b', system: 'x' })).status).toBe(404);
+            expect((await post('/models/update', { name: 'careful-reviewer', from: 'missing:7b' })).status).toBe(404);
+            expect((await post('/models/update', { name: 'careful-reviewer', from: 'careful-reviewer' })).status).toBe(404);
+            expect((await post('/models/update', { name: 'careful-reviewer' })).status).toBe(400);
+            expect(state.created).toHaveLength(2);
+
+            await testStartup.loginAsUser('user');
+            expect((await post('/models/update', { name: 'careful-reviewer', system: 'x' })).status).toBe(403);
         });
 
         test('refuses a name that is already taken', async () => {
@@ -1384,6 +1551,7 @@ describe('Model endpoints', () => {
             await testStartup.loginAsUser('admin');
             const first = (await post('/models/pull', { name: 'llama3.2:3b' })).data.download;
             await finished(first.id);
+            expect(await downloads.idle()).toBe(true);
             const old = await Download.create([
                 { model: 'llama3.2:3b', status: 'failed', errorCode: 'OLLAMA_DOWN', requestedBy: first.requestedBy },
                 { model: 'llama3.2:3b', status: 'failed', errorCode: 'DOWNLOAD_INTERRUPTED', requestedBy: first.requestedBy },
@@ -1448,5 +1616,1839 @@ describe('Model endpoints', () => {
             state.hold = null;
             await finished(job.id);
         });
+    });
+});
+
+describe('Generation queue', () => {
+    const gate = () => {
+        let open;
+        const waiting = new Promise((resolve) => {
+            open = resolve;
+        });
+        return { open, waiting };
+    };
+    const settle = () => new Promise((resolve) => setTimeout(resolve, 20));
+
+    test('runs one job at a time by default and reports the place in line', async () => {
+        const line = new GenerationQueue();
+        const first = gate();
+        const ran = [];
+        const a = line.add({ userId: 'u1', run: async () => { ran.push('a'); await first.waiting; return 'A'; } });
+        const b = line.add({ userId: 'u2', run: async () => { ran.push('b'); return 'B'; } });
+        await settle();
+
+        expect(ran).toEqual(['a']);
+        expect(a.ahead()).toBe(0);
+        expect(b.ahead()).toBe(1);
+
+        first.open();
+        expect(await a.done).toBe('A');
+        expect(await b.done).toBe('B');
+    });
+
+    test('runs chat ahead of background work', async () => {
+        const line = new GenerationQueue();
+        const first = gate();
+        const ran = [];
+        line.add({ userId: 'u1', run: () => first.waiting });
+        await settle();
+        const background = line.add({ userId: 'u1', priority: 'background', run: async () => ran.push('background') });
+        const chat = line.add({ userId: 'u2', priority: 'interactive', run: async () => ran.push('chat') });
+
+        expect(chat.ahead()).toBe(1);
+        expect(background.ahead()).toBe(2);
+        first.open();
+        await Promise.all([background.done, chat.done]);
+        expect(ran).toEqual(['chat', 'background']);
+    });
+
+    test('alternates between two users', async () => {
+        const line = new GenerationQueue();
+        const first = gate();
+        const ran = [];
+        line.add({ userId: 'blocker', run: () => first.waiting });
+        await settle();
+        const jobs = [
+            line.add({ userId: 'a', run: async () => ran.push('a1') }),
+            line.add({ userId: 'a', run: async () => ran.push('a2') }),
+            line.add({ userId: 'a', run: async () => ran.push('a3') }),
+            line.add({ userId: 'b', run: async () => ran.push('b1') }),
+            line.add({ userId: 'b', run: async () => ran.push('b2') })
+        ];
+        first.open();
+        await Promise.all(jobs.map((job) => job.done));
+        expect(ran).toEqual(['a1', 'b1', 'a2', 'b2', 'a3']);
+    });
+
+    test('refuses a sixth waiting job from one user, but not from another', async () => {
+        const line = new GenerationQueue();
+        const first = gate();
+        line.add({ userId: 'a', run: () => first.waiting });
+        await settle();
+        for (let count = 0; count < 5; count++) line.add({ userId: 'a', run: async () => {} });
+
+        expect(() => line.add({ userId: 'a', run: async () => {} })).toThrow(OllamaError);
+        try {
+            line.add({ userId: 'a', run: async () => {} });
+        } catch (error) {
+            expect(error.code).toBe('QUEUE_FULL');
+            expect(error.status).toBe(429);
+        }
+        expect(() => line.add({ userId: 'b', run: async () => {} })).not.toThrow();
+        first.open();
+    });
+
+    test('runs several at once when allowed', async () => {
+        const line = new GenerationQueue({ maxConcurrent: 2 });
+        const first = gate();
+        const ran = [];
+        line.add({ userId: 'a', run: async () => { ran.push('a'); await first.waiting; } });
+        line.add({ userId: 'b', run: async () => { ran.push('b'); await first.waiting; } });
+        const third = line.add({ userId: 'c', run: async () => ran.push('c') });
+        await settle();
+        expect(ran).toEqual(['a', 'b']);
+        expect(third.ahead()).toBe(2);
+        first.open();
+        await third.done;
+    });
+
+    test('a cancelled job never runs, and a failed job does not block the next', async () => {
+        const line = new GenerationQueue();
+        const first = gate();
+        const ran = [];
+        line.add({ userId: 'a', run: () => first.waiting });
+        await settle();
+        const dropped = line.add({ userId: 'b', run: async () => ran.push('dropped') });
+        const failing = line.add({ userId: 'c', run: async () => { throw new Error('boom'); } });
+        const last = line.add({ userId: 'd', run: async () => ran.push('last') });
+
+        expect(dropped.cancel()).toBe(true);
+        expect(await dropped.done).toBeNull();
+        first.open();
+        await expect(failing.done).rejects.toThrow('boom');
+        await last.done;
+        expect(ran).toEqual(['last']);
+    });
+});
+
+const serverRequire = createRequire(new URL('../../server/package.json', import.meta.url));
+
+const makePdf = (text) => {
+    const stream = `BT /F1 12 Tf 72 720 Td (${text}) Tj ET`;
+    const objects = [
+        '<< /Type /Catalog /Pages 2 0 R >>',
+        '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+        '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>',
+        `<< /Length ${stream.length} >>\nstream\n${stream}\nendstream`,
+        '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>'
+    ];
+    let body = '%PDF-1.4\n';
+    const offsets = [];
+    objects.forEach((object, index) => {
+        offsets.push(body.length);
+        body += `${index + 1} 0 obj\n${object}\nendobj\n`;
+    });
+    const xref = body.length;
+    body += `xref\n0 ${objects.length + 1}\n0000000000 65535 f \n`;
+    offsets.forEach((offset) => {
+        body += `${String(offset).padStart(10, '0')} 00000 n \n`;
+    });
+    body += `trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF\n`;
+    return Buffer.from(body, 'latin1');
+};
+
+const makeDocx = async (text) => {
+    const JSZip = serverRequire('jszip');
+    const zip = new JSZip();
+    zip.file('[Content_Types].xml', '<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>');
+    zip.file('_rels/.rels', '<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>');
+    zip.file('word/document.xml', `<?xml version="1.0" encoding="UTF-8"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>${text}</w:t></w:r></w:p></w:body></w:document>`);
+    return zip.generateAsync({ type: 'nodebuffer' });
+};
+
+describe('Reading text from documents', () => {
+    test.each([
+        ['notes.txt', 'Plain notes about the harbour survey.'],
+        ['notes.md', '# Survey\n\nThe **harbour** is deep.'],
+        ['figures.csv', 'port,depth\nHarwich,12\nDover,9']
+    ])('reads %s as it is', async (name, content) => {
+        expect(await extractText({ buffer: Buffer.from(content), name })).toBe(content);
+    });
+
+    test('reads the text of a PDF', async () => {
+        const text = await extractText({ buffer: makePdf('The quarterly harbour report'), name: 'report.pdf' });
+        expect(text).toContain('The quarterly harbour report');
+    });
+
+    test('reads the text of a Word file', async () => {
+        const text = await extractText({ buffer: await makeDocx('Minutes of the harbour board'), name: 'minutes.docx' });
+        expect(text).toContain('Minutes of the harbour board');
+    });
+
+    test('removes a byte order mark and Windows line endings', async () => {
+        const text = await extractText({ buffer: Buffer.from('﻿one\r\ntwo'), name: 'a.txt' });
+        expect(text).toBe('one\ntwo');
+    });
+
+    test.each([
+        ['photo.png', Buffer.from([0x89, 0x50, 0x4e, 0x47, 0, 0, 0, 13, 0, 1, 2, 3])],
+        ['clip.mp4', Buffer.from([0, 0, 0, 24, 0x66, 0x74, 0x79, 0x70, 0, 0, 0, 0])],
+        ['old.doc', Buffer.from('looks like text but is an old Word file')],
+        ['broken.pdf', Buffer.from('this is not a pdf at all')],
+        ['empty.txt', Buffer.from('   \n  ')]
+    ])('refuses %s in plain words', async (name, buffer) => {
+        await expect(extractText({ buffer, name })).rejects.toMatchObject({ code: 'FILE_UNREADABLE', status: 415 });
+    });
+
+    test('refuses a file over 20 MB', async () => {
+        const buffer = Buffer.alloc(MAX_ATTACHMENT_BYTES + 1, 'a');
+        await expect(extractText({ buffer, name: 'huge.txt' })).rejects.toMatchObject({ code: 'FILE_TOO_LARGE', status: 413 });
+    });
+
+    test('estimates tokens from length', () => {
+        expect(estimateTokens('')).toBe(0);
+        expect(estimateTokens('abcd')).toBe(1);
+        expect(estimateTokens('a'.repeat(4001))).toBe(1001);
+    });
+});
+
+describe('Chat validation', () => {
+    const ok = (schema, value) => expect(schema.validate(value).error).toBeUndefined();
+    const bad = (schema, value) => expect(schema.validate(value).error).toBeDefined();
+
+    test('a message is 1 to 100,000 characters', () => {
+        ok(chatSchemas.send, { content: 'hello' });
+        ok(chatSchemas.send, { content: 'a'.repeat(100000) });
+        bad(chatSchemas.send, { content: '' });
+        bad(chatSchemas.send, { content: 'a'.repeat(100001) });
+        bad(chatSchemas.send, {});
+    });
+
+    test('regenerate and edit are checked', () => {
+        ok(chatSchemas.send, { regenerate: true });
+        ok(chatSchemas.send, { content: 'again', editIndex: 0 });
+        bad(chatSchemas.send, { regenerate: true, content: 'x' });
+        bad(chatSchemas.send, { content: 'x', editIndex: -1 });
+        bad(chatSchemas.send, { content: 'x', editIndex: 200 });
+        bad(chatSchemas.send, { content: 'x', role: 'system' });
+    });
+
+    test('generation options stay inside their ranges', () => {
+        ok(chatSchemas.create, { options: { temperature: 0, num_ctx: 512 } });
+        ok(chatSchemas.create, { options: { temperature: 2, num_ctx: 262144, top_p: 1, top_k: 500, repeat_penalty: 5, num_predict: -1 } });
+        for (const options of [{ temperature: 2.1 }, { temperature: -1 }, { num_ctx: 511 }, { num_ctx: 262145 }, { top_p: 1.1 }, { top_k: 501 }, { num_predict: 100001 }, { made_up: 1 }]) {
+            bad(chatSchemas.create, { options });
+        }
+    });
+
+    test('titles, instructions and file paths are limited', () => {
+        ok(chatSchemas.update, { title: 'Plan' });
+        bad(chatSchemas.update, {});
+        bad(chatSchemas.update, { title: 'a'.repeat(121) });
+        bad(chatSchemas.update, { system: 'a'.repeat(100001) });
+        ok(chatSchemas.attachFile, { path: '/docs/a.md' });
+        for (const path of ['docs/a.md', '/docs//a.md', '', `/${'a'.repeat(1000)}`]) bad(chatSchemas.attachFile, { path });
+        bad(chatSchemas.fileSave, { folder: '/docs', name: 'a/b.md', content: 'x' });
+        ok(chatSchemas.fileSave, { folder: '/docs', name: 'chat.md', content: 'x' });
+    });
+});
+
+describe('Chat endpoints', () => {
+    const post = (path, body, config) => client.post(`/api/v1${path}`, body, config);
+    const get = (path) => client.get(`/api/v1${path}`);
+    const patch = (path, body) => client.patch(`/api/v1${path}`, body);
+    const remove = (path) => client.delete(`/api/v1${path}`);
+    const events = (response) => String(response.data).trim().split('\n').map((line) => JSON.parse(line));
+    const newChat = async (body = {}) => (await post('/chats', body)).data.chat;
+    const send = async (chatId, body) => {
+        const response = await post(`/chats/${chatId}/messages`, body, { responseType: 'text', transformResponse: [(data) => data] });
+        return { response, events: response.status === 200 ? events(response) : [] };
+    };
+    const upload = (chatId, name, buffer) => post(`/chats/${chatId}/attachments?name=${encodeURIComponent(name)}`, buffer, {
+        headers: { 'Content-Type': 'application/octet-stream' }
+    });
+    const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+    let filesCalls = [];
+    const fsFiles = {
+        '/docs/brief.md': { type: 'text', content: 'The client wants a harbour survey by June.' },
+        '/docs/report.pdf': { type: 'binary', bytes: makePdf('Dredging costs rose in March') },
+        '/docs/photo.png': { type: 'binary', bytes: Buffer.from([0x89, 0x50, 0x4e, 0x47, 0, 0, 0, 13, 0, 1, 2, 3]) }
+    };
+    const json = (status, body) => new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } });
+    const fakeFilesystemOne = async (url, options) => {
+        const cookie = options.headers.Cookie || '';
+        filesCalls.push({ url, method: options.method || 'GET', cookie, csrf: options.headers['X-CSRF-Token'], body: options.body });
+        if (state.filesDown) throw new TypeError('fetch failed');
+        const address = new URL(url);
+        if (address.pathname.endsWith('/directory/contents')) {
+            const folder = address.searchParams.get('filePath');
+            if ([...address.searchParams.keys()].join() !== 'filePath') return json(400, { success: false, message: 'Validation error' });
+            if (folder === '/private') return json(404, { success: false, message: 'Directory not found or access denied' });
+            return json(200, { success: true, contents: [
+                { fileName: 'brief.md', filePath: '/docs/brief.md', type: 'text', size: 42 },
+                { fileName: 'docs', filePath: '/docs', type: 'directory', size: 0 }
+            ] });
+        }
+        if ((options.method || 'GET') === 'POST') {
+            const body = JSON.parse(options.body);
+            if (body.filePath.startsWith('/locked')) return json(403, { success: false });
+            return json(201, { success: true, file: { id: 'f1', filePath: body.filePath, type: 'text' } });
+        }
+        const [, encoded, part] = address.pathname.match(/\/api\/v1\/files\/([^/]+)\/(content|download)$/) || [];
+        const file = fsFiles[decodeURIComponent(encoded || '')];
+        if (!file) return json(404, { success: false, message: 'File not found or access denied' });
+        if (part === 'content') return json(200, { success: true, fileType: file.type, content: file.type === 'text' ? file.content : { type: 'Buffer', data: [] } });
+        return new Response(file.bytes, { status: 200, headers: { 'Content-Length': String(file.bytes.length) } });
+    };
+
+    beforeAll(async () => {
+        resetState();
+        setOllamaClientFactory(fakeOllama);
+        setFilesFetch(fakeFilesystemOne);
+    });
+
+    afterAll(async () => {
+        state.chatHold = false;
+        setFilesFetch(null);
+        queue.maxConcurrent = 1;
+    });
+
+    beforeEach(async () => {
+        state.chatHold = false;
+        resetState();
+        filesCalls = [];
+        await Chat.deleteMany({});
+        await Prompt.deleteMany({});
+        await Setting.deleteMany({});
+        await testStartup.loginAsUser('user');
+    });
+
+    describe('Creating and listing', () => {
+        test('needs sign-in', async () => {
+            client.clearCookies();
+            client.authenticatedAs = null;
+            expect((await get('/chats')).status).toBe(401);
+            expect((await post('/chats', {})).status).toBeGreaterThanOrEqual(401);
+        });
+
+        test('a chat can be created with nothing chosen', async () => {
+            const response = await post('/chats', {});
+            expect(response.status).toBe(201);
+            expect(response.data.chat).toMatchObject({ title: 'New chat', model: null, system: '', messages: [], pendingAttachments: [] });
+            const stored = await Chat.findById(response.data.chat.id);
+            expect(stored.service).toBe('ai-base');
+        });
+
+        test('lists only the caller’s chats, newest first, and never caches', async () => {
+            const mine = await newChat({ title: 'Mine' });
+            await testStartup.loginAsUser('owner');
+            await newChat({ title: 'Owner only' });
+            await testStartup.loginAsUser('user');
+            const second = await newChat({ title: 'Second' });
+
+            const response = await get('/chats');
+            expect(response.headers['cache-control']).toMatch(/no-store/);
+            expect(response.data.chats.map((chat) => chat.id)).toEqual([second.id, mine.id]);
+        });
+
+        test('searches by title', async () => {
+            await newChat({ title: 'Harbour survey' });
+            await newChat({ title: 'Budget (2026)' });
+            expect((await get('/chats?search=harb')).data.chats.map((chat) => chat.title)).toEqual(['Harbour survey']);
+            expect((await get('/chats?search=(2026)')).data.chats).toHaveLength(1);
+            expect((await get('/chats?search=zzz')).data.chats).toEqual([]);
+        });
+
+        test('renames, changes instructions and deletes', async () => {
+            const chat = await newChat();
+            const renamed = await patch(`/chats/${chat.id}`, { title: 'Renamed', system: 'Reply formally.', options: { temperature: 0.2 } });
+            expect(renamed.data.chat).toMatchObject({ title: 'Renamed', system: 'Reply formally.', options: { temperature: 0.2 } });
+            expect((await remove(`/chats/${chat.id}`)).status).toBe(200);
+            expect((await get(`/chats/${chat.id}`)).status).toBe(404);
+        });
+
+        test('rejects a malformed id before it reaches the database', async () => {
+            expect((await get('/chats/not-an-id')).status).toBe(400);
+        });
+    });
+
+    describe('Ownership', () => {
+        test('another user cannot read, change, send to, attach to, export or delete a chat', async () => {
+            await testStartup.loginAsUser('owner');
+            const chat = await newChat({ title: 'Private', model: 'qwen2.5-coder:7b' });
+            await send(chat.id, { content: 'secret plan' });
+
+            for (const role of ['user', 'admin']) {
+                await testStartup.loginAsUser(role);
+                expect((await get(`/chats/${chat.id}`)).status).toBe(404);
+                expect((await patch(`/chats/${chat.id}`, { title: 'Taken' })).status).toBe(404);
+                expect((await send(chat.id, { content: 'hello' })).response.status).toBe(404);
+                expect((await send(chat.id, { regenerate: true })).response.status).toBe(404);
+                expect((await post(`/chats/${chat.id}/summary`, {})).status).toBe(404);
+                expect((await upload(chat.id, 'a.txt', Buffer.from('text'))).status).toBe(404);
+                expect((await get(`/chats/${chat.id}/export?format=markdown`)).status).toBe(404);
+                expect((await remove(`/chats/${chat.id}`)).status).toBe(404);
+            }
+            const stored = await Chat.findById(chat.id);
+            expect(stored.title).toBe('Private');
+            expect(stored.messages).toHaveLength(2);
+        });
+    });
+
+    describe('Sending a message', () => {
+        test('streams the reply, saves both messages and titles the chat', async () => {
+            const chat = await newChat();
+            state.chatReply = 'Hello there friend';
+            const { response, events: list } = await send(chat.id, { content: 'Explain what you can help me with in three sentences.' });
+
+            expect(response.status).toBe(200);
+            expect(response.headers['content-type']).toMatch(/ndjson/);
+            expect(list[0]).toMatchObject({ type: 'accepted', chat: { id: chat.id } });
+            expect(list.filter((event) => event.type === 'token').map((event) => event.text).join('')).toBe('Hello there friend');
+            const done = list[list.length - 1];
+            expect(done).toMatchObject({ type: 'done', reply: { role: 'assistant', content: 'Hello there friend', stopped: false, error: null } });
+            expect(done.reply.stats.tokensPerSecond).toBeGreaterThan(0);
+            expect(done.context).toMatchObject({ capacityTokens: 32768, warn: false });
+
+            const saved = (await get(`/chats/${chat.id}`)).data.chat;
+            expect(saved.title).toBe('Explain what you can help me with in three sentences.');
+            expect(saved.messages.map((message) => message.role)).toEqual(['user', 'assistant']);
+            expect(saved.model).toBe('qwen2.5-coder:7b');
+        });
+
+        test('uses the default model from settings when one is set', async () => {
+            await Setting.create({ defaultModel: 'custom-thing:latest' });
+            const chat = await newChat();
+            await send(chat.id, { content: 'hi' });
+            expect(state.chatCalls[0].model).toBe('custom-thing:latest');
+        });
+
+        test('sends instructions, options, the context size and how long to stay loaded', async () => {
+            await Setting.create({ keepAliveMinutes: 12 });
+            const chat = await newChat({ model: 'qwen2.5-coder:7b', system: 'Reply only in formal British English.', options: { temperature: 0.3 } });
+            await send(chat.id, { content: 'hi' });
+            const request = state.chatCalls[0];
+            expect(request.messages[0]).toEqual({ role: 'system', content: 'Reply only in formal British English.' });
+            expect(request.messages[1]).toEqual({ role: 'user', content: 'hi' });
+            expect(request.options).toMatchObject({ temperature: 0.3, num_ctx: 8192 });
+            expect(request.keep_alive).toBe('12m');
+            expect(request.think).toBeUndefined();
+        });
+
+        test('shows thinking separately for a reasoning model', async () => {
+            state.thinkingModel = true;
+            const chat = await newChat({ model: 'qwen2.5-coder:7b' });
+            const { events: list } = await send(chat.id, { content: 'think hard' });
+            expect(state.chatCalls[0].think).toBe(true);
+            expect(list.some((event) => event.type === 'thinking')).toBe(true);
+            const done = list[list.length - 1];
+            expect(done.reply.thinking).toBe('Let me consider this.');
+            expect(done.reply.content).not.toContain('consider');
+        });
+
+        test('a later message carries the earlier conversation', async () => {
+            const chat = await newChat({ model: 'qwen2.5-coder:7b' });
+            state.chatReply = 'First answer';
+            await send(chat.id, { content: 'first' });
+            await send(chat.id, { content: 'second' });
+            expect(state.chatCalls[1].messages.map((message) => message.content)).toEqual(['first', 'First answer', 'second']);
+        });
+
+        test('regenerate replaces the last reply', async () => {
+            const chat = await newChat({ model: 'qwen2.5-coder:7b' });
+            state.chatReply = 'Old answer';
+            await send(chat.id, { content: 'question' });
+            state.chatReply = 'New answer';
+            const { events: list } = await send(chat.id, { regenerate: true });
+            expect(list[list.length - 1].reply.content).toBe('New answer');
+
+            const saved = (await get(`/chats/${chat.id}`)).data.chat;
+            expect(saved.messages.map((message) => message.content)).toEqual(['question', 'New answer']);
+            expect(state.chatCalls[1].messages.map((message) => message.content)).toEqual(['question']);
+        });
+
+        test('editing an earlier message continues from the edited message', async () => {
+            const chat = await newChat({ model: 'qwen2.5-coder:7b' });
+            await send(chat.id, { content: 'one' });
+            await send(chat.id, { content: 'two' });
+            state.chatReply = 'Edited answer';
+            await send(chat.id, { content: 'one, corrected', editIndex: 0 });
+
+            const saved = (await get(`/chats/${chat.id}`)).data.chat;
+            expect(saved.messages.map((message) => message.content)).toEqual(['one, corrected', 'Edited answer']);
+        });
+
+        test('only a user message can be edited', async () => {
+            const chat = await newChat({ model: 'qwen2.5-coder:7b' });
+            await send(chat.id, { content: 'one' });
+            expect((await send(chat.id, { content: 'x', editIndex: 1 })).response.status).toBe(400);
+            expect((await send(chat.id, { content: 'x', editIndex: 9 })).response.status).toBe(400);
+        });
+
+        test('refuses a message that is too long or empty', async () => {
+            const chat = await newChat();
+            expect((await send(chat.id, { content: 'a'.repeat(100001) })).response.status).toBe(400);
+            expect((await send(chat.id, { content: '' })).response.status).toBe(400);
+            expect((await Chat.findById(chat.id)).messages).toHaveLength(0);
+        });
+
+        test('refuses the 201st message', async () => {
+            const chat = await newChat({ model: 'qwen2.5-coder:7b' });
+            const stored = await Chat.findById(chat.id);
+            for (let count = 0; count < 100; count++) stored.messages.push({ role: 'user', content: 'q' }, { role: 'assistant', content: 'a' });
+            await stored.save();
+            const response = (await send(chat.id, { content: 'one more' })).response;
+            expect(response.status).toBe(422);
+            expect(JSON.parse(response.data)).toMatchObject({ code: 'CHAT_FULL' });
+        });
+    });
+
+    describe('When something goes wrong', () => {
+        test('Ollama not running is said plainly and nothing is saved', async () => {
+            const chat = await newChat({ model: 'qwen2.5-coder:7b' });
+            state.up = false;
+            const response = (await send(chat.id, { content: 'hello' })).response;
+            expect(response.status).toBe(503);
+            expect(JSON.parse(response.data)).toMatchObject({ code: 'OLLAMA_DOWN' });
+            expect((await Chat.findById(chat.id)).messages).toHaveLength(0);
+        });
+
+        test('no installed model is said plainly', async () => {
+            state.models = [];
+            const chat = await newChat();
+            const response = (await send(chat.id, { content: 'hello' })).response;
+            expect(response.status).toBe(409);
+            expect(JSON.parse(response.data)).toMatchObject({ code: 'NO_MODELS' });
+        });
+
+        test('a model that is not installed is said plainly', async () => {
+            const chat = await newChat({ model: 'gone:1b' });
+            const response = (await send(chat.id, { content: 'hello' })).response;
+            expect(response.status).toBe(404);
+            expect(JSON.parse(response.data)).toMatchObject({ code: 'MODEL_MISSING' });
+        });
+
+        test('Ollama stopping mid-reply keeps what was written and allows regenerate', async () => {
+            const chat = await newChat({ model: 'qwen2.5-coder:7b' });
+            state.chatReply = 'Partial answer that breaks';
+            state.chatFailsMidway = true;
+            const { events: list } = await send(chat.id, { content: 'hello' });
+            const last = list[list.length - 1];
+            expect(last).toMatchObject({ type: 'error', code: 'OLLAMA_DOWN' });
+            expect(last.reply.content).toBe('Partial ');
+            expect(last.reply.error.code).toBe('OLLAMA_DOWN');
+
+            state.chatFailsMidway = false;
+            state.chatReply = 'Whole answer';
+            await send(chat.id, { regenerate: true });
+            const saved = (await get(`/chats/${chat.id}`)).data.chat;
+            expect(saved.messages.map((message) => message.content)).toEqual(['hello', 'Whole answer']);
+        });
+
+        test('not enough memory is said plainly', async () => {
+            const chat = await newChat({ model: 'qwen2.5-coder:7b' });
+            state.chatError = 'model requires more system memory (9.1 GiB) than is available (4.0 GiB)';
+            const { events: list } = await send(chat.id, { content: 'hello' });
+            expect(list[list.length - 1]).toMatchObject({ type: 'error', code: 'OUT_OF_MEMORY' });
+            expect(list[list.length - 1].action).toMatch(/unload/i);
+        });
+
+        test('a conversation too long for the model is refused before it is sent', async () => {
+            state.contextLength = 2048;
+            const chat = await newChat({ model: 'qwen2.5-coder:7b' });
+            const response = (await send(chat.id, { content: 'word '.repeat(2000) })).response;
+            expect(response.status).toBe(422);
+            expect(JSON.parse(response.data)).toMatchObject({ code: 'TOO_LONG' });
+            expect(state.chatCalls).toHaveLength(0);
+        });
+
+        test('warns as the conversation nears the limit', async () => {
+            state.contextLength = 8192;
+            const chat = await newChat({ model: 'qwen2.5-coder:7b' });
+            const { events: list } = await send(chat.id, { content: 'word '.repeat(Math.floor(((8192 - 1024 - 300 - estimateTokens(COMPONENT_GUIDE)) * 4) / 5)) });
+            expect(list[list.length - 1].context).toMatchObject({ capacityTokens: 8192, warn: true });
+            expect(state.chatCalls[0].options.num_ctx).toBe(8192);
+        });
+    });
+
+    describe('Stopping and waiting', () => {
+        const openStream = async (chatId, body) => {
+            const controller = new AbortController();
+            const cookie = client.cookieJar.getCookieStringSync(client.baseURL);
+            const response = await fetch(`${client.baseURL}/api/v1/chats/${chatId}/messages`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', Cookie: cookie, 'X-CSRF-Token': client.getCsrfTokenFromCookies() },
+                body: JSON.stringify(body),
+                signal: controller.signal
+            });
+            const reader = response.body.getReader();
+            const decoder = new TextDecoder();
+            const seen = [];
+            const pump = (async () => {
+                let buffer = '';
+                try {
+                    for (;;) {
+                        const { value, done } = await reader.read();
+                        if (done) break;
+                        buffer += decoder.decode(value, { stream: true });
+                        const lines = buffer.split('\n');
+                        buffer = lines.pop();
+                        lines.filter(Boolean).forEach((line) => seen.push(JSON.parse(line)));
+                    }
+                } catch {
+                    return seen;
+                }
+                return seen;
+            })();
+            const until = async (check) => {
+                for (let attempt = 0; attempt < 200; attempt++) {
+                    if (seen.some(check)) return;
+                    await wait(15);
+                }
+                throw new Error(`stream never showed the expected event: ${JSON.stringify(seen)}`);
+            };
+            return { seen, until, stop: () => controller.abort(), finished: pump };
+        };
+
+        test('leaving the page does not stop the reply, and coming back picks it up from the start', async () => {
+            const chat = await newChat({ model: 'qwen2.5-coder:7b' });
+            state.chatReply = 'One two three four';
+            state.chatHold = true;
+            const first = await openStream(chat.id, { content: 'long request' });
+            await first.until((event) => event.type === 'token');
+            first.stop();
+            await first.finished;
+            await wait(60);
+
+            expect(state.chatAborted).toBe(0);
+            expect((await get(`/chats/${chat.id}`)).data.chat).toMatchObject({ replying: true });
+            expect((await post(`/chats/${chat.id}/messages`, { regenerate: true })).status).toBe(409);
+
+            const cookie = client.cookieJar.getCookieStringSync(client.baseURL);
+            const back = await fetch(`${client.baseURL}/api/v1/chats/${chat.id}/reply`, { headers: { Cookie: cookie } });
+            expect(back.status).toBe(200);
+            state.chatHold = false;
+            const events = (await back.text()).split('\n').filter(Boolean).map((line) => JSON.parse(line));
+            expect(events.slice(0, 2).map((event) => event.type)).toEqual(['accepted', 'start']);
+            expect(events.filter((event) => event.type === 'token').map((event) => event.text).join('')).toBe('One two three four');
+            expect(events[events.length - 1]).toMatchObject({ type: 'done', reply: { content: 'One two three four', stopped: false } });
+
+            const after = (await get(`/chats/${chat.id}`)).data.chat;
+            expect(after.replying).toBe(false);
+            expect(after.messages[1]).toMatchObject({ role: 'assistant', content: 'One two three four' });
+            expect((await fetch(`${client.baseURL}/api/v1/chats/${chat.id}/reply`, { headers: { Cookie: cookie } })).status).toBe(204);
+        });
+
+        test('Stop ends generation and keeps what was written', async () => {
+            const chat = await newChat({ model: 'qwen2.5-coder:7b' });
+            state.chatReply = 'One two three four';
+            state.chatHold = true;
+            const stream = await openStream(chat.id, { content: 'long request' });
+            await stream.until((event) => event.type === 'token');
+            expect((await post(`/chats/${chat.id}/stop`, {})).data).toMatchObject({ stopped: true });
+            await stream.finished;
+            expect((await post(`/chats/${chat.id}/stop`, {})).data).toMatchObject({ stopped: false });
+
+            for (let attempt = 0; attempt < 100 && state.chatAborted === 0; attempt++) await wait(15);
+            expect(state.chatAborted).toBe(1);
+            for (let attempt = 0; attempt < 100; attempt++) {
+                if ((await Chat.findById(chat.id)).messages.length === 2) break;
+                await wait(15);
+            }
+            const stored = await Chat.findById(chat.id);
+            expect(stored.messages[1]).toMatchObject({ role: 'assistant', content: 'One ', stopped: true });
+
+            state.chatHold = false;
+            state.chatReply = 'Fresh answer';
+            const { events: list } = await send(chat.id, { regenerate: true });
+            expect(list[list.length - 1].reply.content).toBe('Fresh answer');
+        });
+
+        test('a second request waits and is told its place, then answers', async () => {
+            const first = await newChat({ model: 'qwen2.5-coder:7b' });
+            const second = await newChat({ model: 'qwen2.5-coder:7b' });
+            state.chatHold = true;
+            const one = await openStream(first.id, { content: 'first long request' });
+            await one.until((event) => event.type === 'token');
+            const two = await openStream(second.id, { content: 'second long request' });
+            await two.until((event) => event.type === 'queued');
+            expect(two.seen.find((event) => event.type === 'queued')).toEqual({ type: 'queued', ahead: 1 });
+            expect(two.seen.some((event) => event.type === 'start')).toBe(false);
+
+            state.chatHold = false;
+            const [firstEvents, secondEvents] = await Promise.all([one.finished, two.finished]);
+            expect(firstEvents[firstEvents.length - 1].type).toBe('done');
+            expect(secondEvents[secondEvents.length - 1].type).toBe('done');
+            expect(secondEvents.findIndex((event) => event.type === 'start')).toBeGreaterThan(secondEvents.findIndex((event) => event.type === 'queued'));
+        });
+
+        test('a waiting request that is stopped never reaches the model', async () => {
+            const first = await newChat({ model: 'qwen2.5-coder:7b' });
+            const second = await newChat({ model: 'qwen2.5-coder:7b' });
+            state.chatHold = true;
+            const one = await openStream(first.id, { content: 'first' });
+            await one.until((event) => event.type === 'token');
+            const two = await openStream(second.id, { content: 'second' });
+            await two.until((event) => event.type === 'queued');
+            await post(`/chats/${second.id}/stop`, {});
+            await two.finished;
+            await wait(50);
+
+            state.chatHold = false;
+            await one.finished;
+            await wait(50);
+            expect(state.chatCalls).toHaveLength(1);
+            expect((await Chat.findById(second.id)).messages.map((message) => message.role)).toEqual(['user']);
+        });
+
+        test('a message sent while the chat is replying waits and is answered next', async () => {
+            const chat = await newChat({ model: 'qwen2.5-coder:7b' });
+            state.chatReply = 'Answer';
+            state.chatHold = true;
+            const one = await openStream(chat.id, { content: 'first' });
+            await one.until((event) => event.type === 'token');
+            const queued = await post(`/chats/${chat.id}/messages`, { content: 'second' });
+            expect(queued.status).toBe(202);
+            expect(queued.data.queued).toEqual(['second']);
+            expect((await get(`/chats/${chat.id}`)).data.chat.queued).toEqual(['second']);
+            expect((await post(`/chats/${chat.id}/messages`, { regenerate: true })).status).toBe(409);
+
+            state.chatHold = false;
+            await one.finished;
+            for (let attempt = 0; attempt < 200; attempt++) {
+                if ((await Chat.findById(chat.id)).messages.length === 4) break;
+                await wait(15);
+            }
+            const stored = await Chat.findById(chat.id);
+            expect(stored.messages.map((message) => message.role)).toEqual(['user', 'assistant', 'user', 'assistant']);
+            expect(stored.messages[2].content).toBe('second');
+            expect(stored.messages[3].content).toBe('Answer');
+            for (let attempt = 0; attempt < 100; attempt++) {
+                if (!(await get(`/chats/${chat.id}`)).data.chat.replying) break;
+                await wait(15);
+            }
+            expect((await get(`/chats/${chat.id}`)).data.chat).toMatchObject({ replying: false, queued: [] });
+        });
+
+        test('only five messages can wait in one chat, and Stop drops the ones waiting', async () => {
+            const chat = await newChat({ model: 'qwen2.5-coder:7b' });
+            state.chatHold = true;
+            const one = await openStream(chat.id, { content: 'first' });
+            await one.until((event) => event.type === 'token');
+            for (let index = 0; index < 5; index++) {
+                expect((await post(`/chats/${chat.id}/messages`, { content: `waiting ${index}` })).status).toBe(202);
+            }
+            const full = await post(`/chats/${chat.id}/messages`, { content: 'one too many' });
+            expect(full.status).toBe(429);
+            expect(full.data).toMatchObject({ code: 'QUEUE_FULL' });
+
+            await post(`/chats/${chat.id}/stop`, {});
+            await one.finished;
+            state.chatHold = false;
+            await wait(150);
+            expect(state.chatCalls).toHaveLength(1);
+            expect((await Chat.findById(chat.id)).messages.map((message) => message.role)).toEqual(['user', 'assistant']);
+            expect((await get(`/chats/${chat.id}`)).data.chat).toMatchObject({ replying: false, queued: [] });
+        });
+
+        test('the number of generations at once follows the setting', async () => {
+            await Setting.create({ maxConcurrentGenerations: 2 });
+            const first = await newChat({ model: 'qwen2.5-coder:7b' });
+            const second = await newChat({ model: 'qwen2.5-coder:7b' });
+            state.chatHold = true;
+            const one = await openStream(first.id, { content: 'first' });
+            const two = await openStream(second.id, { content: 'second' });
+            await one.until((event) => event.type === 'token');
+            await two.until((event) => event.type === 'token');
+            expect(two.seen.some((event) => event.type === 'queued')).toBe(false);
+            state.chatHold = false;
+            await Promise.all([one.finished, two.finished]);
+        });
+    });
+
+    describe('Attachments', () => {
+        test.each([
+            ['notes.txt', () => Buffer.from('The harbour is twelve metres deep.'), 'twelve metres'],
+            ['figures.csv', () => Buffer.from('port,depth\nHarwich,12'), 'Harwich,12'],
+            ['report.pdf', () => makePdf('Dredging costs rose in March'), 'Dredging costs rose'],
+            ['minutes.docx', () => makeDocx('The board approved the survey'), 'board approved']
+        ])('%s is read and sent with the next message only', async (name, build, expected) => {
+            const chat = await newChat({ model: 'qwen2.5-coder:7b' });
+            const attached = await upload(chat.id, name, await build());
+            expect(attached.status).toBe(201);
+            expect(attached.data.chat.pendingAttachments).toHaveLength(1);
+            expect(attached.data.chat.pendingAttachments[0]).toMatchObject({ name, source: 'ai-base' });
+            expect(attached.data.chat.pendingAttachments[0].text).toBeUndefined();
+            expect(attached.data.chat.context.usedTokens).toBeGreaterThan(0);
+
+            await send(chat.id, { content: 'Summarise this.' });
+            expect(state.chatCalls[0].messages[0].content).toContain(expected);
+            expect(state.chatCalls[0].messages[0].content).toContain(`Document "${name}"`);
+
+            const saved = (await get(`/chats/${chat.id}`)).data.chat;
+            expect(saved.pendingAttachments).toEqual([]);
+            expect(saved.messages[0].attachments[0].name).toBe(name);
+            expect(saved.messages[0].content).toBe('Summarise this.');
+
+            await send(chat.id, { content: 'And again?' });
+            expect(state.chatCalls[1].messages[0].content).toContain(expected);
+            expect(state.chatCalls[1].messages[2].content).toBe('And again?');
+        });
+
+        test('a file that is not text is refused in plain words', async () => {
+            const chat = await newChat();
+            const response = await upload(chat.id, 'photo.png', Buffer.from([0x89, 0x50, 0x4e, 0x47, 0, 0, 0, 13]));
+            expect(response.status).toBe(415);
+            expect(response.data).toMatchObject({ success: false, code: 'FILE_UNREADABLE' });
+        });
+
+        test('a file over 20 MB is refused', async () => {
+            const chat = await newChat();
+            const response = await upload(chat.id, 'huge.txt', Buffer.alloc(MAX_ATTACHMENT_BYTES + 1024, 'a'));
+            expect(response.status).toBe(413);
+            expect(response.data).toMatchObject({ code: 'FILE_TOO_LARGE' });
+            expect((await Chat.findById(chat.id)).attachments).toHaveLength(0);
+        }, 30000);
+
+        test('a document longer than the model can read is refused with the numbers', async () => {
+            state.contextLength = 4096;
+            const chat = await newChat({ model: 'qwen2.5-coder:7b' });
+            const response = await upload(chat.id, 'long.txt', Buffer.from('word '.repeat(8000)));
+            expect(response.status).toBe(422);
+            expect(response.data).toMatchObject({ code: 'DOCUMENT_TOO_LONG', neededTokens: 10000 });
+            expect(response.data.message).toMatch(/10,000 tokens/);
+            expect(response.data.action).toMatch(/shorter document|read more/);
+            expect((await Chat.findById(chat.id)).attachments).toHaveLength(0);
+        });
+
+        test('needs a file name', async () => {
+            const chat = await newChat();
+            const response = await post(`/chats/${chat.id}/attachments`, Buffer.from('text'), { headers: { 'Content-Type': 'application/octet-stream' } });
+            expect(response.status).toBe(400);
+        });
+
+        test('an attachment can be removed before it is sent, not after', async () => {
+            const chat = await newChat({ model: 'qwen2.5-coder:7b' });
+            const attached = (await upload(chat.id, 'a.txt', Buffer.from('alpha'))).data.chat.pendingAttachments[0];
+            expect((await remove(`/chats/${chat.id}/attachments/${attached.id}`)).data.chat.pendingAttachments).toEqual([]);
+
+            const kept = (await upload(chat.id, 'b.txt', Buffer.from('beta'))).data.chat.pendingAttachments[0];
+            await send(chat.id, { content: 'use it' });
+            expect((await remove(`/chats/${chat.id}/attachments/${kept.id}`)).status).toBe(404);
+        });
+
+        test('attachments go when the chat is deleted', async () => {
+            const chat = await newChat();
+            await upload(chat.id, 'a.txt', Buffer.from('alpha'));
+            await remove(`/chats/${chat.id}`);
+            expect(await Chat.countDocuments({ 'attachments.name': 'a.txt' })).toBe(0);
+        });
+    });
+
+    describe('Export and summary', () => {
+        test('exports as markdown and as JSONL', async () => {
+            const chat = await newChat({ model: 'qwen2.5-coder:7b', title: 'Harbour: plan/2026', system: 'Be brief.' });
+            state.chatReply = 'It is deep.';
+            await send(chat.id, { content: 'How deep is it?' });
+
+            const markdown = (await get(`/chats/${chat.id}/export?format=markdown`)).data;
+            expect(markdown.fileName).toBe('harbour-plan-2026.md');
+            expect(markdown.content).toContain('# Harbour: plan/2026');
+            expect(markdown.content).toContain('## You\n\nHow deep is it?');
+            expect(markdown.content).toContain('It is deep.');
+
+            const jsonl = (await get(`/chats/${chat.id}/export?format=jsonl`)).data;
+            expect(jsonl.fileName).toBe('harbour-plan-2026.jsonl');
+            const lines = jsonl.content.trim().split('\n').map((line) => JSON.parse(line));
+            expect(lines.map((line) => line.role)).toEqual(['system', 'user', 'assistant']);
+            expect(lines[2]).toMatchObject({ content: 'It is deep.', model: 'qwen2.5-coder:7b' });
+
+            expect((await get(`/chats/${chat.id}/export?format=pdf`)).status).toBe(400);
+        });
+
+        test('starts a new chat from a summary', async () => {
+            const chat = await newChat({ model: 'qwen2.5-coder:7b', system: 'Be brief.' });
+            await send(chat.id, { content: 'We plan a harbour survey.' });
+            state.chatReply = '- Goal: harbour survey';
+            const response = await post(`/chats/${chat.id}/summary`, {});
+
+            expect(response.status).toBe(201);
+            expect(response.data.chat).toMatchObject({
+                summary: '- Goal: harbour survey', continuedFrom: chat.id, model: 'qwen2.5-coder:7b', system: 'Be brief.', messages: []
+            });
+            expect(response.data.chat.title).toMatch(/\(continued\)$/);
+            expect(state.chatCalls[1].stream).toBe(false);
+
+            await send(response.data.chat.id, { content: 'What was the goal?' });
+            expect(state.chatCalls[2].messages[0].content).toContain('Summary of the earlier conversation:\n- Goal: harbour survey');
+        });
+
+        test('an empty chat cannot be summarised', async () => {
+            const chat = await newChat({ model: 'qwen2.5-coder:7b' });
+            expect((await post(`/chats/${chat.id}/summary`, {})).status).toBe(400);
+        });
+    });
+
+    describe('Built-in component guide', () => {
+        test('explains the tag format, every component and its attributes', () => {
+            expect(COMPONENT_GUIDE.split('\n')[0]).toMatch(/used primarily to display information in the chat/);
+            for (const heading of ['VALUES', 'COMPONENTS', 'SHARED ATTRIBUTES', 'LAYOUT ATTRIBUTES (Container and Card)', 'TAGS THAT GO INSIDE OTHERS', 'FILES BY TYPE']) {
+                expect(COMPONENT_GUIDE).toContain(`\n${heading}\n|`);
+            }
+            expect(COMPONENT_GUIDE).toMatch(/Never put code inside a component block/);
+            expect(COMPONENT_GUIDE).toContain('```component\n<Card ');
+            for (const name of ['Container', 'Card', 'Typography', 'Button', 'ButtonGroup', 'FloatingActionButton', 'Badge', 'Divider', 'Icon', 'ProgressBar', 'CircularProgress', 'Data', 'Flow', 'TreeView', 'Image', 'Video', 'Audio', 'PdfViewer', 'Model3D', 'Editor', 'Input', 'Select', 'Switch']) {
+                expect(COMPONENT_GUIDE).toContain(`<${name}`);
+            }
+            for (const part of ['<Row ', '<Column ', '<Node ', '<Edge ', '<Item ', '<Option ']) expect(COMPONENT_GUIDE).toContain(part);
+            for (const word of ['justify', 'align', 'flex-column', 'grid', 'between', 'source', 'target', 'showPercentage', 'borderColor']) {
+                expect(COMPONENT_GUIDE).toContain(word);
+            }
+            expect(COMPONENT_GUIDE).not.toMatch(/\{"component"/);
+            expect(estimateTokens(COMPONENT_GUIDE)).toBeLessThan(3300);
+            expect(COMPONENT_GUIDE).not.toMatch(/web_search|web_fetch|search the web|do not guess|Never invent/i);
+            for (const tag of ['<Model3D src=', '<PdfViewer src=', '<Video src=', '<Audio src=', '<Editor src=', '<Data src=', '<Image src=']) expect(COMPONENT_GUIDE).toContain(tag);
+
+            const examples = [...COMPONENT_GUIDE.matchAll(/```component\n([\s\S]*?)\n```/g)].map((match) => match[1]);
+            expect(examples).toHaveLength(5);
+            for (const example of examples) {
+                const opened = [...example.matchAll(/<([A-Z]\w*)(?:\s[^<>]*?)?(\/?)>/g)].filter((match) => match[2] !== '/').map((match) => match[1]);
+                const closed = [...example.matchAll(/<\/([A-Z]\w*)>/g)].map((match) => match[1]);
+                expect(opened.sort()).toEqual(closed.sort());
+            }
+        });
+
+        test('is sent with every chat and every model, with or without instructions', async () => {
+            const plain = await newChat({ model: 'qwen2.5-coder:7b' });
+            const guided = await newChat({ model: 'custom-thing:latest', instructions: [{ name: 'Tone', text: 'Be formal.' }] });
+            await send(plain.id, { content: 'one' });
+            await send(guided.id, { content: 'two' });
+            await send(plain.id, { regenerate: true });
+
+            expect(state.guidesSeen).toBe(3);
+            expect(state.chatCalls[0].messages).toEqual([{ role: 'user', content: 'one' }]);
+            expect(state.chatCalls[1].messages[0]).toEqual({ role: 'system', content: 'Be formal.' });
+        });
+
+        test('is never shown in the chat, the list or an export', async () => {
+            const chat = await newChat({ model: 'qwen2.5-coder:7b', instructions: [{ name: 'Tone', text: 'Be formal.' }] });
+            await send(chat.id, { content: 'hello' });
+            const marker = 'draw interface components';
+            for (const response of [
+                await get(`/chats/${chat.id}`),
+                await get('/chats'),
+                await get(`/chats/${chat.id}/export?format=markdown`),
+                await get(`/chats/${chat.id}/export?format=jsonl`)
+            ]) {
+                expect(JSON.stringify(response.data)).not.toContain(marker);
+            }
+            expect((await Chat.findById(chat.id)).system).toBe('');
+        });
+
+        test('counts toward what the model can read', async () => {
+            const chat = await newChat({ model: 'qwen2.5-coder:7b' });
+            expect(chat.context.usedTokens).toBeGreaterThanOrEqual(estimateTokens(COMPONENT_GUIDE));
+        });
+    });
+
+    describe('Instructions made of several articles', () => {
+        const tone = { name: 'Tone', text: 'Reply only in formal British English.' };
+        const brief = { name: 'brief.md', text: 'The client wants a harbour survey by June.', source: 'fs-one', path: '/docs/brief.md' };
+
+        test('a chat keeps typed text and files as separate articles and sends them all', async () => {
+            const chat = await newChat({ model: 'qwen2.5-coder:7b', instructions: [tone, brief] });
+            expect(chat.instructions).toEqual([
+                { ...tone, source: 'ai-base', path: null },
+                brief
+            ]);
+
+            await send(chat.id, { content: 'hi' });
+            expect(state.chatCalls[0].messages[0]).toEqual({
+                role: 'system',
+                content: '# Tone\n\nReply only in formal British English.\n\n# brief.md\n\nThe client wants a harbour survey by June.'
+            });
+        });
+
+        test('a single article is sent as it is, without a heading', async () => {
+            const chat = await newChat({ model: 'qwen2.5-coder:7b', instructions: [tone] });
+            await send(chat.id, { content: 'hi' });
+            expect(state.chatCalls[0].messages[0].content).toBe('Reply only in formal British English.');
+        });
+
+        test('articles can be replaced and cleared', async () => {
+            const chat = await newChat({ instructions: [tone, brief] });
+            const fewer = await patch(`/chats/${chat.id}`, { instructions: [brief] });
+            expect(fewer.data.chat.instructions).toEqual([brief]);
+            const none = await patch(`/chats/${chat.id}`, { instructions: [] });
+            expect(none.data.chat.instructions).toEqual([]);
+            expect(none.data.chat.system).toBe('');
+        });
+
+        test('a chat made with the older single instruction shows it as one article', async () => {
+            const chat = await newChat({ system: 'Be brief.' });
+            expect(chat.instructions).toEqual([{ name: 'Instructions', text: 'Be brief.', source: 'ai-base', path: null }]);
+            const changed = await patch(`/chats/${chat.id}`, { instructions: [tone] });
+            expect(changed.data.chat.system).toBe(tone.text);
+            expect((await Chat.findById(chat.id)).system).toBe('');
+        });
+
+        test('articles count toward what the model can read', async () => {
+            const chat = await newChat({ model: 'qwen2.5-coder:7b', instructions: [{ name: 'Long', text: 'word '.repeat(4000) }] });
+            expect(chat.context.usedTokens).toBeGreaterThanOrEqual(5000);
+        });
+
+        test('limits: ten articles, each named and not empty', async () => {
+            const eleven = Array.from({ length: 11 }, (_, index) => ({ name: `A${index}`, text: 'x' }));
+            expect((await post('/chats', { instructions: eleven })).status).toBe(400);
+            expect((await post('/chats', { instructions: [{ name: '', text: 'x' }] })).status).toBe(400);
+            expect((await post('/chats', { instructions: [{ name: 'A', text: '' }] })).status).toBe(400);
+            expect((await post('/chats', { instructions: [{ name: 'A', text: 'a'.repeat(100001) }] })).status).toBe(400);
+            expect((await post('/chats', { instructions: [{ name: 'A', text: 'x', source: 'elsewhere' }] })).status).toBe(400);
+        });
+
+        test('a new chat from a summary and an export both carry the articles', async () => {
+            const chat = await newChat({ model: 'qwen2.5-coder:7b', instructions: [tone, brief] });
+            await send(chat.id, { content: 'hello' });
+            const exported = (await get(`/chats/${chat.id}/export?format=markdown`)).data.content;
+            expect(exported).toContain('# Tone');
+            expect(exported).toContain('harbour survey by June');
+            const next = (await post(`/chats/${chat.id}/summary`, {})).data.chat;
+            expect(next.instructions.map((item) => item.name)).toEqual(['Tone', 'brief.md']);
+        });
+    });
+
+    describe('Saved instructions', () => {
+        const tone = { name: 'Formal tone', text: 'Reply only in formal British English.' };
+
+        test('validation', () => {
+            expect(promptSchemas.create.validate(tone).error).toBeUndefined();
+            expect(promptSchemas.create.validate({ name: 'x' }).error).toBeDefined();
+            expect(promptSchemas.create.validate({ ...tone, name: 'a'.repeat(121) }).error).toBeDefined();
+            expect(promptSchemas.update.validate({}).error).toBeDefined();
+        });
+
+        test('needs sign-in', async () => {
+            client.clearCookies();
+            client.authenticatedAs = null;
+            expect((await get('/prompts')).status).toBe(401);
+        });
+
+        test('an instruction can be saved, listed, renamed and deleted', async () => {
+            const saved = await post('/prompts', tone);
+            expect(saved.status).toBe(201);
+            expect(saved.data.prompt).toMatchObject({ ...tone, source: 'ai-base', path: null });
+            expect((await Prompt.findById(saved.data.prompt.id)).service).toBe('ai-base');
+
+            await post('/prompts', { name: 'A brief', text: 'Survey by June.', source: 'fs-one', path: '/docs/brief.md' });
+            const listed = (await get('/prompts')).data.prompts;
+            expect(listed.map((prompt) => prompt.name)).toEqual(['A brief', 'Formal tone']);
+            expect(listed[0]).toMatchObject({ source: 'fs-one', path: '/docs/brief.md' });
+
+            const renamed = await patch(`/prompts/${saved.data.prompt.id}`, { name: 'Formal' });
+            expect(renamed.data.prompt.name).toBe('Formal');
+            expect((await remove(`/prompts/${saved.data.prompt.id}`)).status).toBe(200);
+            expect((await get('/prompts')).data.prompts).toHaveLength(1);
+        });
+
+        test('a saved instruction carries into any number of chats', async () => {
+            const saved = (await post('/prompts', tone)).data.prompt;
+            const article = { name: saved.name, text: saved.text };
+            const first = await newChat({ model: 'qwen2.5-coder:7b', instructions: [article] });
+            const second = await newChat({ model: 'qwen2.5-coder:7b', instructions: [article] });
+            await send(first.id, { content: 'one' });
+            await send(second.id, { content: 'two' });
+            expect(state.chatCalls.map((call) => call.messages[0].content)).toEqual([tone.text, tone.text]);
+
+            await remove(`/prompts/${saved.id}`);
+            expect((await get(`/chats/${first.id}`)).data.chat.instructions).toHaveLength(1);
+        });
+
+        test('saved instructions belong to their owner', async () => {
+            const saved = (await post('/prompts', tone)).data.prompt;
+            for (const role of ['owner', 'admin']) {
+                await testStartup.loginAsUser(role);
+                expect((await get('/prompts')).data.prompts).toEqual([]);
+                expect((await patch(`/prompts/${saved.id}`, { name: 'Taken' })).status).toBe(404);
+                expect((await remove(`/prompts/${saved.id}`)).status).toBe(404);
+            }
+            expect((await Prompt.findById(saved.id)).name).toBe('Formal tone');
+            expect((await get('/prompts/not-an-id')).status).toBeGreaterThanOrEqual(400);
+        });
+
+        test('stops at 100 saved instructions', async () => {
+            const owner = (await post('/prompts', tone)).data.prompt;
+            const stored = await Prompt.findById(owner.id);
+            await Prompt.insertMany(Array.from({ length: 99 }, (_, index) => ({ owner: stored.owner, name: `P${index}`, text: 'x' })));
+            const response = await post('/prompts', tone);
+            expect(response.status).toBe(422);
+            expect(response.data.message).toMatch(/100 saved instructions/);
+        });
+    });
+
+    describe('Loading a model ahead of the first message', () => {
+        test('loads the model the next chat will use and keeps it for the set time', async () => {
+            await Setting.create({ keepAliveMinutes: 20 });
+            const response = await post('/models/load', {});
+            expect(response.status).toBe(202);
+            expect(response.data).toMatchObject({ model: 'qwen2.5-coder:7b', ready: false, loading: true });
+            await wait(30);
+            expect(state.unloaded).toEqual([{ model: 'qwen2.5-coder:7b', keep_alive: '20m', num_ctx: 8192 }]);
+        });
+
+        test('loads with the same context size a chat will use, so the first message does not load it again', async () => {
+            process.env.TAVILY_API_KEY = 'tvly-test';
+            try {
+                await post('/models/load', {});
+                await wait(30);
+                expect(state.unloaded[0].num_ctx).toBe(16384);
+                const chat = (await post('/chats', { model: 'qwen2.5-coder:7b' })).data.chat;
+                await client.post(`/api/v1/chats/${chat.id}/messages`, { content: 'hi' });
+                expect(state.chatCalls[state.chatCalls.length - 1].options.num_ctx).toBe(16384);
+            } finally {
+                process.env.TAVILY_API_KEY = '';
+            }
+        });
+
+        test('loads a named model', async () => {
+            const response = await post('/models/load', { name: 'custom-thing:latest' });
+            expect(response.data).toMatchObject({ model: 'custom-thing:latest', loading: true });
+        });
+
+        test('does nothing when the model is already in memory', async () => {
+            state.running = [{ name: 'qwen2.5-coder:7b', size: 100, size_vram: 100 }];
+            const response = await post('/models/load', { name: 'qwen2.5-coder:7b' });
+            expect(response.data).toMatchObject({ ready: true, loading: false });
+            await wait(30);
+            expect(state.unloaded).toEqual([]);
+        });
+
+        test('says plainly when Ollama is not running or nothing is installed', async () => {
+            state.models = [];
+            expect((await post('/models/load', {})).data).toMatchObject({ code: 'NO_MODELS' });
+            state.up = false;
+            expect((await post('/models/load', {})).status).toBe(503);
+        });
+
+        test('needs sign-in', async () => {
+            client.clearCookies();
+            client.authenticatedAs = null;
+            expect((await post('/models/load', {})).status).toBeGreaterThanOrEqual(401);
+        });
+    });
+
+    describe('Searching the web', () => {
+        const withKey = async (work) => {
+            process.env.TAVILY_API_KEY = 'tvly-test';
+            process.env.WEB_SEARCH_MODE = 'tools';
+            try {
+                return await work();
+            } finally {
+                process.env.TAVILY_API_KEY = '';
+                process.env.WEB_SEARCH_MODE = '';
+            }
+        };
+
+        beforeAll(() => {
+            setSearchFetch(async (url, options = {}) => {
+                state.searchUrls.push(String(url));
+                const sent = options.body ? JSON.parse(options.body) : null;
+                const asked = sent ? sent.query : new URL(url).searchParams.get('q');
+                state.searchRequests.push({ method: options.method || 'GET', key: options.headers?.Authorization || null, body: sent });
+                if (state.searchFails && !state.searchStatus) throw new Error('ECONNREFUSED');
+                if (state.searchFails) return { ok: false, status: state.searchStatus };
+                if (state.enginesLimited) return { ok: false, status: 432 };
+                state.searches.push(asked);
+                const first = state.freshResults ? `https://fresh.example/${state.searches.length}/files/duck.glb` : 'https://models.example/duck';
+                const results = Array.from({ length: 8 }, (_, index) => ({ title: index ? `Other ${index}` : 'Duck model', url: index ? `https://other.example/${index}` : first, content: `A duck in glTF format. ${asked}`, engine: 'x' }));
+                if (state.junkResults) results.push({ title: 'Free online games', url: 'https://games.example/', content: 'Play free games now.', engine: 'x' }, { title: 'Duck pond model railway', url: 'https://railway.example/duck', content: 'A model of a duck pond.', engine: 'x' });
+                if (state.junkResults) results.splice(0, 8);
+                return { ok: true, status: 200, json: async () => ({ results }) };
+            });
+            setRemoteTransport({
+                lookup: async (host) => [{ address: host === 'intranet.example' ? '10.0.0.5' : '93.184.216.34', family: 4 }],
+                request: async (url) => {
+                    state.fetches.push(url.href);
+                    if (url.href.endsWith('/files/duck.glb')) return { status: 200, headers: { 'content-type': 'model/gltf-binary' }, stream: Readable.from([Buffer.from('glb')]) };
+                    if (url.href.includes('missing')) return { status: 404, headers: {}, stream: Readable.from([]) };
+                    if (url.href === 'https://raw.githubusercontent.com/owner/repo/main/data.csv') return { status: 200, headers: { 'content-type': 'text/plain' }, stream: Readable.from([Buffer.from('a,b')]) };
+                    if (url.href.endsWith('/icon.png')) return { status: 200, headers: { 'content-type': 'image/png', 'content-length': '900' }, stream: Readable.from([Buffer.from('png')]) };
+                    if (url.host === 'other.example') return { status: 200, headers: { 'content-type': 'text/html' }, stream: Readable.from([Buffer.from('<html><body><a href="https://models.example/files/missing.glb">a</a><a href="https://models.example/files/page.glb">b</a><img src="/icon.png"><a href="https://github.com/owner/repo/blob/main/data.csv">c</a><script>window.data = {"file":"https:\\/\\/models.example\\/hidden\\/files\\/duck.glb"}</script></body></html>')]) };
+                    return { status: 200, headers: { 'content-type': 'text/html; charset=utf-8' }, stream: Readable.from([Buffer.from("<html><head><title>Duck &amp; friends</title><style>p{color:red}</style></head><body><p>Download the duck below.</p><a href=\"/files/duck.glb\">file</a> <a href=\"https://models.example/about\">about</a><script>evil()</script></body></html>")]) };
+                }
+            });
+        });
+
+        afterAll(() => {
+            setSearchFetch(null);
+            setRemoteTransport(null);
+        });
+        const search = ['web_search', { query: 'duck 3d model' }];
+        const fetchPage = ['web_fetch', { url: 'https://models.example/duck' }];
+
+        test('is off without a search address: no tools are offered, the page is told so, and the model gets no extra instruction', async () => {
+            const chat = await newChat({ model: 'qwen2.5-coder:7b' });
+            await send(chat.id, { content: 'find a duck model' });
+            expect(state.chatCalls[0].tools).toBeUndefined();
+            expect(state.searchGuides).toBe(0);
+            expect(COMPONENT_GUIDE).not.toMatch(/web_search/);
+            expect(state.chatCalls[0].options.num_ctx).toBe(8192);
+            expect((await get('/models')).data.webSearch).toBe(false);
+        });
+
+        test('with a search address, both tools are offered with more room to read and the instruction to search with every request', async () => {
+            await withKey(async () => {
+                const chat = await newChat({ model: 'qwen2.5-coder:7b' });
+                await send(chat.id, { content: 'find a duck model' });
+                const request = state.chatCalls[0];
+                expect(request.tools.map((tool) => tool.function.name)).toEqual(['web_search', 'web_fetch']);
+                expect(state.searchGuides).toBe(1);
+                expect(SEARCH_GUIDE).toMatch(/web_search/);
+                expect(SEARCH_GUIDE).toMatch(/with every request/);
+                expect(request.options.num_ctx).toBe(16384);
+                expect((await get('/models')).data.webSearch).toBe(true);
+            });
+        });
+
+        test('a model that cannot use tools is not offered them', async () => {
+            await withKey(async () => {
+                state.noTools = true;
+                const chat = await newChat({ model: 'qwen2.5-coder:7b' });
+                await send(chat.id, { content: 'find a duck model' });
+                expect(state.chatCalls[0].tools).toBeUndefined();
+                expect(state.searchGuides).toBe(0);
+            });
+        });
+
+        test('searches, reads a page, then answers from what it found', async () => {
+            await withKey(async () => {
+                state.toolPlan = [[search], [fetchPage]];
+                state.chatReply = 'Here is the duck.';
+                const chat = await newChat({ model: 'qwen2.5-coder:7b' });
+                const { events: list } = await send(chat.id, { content: 'find a duck model' });
+
+                expect(list.filter((event) => event.type === 'tool')).toEqual([
+                    { type: 'tool', tool: 'web_search', input: 'duck 3d model' },
+                    { type: 'tool', tool: 'web_fetch', input: 'https://models.example/duck' }
+                ]);
+                expect(state.searches).toEqual(['duck 3d model']);
+                expect(state.searchUrls).toEqual(['https://api.tavily.com/search']);
+                expect(state.fetches).toEqual(['https://models.example/duck']);
+                expect(state.chatCalls).toHaveLength(3);
+
+                const last = state.chatCalls[2].messages;
+                const results = last.filter((message) => message.role === 'tool');
+                expect(results.map((message) => message.tool_name)).toEqual(['web_search', 'web_fetch']);
+                expect(results[0].content).toContain('https://models.example/duck');
+                expect(JSON.parse(results[0].content)).toHaveLength(5);
+                expect(JSON.parse(results[1].content)).toEqual({ title: 'Duck & friends', content: 'Download the duck below.\nfile about', links: ['https://models.example/files/duck.glb', 'https://models.example/about'] });
+                expect(last.filter((message) => message.role === 'assistant' && message.tool_calls)).toHaveLength(2);
+
+                const done = list[list.length - 1];
+                expect(done).toMatchObject({ type: 'done', reply: { content: 'Here is the duck.' } });
+                expect(done.reply.steps).toEqual([
+                    { tool: 'web_search', input: 'duck 3d model', failed: null },
+                    { tool: 'web_fetch', input: 'https://models.example/duck', failed: null }
+                ]);
+                expect((await get(`/chats/${chat.id}`)).data.chat.messages[1].steps).toHaveLength(2);
+            });
+        });
+
+        test('accepts tool arguments written as text, and refuses to read something that is not a web address', async () => {
+            await withKey(async () => {
+                state.toolPlan = [[['web_search', '{"query":"duck"}'], ['web_fetch', { url: 'file:///etc/passwd' }]]];
+                const chat = await newChat({ model: 'qwen2.5-coder:7b' });
+                await send(chat.id, { content: 'find a duck model' });
+                expect(state.searches).toEqual(['duck']);
+                expect(state.fetches).toEqual([]);
+                expect(state.chatCalls[1].messages.filter((message) => message.role === 'tool')[1].content).toMatch(/https/);
+            });
+        });
+
+        test('a failed search is told to the model, and the reply still finishes', async () => {
+            await withKey(async () => {
+                state.searchFails = true;
+                state.toolPlan = [[search]];
+                state.chatReply = 'I could not look that up.';
+                const chat = await newChat({ model: 'qwen2.5-coder:7b' });
+                const { events: list } = await send(chat.id, { content: 'find a duck model' });
+                expect(state.chatCalls[1].messages.find((message) => message.role === 'tool').content).toBe('Error: The search service could not be reached. (ECONNREFUSED)');
+                expect(list[list.length - 1]).toMatchObject({ type: 'done', reply: { content: 'I could not look that up.', error: null } });
+                expect(list.find((event) => event.type === 'toolFailed').failed).toBe('unreachable');
+            });
+        });
+
+        test.each([[403, 'refused', 'The search service refused the request.'], [429, 'limited', 'The search service is limiting requests right now.']])('a search answered with %i is told to the model plainly and kept on the reply', async (status, failed, said) => {
+            await withKey(async () => {
+                state.searchFails = true;
+                state.searchStatus = status;
+                state.toolPlan = [[search]];
+                const chat = await newChat({ model: 'qwen2.5-coder:7b' });
+                const { events: list } = await send(chat.id, { content: 'find a duck model' });
+                expect(state.chatCalls[1].messages.find((message) => message.role === 'tool').content).toBe(`Error: ${said} (status ${status})`);
+                expect(list.find((event) => event.type === 'toolFailed').failed).toBe(failed);
+                expect(list[list.length - 1].reply.steps[0].failed).toBe(failed);
+                expect((await get(`/chats/${chat.id}`)).data.chat.messages[1].steps[0].failed).toBe(failed);
+            });
+        });
+
+        test('tool calls a model writes as text are run as calls and kept out of the reply', async () => {
+            await withKey(async () => {
+                state.toolsAsText = true;
+                state.toolPlan = [[search, ['web_search', { query: 'second' }], ['web_search', { query: 'third' }], ['web_search', { query: 'fourth' }], ['web_search', { query: 'fifth' }]], [fetchPage]];
+                state.chatReply = 'Here is the duck.';
+                const chat = await newChat({ model: 'qwen2.5-coder:7b' });
+                const { events: list } = await send(chat.id, { content: 'find a duck model' });
+                expect(state.searches).toEqual(['duck 3d model', 'second', 'third', 'fourth']);
+                expect(state.fetches).toEqual(['https://models.example/duck']);
+                expect(list.filter((event) => event.type === 'replace')).toEqual([{ type: 'replace', text: '' }, { type: 'replace', text: '' }]);
+                const done = list[list.length - 1];
+                expect(done.reply.content).toBe('Here is the duck.');
+                expect(done.reply.steps).toHaveLength(5);
+                const second = state.chatCalls[1].messages;
+                expect(second.find((message) => message.tool_calls).tool_calls).toHaveLength(4);
+                expect(second.filter((message) => message.role === 'tool')).toHaveLength(4);
+            });
+        });
+
+        test('tool calls written at the end of a reply are found, and anything else is left alone', () => {
+            const call = '{"name": "web_search", "arguments": {"query": "a {b} \\"c\\""}}';
+            const found = { function: { name: 'web_search', arguments: { query: 'a {b} "c"' } } };
+            expect(writtenToolCalls(call)).toEqual({ calls: [found], text: '' });
+            expect(writtenToolCalls(`<tool_call>\n${call}\n</tool_call>`)).toEqual({ calls: [found], text: '' });
+            expect(writtenToolCalls(`\`\`\`json\n[${call},\n{"name":"web_fetch","parameters":{"url":"https://a.example"}}]\n\`\`\``).calls).toHaveLength(2);
+            expect(writtenToolCalls(`I will search first.\n\n${call}\n${call}`)).toEqual({ calls: [found, found], text: 'I will search first.' });
+            expect(writtenToolCalls(`${call}\nThen I will answer.`).calls).toEqual([]);
+            expect(writtenToolCalls('{"name": "delete_everything", "arguments": {}}').calls).toEqual([]);
+            expect(writtenToolCalls('{"name": "web_search", "arguments": {"query": "cut off').calls).toEqual([]);
+            expect(writtenToolCalls('Here is the duck.')).toEqual({ calls: [], text: 'Here is the duck.' });
+        });
+
+        test('will not read a page on a private network', async () => {
+            await withKey(async () => {
+                state.toolPlan = [[['web_fetch', { url: 'https://intranet.example/admin' }]]];
+                const chat = await newChat({ model: 'qwen2.5-coder:7b' });
+                const { events: list } = await send(chat.id, { content: 'read the intranet' });
+                expect(state.fetches).toEqual([]);
+                expect(state.chatCalls[1].messages.find((message) => message.role === 'tool').content).toBe('Error: This address cannot be loaded.');
+                expect(list.find((event) => event.type === 'toolFailed').failed).toBe('blocked');
+            });
+        });
+
+        describe('run by the app', () => {
+            const request0 = (now) => now.chatCalls[0].messages[now.chatCalls[0].messages.length - 1].content;
+
+            const withApp = async (work) => {
+                process.env.TAVILY_API_KEY = 'tvly-test';
+                try {
+                    return await work();
+                } finally {
+                    process.env.TAVILY_API_KEY = '';
+                }
+            };
+
+            test('Stop during the planning step ends at once and cancels the plan', async () => {
+                await withApp(async () => {
+                    state.planHold = true;
+                    const chat = await newChat({ model: 'qwen2.5-coder:7b' });
+                    const pending = send(chat.id, { content: 'find a duck model' });
+                    for (let attempt = 0; attempt < 200 && state.planCalls.length === 0; attempt++) await wait(10);
+                    expect(state.planCalls).toHaveLength(1);
+                    const started = Date.now();
+                    await post(`/chats/${chat.id}/stop`, {});
+                    await pending;
+                    expect(Date.now() - started).toBeLessThan(1500);
+                    expect(state.planAborted).toBe(1);
+                    expect(state.chatCalls).toHaveLength(0);
+                    state.planHold = false;
+                });
+            });
+
+            test('the model plans, the app searches and reads, and only files that load are offered', async () => {
+                await withApp(async () => {
+                    state.plan = { note: '  Looking for a duck   model file.  ', searches: [{ query: 'duck 3d model', fileTypes: ['.GLB'] }] };
+                    state.chatReply = 'Here it is.\n\n```component\n<Model3D src="https://models.example/files/duck.glb" />\n<Image src="https://invented.example/duck.png" />\n<PdfViewer src="https://models.example/duck" />\n```';
+                    const chat = await newChat({ model: 'qwen2.5-coder:7b' });
+                    const { events: list } = await send(chat.id, { content: 'find a duck model, like https://given.example/a.glb' });
+
+                    expect(state.planCalls).toHaveLength(1);
+                    expect(state.planCalls[0]).toMatchObject({ stream: true, format: { type: 'object' } });
+                    expect(state.planCalls[0].messages.map((message) => message.role)).toEqual(['system', 'user']);
+                    expect(state.planCalls[0].messages[1].content).toMatch(/fileTypes[\s\S]*THE USER'S MESSAGE\n/);
+                    expect(state.searches).toEqual(['duck 3d model']);
+                    expect(state.planCalls[0].format.required).toEqual(['note', 'searches']);
+                    expect(list.find((event) => event.type === 'note')).toEqual({ type: 'note', text: 'Looking for a duck model file.' });
+                    expect(list.find((event) => event.type === 'start')).toMatchObject({ loaded: expect.any(Boolean) });
+                    expect(list.filter((event) => event.type === 'tool').map((event) => event.tool)).toEqual(['web_search', 'web_fetch', 'web_fetch', 'web_fetch']);
+                    expect(request0(state).indexOf('Files found')).toBeLessThan(request0(state).indexOf('Pages (web pages'));
+
+                    expect(state.chatCalls).toHaveLength(1);
+                    const request = state.chatCalls[0];
+                    expect(request.tools).toBeUndefined();
+                    expect(request.options.num_ctx).toBe(16384);
+                    expect(request.options.num_predict).toBe(16384);
+                    expect(state.planCalls[0].options.num_ctx).toBe(16384);
+                    expect(request.messages[0].content).toMatch(/WEB RESULTS/);
+                    const asked = request.messages[request.messages.length - 1].content;
+                    expect(asked).toMatch(/^WEB RESULTS/);
+                    expect(asked).toContain('- https://models.example/files/duck.glb (glb)');
+                    expect(asked).not.toContain('missing.glb');
+                    expect(asked).toContain('- https://models.example/hidden/files/duck.glb (glb)');
+                    expect(asked).not.toContain('page.glb');
+                    expect(asked.endsWith('find a duck model, like https://given.example/a.glb')).toBe(true);
+
+                    const done = list[list.length - 1];
+                    expect(state.reviewCalls).toHaveLength(0);
+                    expect(done.reply.unverified).toEqual(['https://invented.example/duck.png', 'https://models.example/duck']);
+                    const saved = (await get(`/chats/${chat.id}`)).data.chat.messages;
+                    expect(saved[0].content).toBe('find a duck model, like https://given.example/a.glb');
+                    expect(saved[1].unverified).toEqual(['https://invented.example/duck.png', 'https://models.example/duck']);
+                    expect(saved[1].steps).toHaveLength(4);
+                });
+            });
+
+            test('an address the user gave is never marked, and nothing is searched when the plan is empty', async () => {
+                await withApp(async () => {
+                    state.chatReply = '```component\n<Model3D src="https://given.example/a.glb" />\n```';
+                    const chat = await newChat({ model: 'qwen2.5-coder:7b' });
+                    const { events: list } = await send(chat.id, { content: 'show https://given.example/a.glb' });
+                    expect(state.searches).toEqual([]);
+                    expect(state.chatCalls[0].messages[state.chatCalls[0].messages.length - 1].content).toBe('show https://given.example/a.glb');
+                    expect(list[list.length - 1].reply.unverified).toEqual([]);
+                    expect(list[list.length - 1].reply.steps).toEqual([]);
+                });
+            });
+
+            test('when the first search finds no file, the app searches once more by file type, and small images are not offered', async () => {
+                await withApp(async () => {
+                    state.plan = { searches: [{ query: 'tiny icons', fileTypes: ['png'] }] };
+                    const chat = await newChat({ model: 'qwen2.5-coder:7b' });
+                    const { events: list } = await send(chat.id, { content: 'find icons' });
+                    expect(state.searches).toEqual(['tiny icons', 'tiny icons filetype:png']);
+                    expect(request0(state)).toContain('- none');
+                    expect(list[list.length - 1].reply.steps.filter((step) => step.tool === 'web_search')).toHaveLength(2);
+                });
+            });
+
+            test('a GitHub page for a file is offered as its raw file', async () => {
+                await withApp(async () => {
+                    state.plan = { searches: [{ query: 'github table', fileTypes: ['csv'] }] };
+                    const chat = await newChat({ model: 'qwen2.5-coder:7b' });
+                    await send(chat.id, { content: 'find a table' });
+                    expect(request0(state)).toContain('- https://raw.githubusercontent.com/owner/repo/main/data.csv (csv)');
+                });
+            });
+
+            test('when the search service is limiting requests the app says so and stops searching', async () => {
+                await withApp(async () => {
+                    state.enginesLimited = true;
+                    state.plan = { searches: [{ query: 'duck', fileTypes: ['glb'] }, { query: 'goose', fileTypes: ['glb'] }] };
+                    const chat = await newChat({ model: 'qwen2.5-coder:7b' });
+                    const { events: list } = await send(chat.id, { content: 'find birds' });
+                    expect(list.filter((event) => event.type === 'toolFailed').map((event) => event.failed)).toEqual(['limited']);
+                    expect(state.searchUrls).toHaveLength(1);
+                    expect(request0(state)).toContain('SEARCH: duck\nThe search service is limiting requests right now, so this search could not be run.');
+                    expect(list[list.length - 1]).toMatchObject({ type: 'done', reply: { error: null } });
+                });
+            });
+
+            test('results that share fewer than two words with the search are dropped as unrelated', async () => {
+                await withApp(async () => {
+                    state.junkResults = true;
+                    state.plan = { searches: [{ query: 'free duck 3d model', fileTypes: [] }] };
+                    const chat = await newChat({ model: 'qwen2.5-coder:7b' });
+                    await send(chat.id, { content: 'find a duck' });
+                    expect(request0(state)).toContain('https://railway.example/duck');
+                    expect(request0(state)).not.toContain('games.example');
+                    expect(state.fetches).toEqual(['https://railway.example/duck']);
+                });
+            });
+
+            test('with a search key the app asks the search service with that key, and a spent allowance is reported as limited', async () => {
+                process.env.TAVILY_API_KEY = 'tvly-test';
+                try {
+                    expect((await get('/models')).data.webSearch).toBe(true);
+                    state.plan = { searches: [{ query: 'duck 3d model', fileTypes: ['glb'] }] };
+                    const chat = await newChat({ model: 'qwen2.5-coder:7b' });
+                    await send(chat.id, { content: 'find a duck model' });
+                    expect(state.searchUrls).toEqual(['https://api.tavily.com/search']);
+                    expect(state.searchRequests[0]).toMatchObject({ method: 'POST', key: 'Bearer tvly-test', body: { query: 'duck 3d model', max_results: 8, search_depth: 'basic' } });
+                    expect(request0(state)).toContain('- https://models.example/files/duck.glb (glb)');
+
+                    state.searchFails = true;
+                    state.searchStatus = 432;
+                    const second = await send(chat.id, { content: 'again' });
+                    expect(second.events.find((event) => event.type === 'toolFailed').failed).toBe('limited');
+                } finally {
+                    process.env.TAVILY_API_KEY = '';
+                }
+            });
+
+            test('when a search finds nothing, the model is asked for deeper searches and pages, and the app stops once they find something', async () => {
+                await withApp(async () => {
+                    state.plan = { searches: [{ query: 'duck 3d model', fileTypes: ['pdf'] }] };
+                    state.reviews = [{
+                        enough: false,
+                        searches: [{ query: 'mallard glb github', fileTypes: ['glb'] }, { query: 'Duck 3D Model', fileTypes: ['glb'] }],
+                        pages: [
+                            { url: 'https://other.example/4', fileTypes: ['csv'] },
+                            { url: 'https://other.example/1', fileTypes: ['csv'] },
+                            { url: 'https://never-found.example/x', fileTypes: ['glb'] }
+                        ]
+                    }, { enough: true, searches: [], pages: [] }];
+                    const chat = await newChat({ model: 'qwen2.5-coder:7b' });
+                    const { events: list } = await send(chat.id, { content: 'find a duck model and a table' });
+
+                    expect(state.reviewCalls).toHaveLength(1);
+                    expect(state.reviewCalls[0].format.properties.enough).toEqual({ type: 'boolean' });
+                    expect(state.reviewCalls[0].messages[1].content).toMatch(/\n\nTHE USER'S MESSAGE\nfind a duck model and a table\n\nFOUND SO FAR\n\nSEARCH: duck 3d model/);
+                    expect(state.reviewCalls[0].messages[1].content).toContain('SEARCHES ALREADY RUN\n- duck 3d model\n\nWORDS ALREADY SEARCHED\nduck, 3d, model');
+                    expect(state.searches).toEqual(['duck 3d model', 'duck 3d model filetype:pdf', 'mallard glb github']);
+                    expect(state.fetches).toContain('https://other.example/4');
+                    expect(state.fetches.filter((address) => address === 'https://other.example/1')).toHaveLength(1);
+                    expect(state.fetches.some((address) => address.includes('never-found'))).toBe(false);
+                    expect(request0(state)).toContain('PAGE: https://other.example/4\nFiles found on this page (csv; each one was loaded successfully; use these in src):\n- https://raw.githubusercontent.com/owner/repo/main/data.csv (csv)');
+                    expect(list[list.length - 1]).toMatchObject({ type: 'done', reply: { error: null } });
+                });
+            });
+
+            test('the search stops when two rounds in a row find nothing new, and a review that cannot be read ends it', async () => {
+                await withApp(async () => {
+                    state.plan = { searches: [{ query: 'duck', fileTypes: ['pdf'] }] };
+                    state.reviews = [1, 2, 3, 4].map((round) => ({ enough: false, searches: [{ query: `alpha${round} beta${round}`, fileTypes: ['pdf'] }], pages: [] }));
+                    const chat = await newChat({ model: 'qwen2.5-coder:7b' });
+                    await send(chat.id, { content: 'find a duck model' });
+                    expect(state.reviewCalls).toHaveLength(2);
+                    expect(state.searches).toEqual(['duck', 'duck filetype:pdf', 'alpha1 beta1', 'alpha1 beta1 filetype:pdf', 'alpha2 beta2', 'alpha2 beta2 filetype:pdf']);
+
+                    state.reviews = ['not json'];
+                    await send(chat.id, { content: 'again' });
+                    expect(state.reviewCalls).toHaveLength(3);
+                    expect(state.searches.slice(6)).toEqual(['duck', 'duck filetype:pdf']);
+                });
+            });
+
+            test('a deeper search must use new words: rewordings of earlier searches are not run', async () => {
+                await withApp(async () => {
+                    state.plan = { searches: [{ query: 'NASA Curiosity rover 3D model glb', fileTypes: ['pdf'] }] };
+                    state.reviews = [{
+                        enough: false,
+                        searches: [
+                            { query: 'Curiosity rover 3D model NASA glb download', fileTypes: ['glb'] },
+                            { query: "NASA's official 3D model of the Curiosity rover", fileTypes: ['glb'] },
+                            { query: 'Curiosity rover 3D model Sketchfab', fileTypes: ['glb'] },
+                            { query: 'Mars Science Laboratory MSL spacecraft mesh', fileTypes: ['pdf'] }
+                        ],
+                        pages: []
+                    }];
+                    const chat = await newChat({ model: 'qwen2.5-coder:7b' });
+                    await send(chat.id, { content: 'find the rover' });
+                    expect(state.searches.filter((query) => !query.includes('filetype:'))).toEqual(['NASA Curiosity rover 3D model glb', 'Mars Science Laboratory MSL spacecraft mesh']);
+                    expect(state.reviewCalls[1].messages[1].content).toContain('- Mars Science Laboratory MSL spacecraft mesh');
+                });
+            });
+
+            test('a question that needs facts gets the text of the best page', async () => {
+                await withApp(async () => {
+                    state.plan = { searches: [{ query: 'duck facts', fileTypes: [] }, { query: '', fileTypes: [] }] };
+                    const chat = await newChat({ model: 'qwen2.5-coder:7b' });
+                    await send(chat.id, { content: 'tell me about ducks' });
+                    const asked = state.chatCalls[0].messages[state.chatCalls[0].messages.length - 1].content;
+                    expect(state.fetches).toEqual(['https://models.example/duck']);
+                    expect(asked).toContain('Text of https://models.example/duck:\nDownload the duck below.');
+                    expect(asked).not.toContain('Files found');
+                });
+            });
+
+            test('a plan that cannot be read or a search that fails still ends in a reply', async () => {
+                await withApp(async () => {
+                    state.plan = 'not json';
+                    const chat = await newChat({ model: 'qwen2.5-coder:7b' });
+                    const first = await send(chat.id, { content: 'find a duck model' });
+                    expect(first.events[first.events.length - 1]).toMatchObject({ type: 'done', reply: { content: 'A short answer', error: null } });
+
+                    state.plan = { searches: [{ query: 'duck', fileTypes: ['glb'] }] };
+                    state.searchFails = true;
+                    state.searchStatus = 403;
+                    const second = await send(chat.id, { content: 'try again' });
+                    expect(second.events.find((event) => event.type === 'toolFailed').failed).toBe('refused');
+                    expect(second.events[second.events.length - 1]).toMatchObject({ type: 'done', reply: { error: null } });
+                });
+            });
+        });
+
+        test('the plan and results instructions are short and say what the app does', () => {
+            expect(PLAN_GUIDE).toMatch(/at most 8/);
+            expect(RESULTS_GUIDE).toMatch(/Never put a page address in src/);
+            expect(REVIEW_GUIDE).toMatch(/deeper searches/);
+            expect(estimateTokens(PLAN_GUIDE) + estimateTokens(RESULTS_GUIDE) + estimateTokens(REVIEW_GUIDE)).toBeLessThan(1100);
+        });
+
+        test('stops offering tools after six rounds so a reply always ends', async () => {
+            await withKey(async () => {
+                state.toolPlan = Array.from({ length: 10 }, () => [search]);
+                const chat = await newChat({ model: 'qwen2.5-coder:7b' });
+                const { events: list } = await send(chat.id, { content: 'find a duck model' });
+                expect(state.searches).toHaveLength(6);
+                expect(state.chatCalls).toHaveLength(7);
+                expect(state.chatCalls[6].tools).toBeUndefined();
+                expect(list[list.length - 1].type).toBe('done');
+            });
+        });
+    });
+
+    describe('Model picker data', () => {
+        test('installed models carry a fit badge and whether they are ready now', async () => {
+            state.running = [{ name: 'qwen2.5-coder:7b', size: 100, size_vram: 100 }];
+            const models = (await get('/models')).data.models;
+            const loaded = models.find((model) => model.name === 'qwen2.5-coder:7b');
+            const idle = models.find((model) => model.name === 'custom-thing:latest');
+            expect(loaded).toMatchObject({ ready: true, canChat: true });
+            expect(loaded.fit).toMatchObject({ fits: expect.any(Boolean), label: expect.any(String) });
+            expect(idle.ready).toBe(false);
+        });
+    });
+
+    describe('Files from FilesystemOne', () => {
+        test('browse passes the caller’s own sign-in through', async () => {
+            const response = await get('/files/browse?path=/');
+            expect(response.status).toBe(200);
+            expect(response.data).toMatchObject({ path: '/', parent: null });
+            expect(response.data.entries).toEqual([
+                { name: 'docs', path: '/docs', type: 'folder', size: 0, updatedAt: null },
+                { name: 'brief.md', path: '/docs/brief.md', type: 'file', size: 42, updatedAt: null }
+            ]);
+
+            const mine = client.cookieJar.getCookieStringSync(client.baseURL).match(/accessToken=([^;]+)/)[1];
+            expect(filesCalls[0].url).toMatch(/^http:\/\/fs-one\.test\/api\/v1\/files\/directory\/contents\?filePath=%2F/);
+            expect(filesCalls[0].cookie).toContain(`accessToken=${mine}`);
+
+            await testStartup.loginAsUser('owner');
+            await get('/files/browse?path=/docs');
+            const theirs = client.cookieJar.getCookieStringSync(client.baseURL).match(/accessToken=([^;]+)/)[1];
+            expect(theirs).not.toBe(mine);
+            expect(filesCalls[1].cookie).toContain(`accessToken=${theirs}`);
+        });
+
+        test('needs sign-in', async () => {
+            client.clearCookies();
+            client.authenticatedAs = null;
+            expect((await get('/files/browse?path=/')).status).toBe(401);
+            expect(filesCalls).toHaveLength(0);
+        });
+
+        test('a folder FilesystemOne refuses stays refused', async () => {
+            const response = await get('/files/browse?path=/private');
+            expect(response.status).toBe(404);
+            expect(response.data).toMatchObject({ code: 'FILE_NOT_FOUND' });
+        });
+
+        test('a file FilesystemOne refuses stays refused', async () => {
+            const response = await get('/files/text?path=/private/secret.md');
+            expect(response.status).toBe(404);
+            expect(response.data).toMatchObject({ code: 'FILE_NOT_FOUND' });
+            const chat = await newChat();
+            expect((await post(`/chats/${chat.id}/attachments`, { path: '/private/secret.md' })).status).toBe(404);
+        });
+
+        test('reads a text file with its size against the model', async () => {
+            const response = await get('/files/text?path=/docs/brief.md&model=qwen2.5-coder:7b');
+            expect(response.data).toMatchObject({
+                name: 'brief.md', path: '/docs/brief.md', text: 'The client wants a harbour survey by June.', capacityTokens: 32768, fits: true
+            });
+        });
+
+        test('attaches a text file and a PDF from FilesystemOne as copies', async () => {
+            const chat = await newChat({ model: 'qwen2.5-coder:7b' });
+            expect((await post(`/chats/${chat.id}/attachments`, { path: '/docs/brief.md' })).status).toBe(201);
+            const second = await post(`/chats/${chat.id}/attachments`, { path: '/docs/report.pdf' });
+            expect(second.data.chat.pendingAttachments.map((file) => [file.name, file.source, file.path])).toEqual([
+                ['brief.md', 'fs-one', '/docs/brief.md'],
+                ['report.pdf', 'fs-one', '/docs/report.pdf']
+            ]);
+
+            fsFiles['/docs/brief.md'].content = 'CHANGED AFTERWARDS';
+            await send(chat.id, { content: 'Compare them.' });
+            const sent = state.chatCalls[0].messages[0].content;
+            expect(sent).toContain('harbour survey by June');
+            expect(sent).toContain('Dredging costs rose in March');
+            expect(sent).not.toContain('CHANGED AFTERWARDS');
+            fsFiles['/docs/brief.md'].content = 'The client wants a harbour survey by June.';
+        });
+
+        test('an image is refused in plain words', async () => {
+            const response = await get('/files/text?path=/docs/photo.png');
+            expect(response.status).toBe(415);
+            expect(response.data).toMatchObject({ code: 'FILE_UNREADABLE' });
+        });
+
+        test('an oversized file is refused', async () => {
+            fsFiles['/docs/huge.txt'] = { type: 'binary', bytes: Buffer.alloc(MAX_ATTACHMENT_BYTES + 10, 'a') };
+            const response = await get('/files/text?path=/docs/huge.txt');
+            delete fsFiles['/docs/huge.txt'];
+            expect(response.status).toBe(413);
+            expect(response.data).toMatchObject({ code: 'FILE_TOO_LARGE' });
+        }, 30000);
+
+        test('FilesystemOne being down gives a plain message and chat still works', async () => {
+            state.filesDown = true;
+            for (const response of [await get('/files/browse?path=/'), await get('/files/text?path=/docs/brief.md')]) {
+                expect(response.status).toBe(503);
+                expect(response.data).toMatchObject({ code: 'FILES_DOWN' });
+                expect(response.data.action).toMatch(/FilesystemOne/);
+            }
+            const chat = await newChat({ model: 'qwen2.5-coder:7b' });
+            expect((await send(chat.id, { content: 'still here?' })).response.status).toBe(200);
+        });
+
+        test('saves text into a folder with the caller’s sign-in', async () => {
+            const response = await post('/files/save', { folder: '/docs', name: 'chat.md', content: '# Chat' });
+            expect(response.status).toBe(201);
+            expect(response.data.path).toBe('/docs/chat.md');
+            const call = filesCalls[0];
+            expect(call.method).toBe('POST');
+            expect(JSON.parse(call.body)).toEqual({ filePath: '/docs/chat.md', content: '# Chat', onConflict: 'rename' });
+            expect(call.cookie).toContain(`csrfToken=${call.csrf}`);
+        });
+
+        test('a folder that cannot be written to is said plainly', async () => {
+            const response = await post('/files/save', { folder: '/locked', name: 'chat.md', content: '# Chat' });
+            expect(response.status).toBe(403);
+            expect(response.data).toMatchObject({ code: 'FILE_NOT_SAVED' });
+        });
+
+        test('rejects a path that is not absolute', async () => {
+            expect((await get('/files/browse?path=docs')).status).toBe(400);
+            expect((await get('/files/text?path=/docs//brief.md')).status).toBe(400);
+            expect(filesCalls).toHaveLength(0);
+        });
+    });
+});
+
+describe('Files loaded from the web', () => {
+    const get = (path) => client.get(`/api/v1${path}`);
+    const address = (url) => `/files/remote?url=${encodeURIComponent(url)}`;
+    const body = (text, headers = {}) => ({ status: 200, headers, stream: Readable.from([Buffer.from(text)]) });
+    let requests = [];
+    let pages = {};
+
+    beforeAll(() => {
+        setRemoteTransport({
+            lookup: async (host) => {
+                if (host === 'intranet.example') return [{ address: '10.0.0.5', family: 4 }];
+                if (host === 'mixed.example') return [{ address: '93.184.216.34', family: 4 }, { address: '127.0.0.1', family: 4 }];
+                if (host === 'gone.example') throw new Error('ENOTFOUND');
+                return [{ address: '93.184.216.34', family: 4 }];
+            },
+            request: async (url, pinned) => {
+                requests.push({ url: url.href, pinned: pinned.address });
+                const page = pages[url.href];
+                if (!page) return { status: 404, headers: {}, stream: Readable.from([]) };
+                return typeof page === 'function' ? page() : page;
+            }
+        });
+    });
+
+    afterAll(() => setRemoteTransport(null));
+
+    beforeEach(async () => {
+        requests = [];
+        pages = {};
+        await testStartup.loginAsUser('user');
+    });
+
+    test.each([
+        ['8.8.8.8', true], ['93.184.216.34', true], ['2606:4700:4700::1111', true], ['192.0.66.161', true], ['198.51.99.1', true],
+        ['192.0.0.8', false], ['192.0.2.1', false], ['198.51.100.7', false], ['203.0.113.9', false],
+        ['127.0.0.1', false], ['10.1.2.3', false], ['172.16.0.1', false], ['172.31.255.255', false], ['192.168.1.10', false],
+        ['169.254.169.254', false], ['100.64.0.1', false], ['0.0.0.0', false], ['224.0.0.1', false],
+        ['::1', false], ['fd00::1', false], ['fe80::1', false], ['::ffff:127.0.0.1', false], ['not-an-ip', false]
+    ])('%s is public: %s', (ip, expected) => {
+        expect(isPublicAddress(ip)).toBe(expected);
+    });
+
+    test('needs sign-in', async () => {
+        client.clearCookies();
+        client.authenticatedAs = null;
+        expect((await get(address('https://files.example/a.obj'))).status).toBe(401);
+        expect(requests).toHaveLength(0);
+    });
+
+    test('passes a public https file through', async () => {
+        pages['https://files.example/house.obj'] = body('v 0 0 0\nv 1 0 0\n', { 'content-type': 'text/html' });
+        const response = await get(address('https://files.example/house.obj'));
+        expect(response.status).toBe(200);
+        expect(String(response.data)).toContain('v 1 0 0');
+        expect(response.headers['content-type']).toMatch(/octet-stream/);
+        expect(response.headers['content-disposition']).toMatch(/attachment/);
+        expect(response.headers['x-content-type-options']).toBe('nosniff');
+        expect(requests).toEqual([{ url: 'https://files.example/house.obj', pinned: '93.184.216.34' }]);
+    });
+
+    test.each([
+        'http://files.example/a.obj',
+        'https://user:pass@files.example/a.obj',
+        'https://127.0.0.1/a.obj',
+        'https://[::1]/a.obj',
+        'https://169.254.169.254/latest/meta-data',
+        'https://intranet.example/a.obj',
+        'https://mixed.example/a.obj'
+    ])('refuses %s without contacting it', async (url) => {
+        const response = await get(address(url));
+        expect([400, 403]).toContain(response.status);
+        expect(requests).toHaveLength(0);
+    });
+
+    test('says plainly when an address is blocked', async () => {
+        const response = await get(address('https://intranet.example/a.obj'));
+        expect(response.data).toMatchObject({ success: false, code: 'REMOTE_BLOCKED' });
+        expect(response.data.action).toMatch(/public https/);
+    });
+
+    test('follows a redirect to a public address but not to a private one', async () => {
+        pages['https://files.example/old.pdf'] = { status: 302, headers: { location: 'https://files.example/new.pdf' }, stream: Readable.from([]) };
+        pages['https://files.example/new.pdf'] = body('%PDF-1.4');
+        expect(String((await get(address('https://files.example/old.pdf'))).data)).toContain('%PDF-1.4');
+
+        pages['https://files.example/trap.pdf'] = { status: 302, headers: { location: 'https://intranet.example/secret.pdf' }, stream: Readable.from([]) };
+        const trapped = await get(address('https://files.example/trap.pdf'));
+        expect(trapped.data).toMatchObject({ code: 'REMOTE_BLOCKED' });
+        expect(requests.some((entry) => entry.url.includes('intranet'))).toBe(false);
+    });
+
+    test('stops after too many redirects', async () => {
+        pages['https://files.example/loop'] = () => ({ status: 302, headers: { location: 'https://files.example/loop' }, stream: Readable.from([]) });
+        const response = await get(address('https://files.example/loop'));
+        expect(response.status).toBe(502);
+        expect(response.data).toMatchObject({ code: 'REMOTE_FAILED' });
+    });
+
+    test('a site that is limiting requests is tried once more, then reported as busy', async () => {
+        let calls = 0;
+        pages['https://files.example/slow.png'] = () => (++calls === 1 ? { status: 429, headers: {}, stream: Readable.from([]) } : body('picture'));
+        const first = await get(address('https://files.example/slow.png'));
+        expect(first.status).toBe(200);
+        expect(calls).toBe(2);
+
+        pages['https://files.example/busy.png'] = () => ({ status: 429, headers: {}, stream: Readable.from([]) });
+        const second = await get(address('https://files.example/busy.png'));
+        expect(second.status).toBe(503);
+        expect(second.data).toMatchObject({ code: 'REMOTE_BUSY' });
+    });
+
+    test('a missing file, an unknown host and an oversized file each get a plain message', async () => {
+        const missing = await get(address('https://files.example/missing.glb'));
+        expect(missing.status).toBe(404);
+        expect(missing.data).toMatchObject({ code: 'REMOTE_NOT_FOUND', message: 'Nothing exists at this address.' });
+        expect((await get(address('https://gone.example/a.glb'))).data).toMatchObject({ code: 'REMOTE_FAILED' });
+        pages['https://files.example/huge.mp4'] = body('x', { 'content-length': String(MAX_REMOTE_BYTES + 1) });
+        const huge = await get(address('https://files.example/huge.mp4'));
+        expect(huge.status).toBe(413);
+        expect(huge.data).toMatchObject({ code: 'REMOTE_TOO_LARGE' });
+    });
+
+    test('needs a url', async () => {
+        expect((await get('/files/remote')).status).toBe(400);
+        expect((await get(address('not a url'))).status).toBe(400);
     });
 });
