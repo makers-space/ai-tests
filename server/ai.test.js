@@ -12,7 +12,7 @@ import {
     GenerationQueue, extractText, estimateTokens, setFilesFetch, MAX_ATTACHMENT_BYTES,
     isPublicAddress, setRemoteTransport, MAX_REMOTE_BYTES, setSearchFetch
 } from '../../server/middleware/ai.middleware.js';
-import { Device, Setting, Download, PersonalModel, Chat, Prompt, deviceSchemas, modelSchemas, chatSchemas, promptSchemas } from '../../server/models/ai.model.js';
+import { Device, Setting, Download, PersonalModel, Chat, Prompt, Guide, GUIDE_STEPS, MANAGER_GUIDE_STEPS, deviceSchemas, modelSchemas, chatSchemas, promptSchemas } from '../../server/models/ai.model.js';
 import { downloads, health, queue, COMPONENT_GUIDE, SEARCH_GUIDE, PLAN_GUIDE, RESULTS_GUIDE, REVIEW_GUIDE, writtenToolCalls } from '../../server/controllers/ai.controller.js';
 
 const MB = 1024 * 1024;
@@ -1182,6 +1182,45 @@ describe('Model endpoints', () => {
             throw new Error(`download ${id} never reached halfway`);
         };
 
+        test('a finished download and a finished reply are announced over the notification socket', async () => {
+            await testStartup.loginAsUser('admin');
+            const token = (await client.get('/api/v1/auth/ws-token')).data.token;
+            const messages = [];
+            const ws = new WebSocket(`ws://localhost:${testStartup.port}/notifications?token=${encodeURIComponent(token)}`);
+            ws.addEventListener('message', (event) => messages.push(JSON.parse(event.data)));
+            await new Promise((resolve, reject) => {
+                ws.addEventListener('open', resolve);
+                ws.addEventListener('error', () => reject(new Error('socket error')));
+            });
+            const seen = async (type) => {
+                for (let attempt = 0; attempt < 200; attempt++) {
+                    const found = messages.find((message) => message.type === type);
+                    if (found) return found;
+                    await new Promise((resolve) => setTimeout(resolve, 25));
+                }
+                throw new Error(`no ${type}; saw ${messages.map((message) => message.type).join(', ')}`);
+            };
+
+            const job = (await post('/models/pull', { name: 'llama3.2:3b' })).data.download;
+            await seen('activity:changed');
+            const finished = await seen('download:finished');
+            expect(finished.data).toMatchObject({ level: 'success', message: 'llama3.2:3b has finished downloading.', model: 'llama3.2:3b', id: job.id });
+            expect(messages.filter((message) => message.type === 'download:finished')).toHaveLength(1);
+
+            const bad = (await post('/models/pull', { name: 'nosuch-model:9b' })).data.download;
+            const failed = await seen('download:failed');
+            expect(failed.data).toMatchObject({ level: 'error', id: bad.id });
+            expect(failed.data.message).toMatch(/nosuch-model:9b could not be downloaded/);
+
+            const chat = (await post('/chats', { model: 'qwen2.5-coder:7b' })).data.chat;
+            const answer = await client.post(`/api/v1/chats/${chat.id}/messages`, { content: 'hello there' });
+            expect(answer.status).toBe(200);
+            const ready = await seen('reply:finished');
+            expect(ready.data).toMatchObject({ level: 'info', chatId: chat.id, path: `/chat/${chat.id}` });
+            expect(ready.data.message).toContain('hello there');
+            ws.close();
+        });
+
         test('an admin starts a download that finishes in the background', async () => {
             await testStartup.loginAsUser('admin');
             const response = await post('/models/pull', { name: 'llama3.2:3b' });
@@ -2240,6 +2279,37 @@ describe('Chat endpoints', () => {
             expect((await fetch(`${client.baseURL}/api/v1/chats/${chat.id}/reply`, { headers: { Cookie: cookie } })).status).toBe(204);
         });
 
+        test('activity lists your own replies in progress and the downloads, and nobody else\'s replies', async () => {
+            expect((await get('/activity')).data).toMatchObject({ replies: [], downloads: expect.any(Array) });
+            const chat = await newChat({ model: 'qwen2.5-coder:7b' });
+            state.chatReply = 'One two three four';
+            state.chatHold = true;
+            const stream = await openStream(chat.id, { content: 'a long request about ducks' });
+            await stream.until((event) => event.type === 'token');
+            await post(`/chats/${chat.id}/messages`, { content: 'and then geese' });
+
+            const mine = (await get('/activity')).data;
+            expect(mine.replies).toEqual([{ chatId: chat.id, title: 'a long request about ducks', model: 'qwen2.5-coder:7b', waiting: 1 }]);
+
+            const owner = client.authenticatedAs;
+            await testStartup.loginAsUser(owner === 'admin' ? 'user' : 'admin');
+            expect((await get('/activity')).data.replies).toEqual([]);
+            await testStartup.loginAsUser(owner || 'user');
+
+            await post(`/chats/${chat.id}/stop`, {});
+            state.chatHold = false;
+            await stream.finished;
+            for (let attempt = 0; attempt < 100; attempt++) {
+                if ((await get('/activity')).data.replies.length === 0) break;
+                await wait(15);
+            }
+            expect((await get('/activity')).data.replies).toEqual([]);
+
+            client.clearCookies();
+            client.authenticatedAs = null;
+            expect((await get('/activity')).status).toBe(401);
+        });
+
         test('Stop ends generation and keeps what was written', async () => {
             const chat = await newChat({ model: 'qwen2.5-coder:7b' });
             state.chatReply = 'One two three four';
@@ -2615,6 +2685,60 @@ describe('Chat endpoints', () => {
             expect(exported).toContain('harbour survey by June');
             const next = (await post(`/chats/${chat.id}/summary`, {})).data.chat;
             expect(next.instructions.map((item) => item.name)).toEqual(['Tone', 'brief.md']);
+        });
+    });
+
+    describe('Setup guide', () => {
+        const put = (body) => client.put('/api/v1/guide', body);
+
+        test('needs sign-in', async () => {
+            client.clearCookies();
+            client.authenticatedAs = null;
+            expect((await get('/guide')).status).toBe(401);
+        });
+
+        test('is on for a first visit, remembers used buttons, and turns itself off when all are used', async () => {
+            await Guide.deleteMany({});
+            await testStartup.loginAsUser('admin');
+            const first = (await get('/guide')).data.guide;
+            expect(first).toMatchObject({ on: true, seen: [] });
+            expect(first.steps).toEqual(GUIDE_STEPS);
+            expect((await Guide.findOne({})).service).toBe('ai-base');
+
+            expect((await post('/guide/seen', { key: 'not.a.button' })).status).toBe(400);
+            const once = (await post('/guide/seen', { key: 'chat.send' })).data.guide;
+            expect(once).toMatchObject({ on: true, seen: ['chat.send'] });
+            expect((await post('/guide/seen', { key: 'chat.send' })).data.guide.seen).toEqual(['chat.send']);
+            expect((await get('/guide')).data.guide.seen).toEqual(['chat.send']);
+
+            await testStartup.loginAsUser('user');
+            await testStartup.loginAsUser('admin');
+            expect((await get('/guide')).data.guide).toMatchObject({ on: true, seen: ['chat.send'] });
+
+            let last = null;
+            for (const key of GUIDE_STEPS) last = (await post('/guide/seen', { key })).data.guide;
+            expect(last.on).toBe(false);
+            expect((await post('/guide/seen', { key: 'chat.new' })).data.guide.on).toBe(false);
+
+            const again = (await put({ on: true })).data.guide;
+            expect(again).toMatchObject({ on: true, seen: [] });
+            expect((await put({ on: false })).data.guide.on).toBe(false);
+            expect((await put({})).status).toBe(400);
+            expect(await Guide.countDocuments({})).toBe(1);
+        });
+
+        test('each person has their own guide, and a regular user is not asked for manager-only buttons', async () => {
+            await Guide.deleteMany({});
+            await testStartup.loginAsUser('admin');
+            await post('/guide/seen', { key: 'chat.send' });
+            await testStartup.loginAsUser('user');
+            const mine = (await get('/guide')).data.guide;
+            expect(mine).toMatchObject({ on: true, seen: [] });
+            expect(mine.steps).toEqual(GUIDE_STEPS.filter((step) => !MANAGER_GUIDE_STEPS.includes(step)));
+            let last = null;
+            for (const key of mine.steps) last = (await post('/guide/seen', { key })).data.guide;
+            expect(last.on).toBe(false);
+            expect(await Guide.countDocuments({})).toBe(2);
         });
     });
 

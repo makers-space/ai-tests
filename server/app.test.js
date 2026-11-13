@@ -1499,4 +1499,119 @@ describe('App Controller and Routes - Comprehensive Tests', () => {
             });
         });
     });
+    describe('Notification WebSocket', () => {
+        const openSocket = (token) => new Promise((resolve, reject) => {
+            const address = `ws://localhost:${testStartup.port}/notifications${token ? `?token=${encodeURIComponent(token)}` : ''}`;
+            const ws = new WebSocket(address);
+            const messages = [];
+            const waiting = [];
+            const closed = new Promise((done) => ws.addEventListener('close', (event) => done(event.code)));
+            ws.addEventListener('message', (event) => {
+                const message = JSON.parse(event.data);
+                messages.push(message);
+                waiting.splice(0).forEach((check) => check());
+            });
+            const next = (type) => new Promise((done, fail) => {
+                const timer = setTimeout(() => fail(new Error(`no ${type} message; saw ${messages.map((m) => m.type).join(', ')}`)), 5000);
+                const check = () => {
+                    const found = messages.find((message) => message.type === type);
+                    if (found) {
+                        clearTimeout(timer);
+                        done(found);
+                    } else waiting.push(check);
+                };
+                check();
+            });
+            ws.addEventListener('open', () => resolve({ ws, messages, next, closed }));
+            ws.addEventListener('error', () => reject(new Error('socket error')));
+            setTimeout(() => reject(new Error('socket timeout')), 5000);
+        });
+        const tokenFor = async (role) => {
+            await testStartup.loginAsUser(role);
+            return (await client.get('/api/v1/auth/ws-token')).data.token;
+        };
+
+        test('refuses a connection without a valid token', async () => {
+            expect(await (await openSocket(null)).closed).toBe(1008);
+            expect(await (await openSocket('not-a-token')).closed).toBe(1008);
+        });
+
+        test('confirms a signed-in connection and answers a ping', async () => {
+            const socket = await openSocket(await tokenFor('user'));
+            const hello = await socket.next('connection:established');
+            expect(hello.data.userId).toBe(String(testStartup.user.id));
+            expect(hello.timestamp).toBeDefined();
+            socket.ws.send(JSON.stringify({ type: 'ping' }));
+            expect((await socket.next('pong')).type).toBe('pong');
+            socket.ws.close();
+        });
+
+        test('a role request reaches owners, and the decision reaches only the person who asked', async () => {
+            const userSocket = await openSocket(await tokenFor('user'));
+            const adminSocket = await openSocket(await tokenFor('admin'));
+            const ownerSocket = await openSocket(await tokenFor('owner'));
+            await Promise.all([userSocket, adminSocket, ownerSocket].map((socket) => socket.next('connection:established')));
+
+            await testStartup.loginAsUser('user');
+            await client.post(`/api/v1/auth/roles/reject/${testStartup.user.id}`);
+            const asked = await client.post('/api/v1/auth/roles/request-elevation', { roles: ['CREATOR'], reason: 'I make themes' });
+            expect([200, 400]).toContain(asked.status);
+            if (asked.status === 200) {
+                const request = await ownerSocket.next('role:requested');
+                expect(request.data).toMatchObject({ level: 'info', userId: String(testStartup.user.id), roles: ['CREATOR'] });
+                expect(request.data.message).toContain('CREATOR');
+            }
+
+            await testStartup.loginAsUser('owner');
+            const decided = await client.post(`/api/v1/auth/roles/reject/${testStartup.user.id}`, { reason: 'Not yet' });
+            expect(decided.status).toBe(200);
+            const rejected = await userSocket.next('role:rejected');
+            expect(rejected.data).toMatchObject({ level: 'warning' });
+            expect(rejected.data.message).toContain('Not yet');
+
+            await new Promise((resolve) => setTimeout(resolve, 200));
+            expect(adminSocket.messages.map((message) => message.type)).toEqual(['connection:established']);
+            expect(ownerSocket.messages.some((message) => message.type === 'role:rejected')).toBe(false);
+            [userSocket, adminSocket, ownerSocket].forEach((socket) => socket.ws.close());
+        });
+
+        test('a notice sent while nobody is connected can be read later, marked read and cleared', async () => {
+            await testStartup.loginAsUser('user');
+            await client.delete('/api/v1/notifications');
+            await client.post(`/api/v1/auth/roles/reject/${testStartup.user.id}`);
+            const asked = await client.post('/api/v1/auth/roles/request-elevation', { roles: ['CREATOR'], reason: 'Later please' });
+            expect([200, 400]).toContain(asked.status);
+
+            await testStartup.loginAsUser('owner');
+            await client.post(`/api/v1/auth/roles/reject/${testStartup.user.id}`, { reason: 'Away test' });
+
+            await testStartup.loginAsUser('user');
+            let list = null;
+            for (let attempt = 0; attempt < 100; attempt++) {
+                list = (await client.get('/api/v1/notifications')).data;
+                if (list.notifications.some((entry) => entry.message.includes('Away test'))) break;
+                await new Promise((resolve) => setTimeout(resolve, 30));
+            }
+            const kept = list.notifications.find((entry) => entry.message.includes('Away test'));
+            expect(kept).toMatchObject({ type: 'role:rejected', level: 'warning', read: false });
+            expect(list.unread).toBeGreaterThanOrEqual(1);
+
+            await testStartup.loginAsUser('admin');
+            expect((await client.get('/api/v1/notifications')).data.notifications.some((entry) => entry.message.includes('Away test'))).toBe(false);
+
+            await testStartup.loginAsUser('user');
+            expect((await client.post('/api/v1/notifications/read', { id: 'nope' })).status).toBe(400);
+            const one = await client.post('/api/v1/notifications/read', { id: kept.id });
+            expect(one.data.unread).toBe(list.unread - 1);
+            expect((await client.delete('/api/v1/notifications?id=nope')).status).toBe(400);
+            expect((await client.post('/api/v1/notifications/read')).data.unread).toBe(0);
+            expect((await client.get('/api/v1/notifications')).data).toMatchObject({ unread: 0 });
+            expect((await client.get('/api/v1/notifications')).data.notifications.every((entry) => entry.read)).toBe(true);
+            expect((await client.delete('/api/v1/notifications')).data.removed).toBeGreaterThanOrEqual(1);
+            expect((await client.get('/api/v1/notifications')).data.notifications).toEqual([]);
+
+            client.clearCookies();
+            expect((await client.get('/api/v1/notifications')).status).toBe(401);
+        });
+    });
 });
