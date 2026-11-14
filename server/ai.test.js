@@ -3796,6 +3796,23 @@ describe('Linked devices', () => {
         expect((await client.delete(`/api/v1/devices/${local.id}`)).status).toBe(404);
     });
 
+    test('a production server leaves its own computer out unless asked to include it', async () => {
+        await testStartup.loginAsUser('admin');
+        const kinds = async () => (await listed()).map((device) => device.kind);
+        const before = { local: process.env.LOCAL_DEVICE, mode: process.env.NODE_ENV };
+        try {
+            delete process.env.LOCAL_DEVICE;
+            expect(await kinds()).toContain('local');
+            process.env.NODE_ENV = 'production';
+            expect(await kinds()).not.toContain('local');
+            process.env.LOCAL_DEVICE = 'true';
+            expect(await kinds()).toContain('local');
+        } finally {
+            process.env.NODE_ENV = before.mode;
+            process.env.LOCAL_DEVICE = before.local;
+        }
+    });
+
     test('with the server\'s own computer switched off, only linked computers count', async () => {
         await Device.deleteMany({ kind: 'companion' });
         process.env.LOCAL_DEVICE = 'false';
