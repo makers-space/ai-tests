@@ -3592,3 +3592,235 @@ describe('Files loaded from the web', () => {
         expect((await get(address('not a url'))).status).toBe(400);
     });
 });
+
+describe('Linked devices', () => {
+    const TAGS = { models: [{ name: 'tiny:1b', model: 'tiny:1b', size: 1000, digest: 'abc', details: { parameter_size: '1B', quantization_level: 'Q4' }, modified_at: new Date().toISOString() }] };
+    const through = (deviceId) => ({ headers: { 'X-Mollama-Device': deviceId }, validateStatus: () => true });
+    const hardware = { hostname: 'laptop', platform: 'darwin', cpu: 'Test CPU', cpuThreads: 8, memoryMb: 16384, gpus: [], gpuMemoryMb: 0, diskFreeMb: 50000, diskTotalMb: 100000 };
+    const open = [];
+
+    // Stands in for the desktop app: connects, says hello, and answers what the server asks of it.
+    const fakeApp = (deviceId, key) => new Promise((resolve) => {
+        const ws = new WebSocket(`ws://localhost:${testStartup.port}/devices`);
+        const app = { ws, welcomed: false, requests: [], closed: new Promise((done) => ws.addEventListener('close', done)) };
+        open.push(ws);
+        const send = (message) => ws.send(JSON.stringify(message));
+        ws.addEventListener('open', () => send({ type: 'hello', deviceId, key }));
+        ws.addEventListener('close', () => resolve(app));
+        ws.addEventListener('message', (event) => {
+            const message = JSON.parse(event.data);
+            if (message.type === 'welcome') {
+                app.welcomed = true;
+                return resolve(app);
+            }
+            if (message.type === 'ask') {
+                return send({ id: message.id, type: 'answer', data: message.what === 'disk' ? { diskFreeMb: 4242, diskTotalMb: 9000 } : { ...hardware, memoryMb: 32768 } });
+            }
+            if (message.type !== 'request') return undefined;
+            app.requests.push(`${message.method} ${message.path}`);
+            const body = message.path === '/api/version' ? { version: '9.9.9' } : message.path === '/api/tags' ? TAGS : message.path === '/api/ps' ? { models: [] } : null;
+            if (!body) {
+                send({ id: message.id, type: 'head', status: 404, headers: { 'content-type': 'application/json' } });
+                send({ id: message.id, type: 'chunk', data: Buffer.from('{"error":"not found"}').toString('base64') });
+                return send({ id: message.id, type: 'end' });
+            }
+            const text = JSON.stringify(body);
+            send({ id: message.id, type: 'head', status: 200, headers: { 'content-type': 'application/json' } });
+            send({ id: message.id, type: 'chunk', data: Buffer.from(text.slice(0, 5)).toString('base64') });
+            send({ id: message.id, type: 'chunk', data: Buffer.from(text.slice(5)).toString('base64') });
+            return send({ id: message.id, type: 'end' });
+        });
+    });
+
+    const link = async (hostname = 'laptop') => {
+        const response = await client.post('/api/v1/devices/link', { hostname, hardware });
+        expect(response.status).toBe(201);
+        return { id: response.data.device.id, key: response.data.key };
+    };
+    const listed = async () => (await client.get('/api/v1/devices')).data.devices;
+    const until = async (check) => {
+        for (let attempt = 0; attempt < 60; attempt += 1) {
+            if (await check()) return true;
+            await new Promise((resolve) => setTimeout(resolve, 50));
+        }
+        return false;
+    };
+
+    beforeAll(async () => {
+        await Device.deleteMany({ kind: 'companion' });
+    });
+
+    beforeEach(() => {
+        setOllamaClientFactory(simpleOllama());
+    });
+
+    afterAll(async () => {
+        delete process.env.LOCAL_DEVICE;
+        process.env.LOCAL_DEVICE = 'true';
+        for (const ws of open) ws.close();
+        await Device.deleteMany({ kind: 'companion' });
+    });
+
+    test('linking needs sign-in and a computer name', async () => {
+        client.clearCookies();
+        client.authenticatedAs = null;
+        expect((await client.post('/api/v1/devices/link', { hostname: 'laptop' })).status).toBe(401);
+        await testStartup.loginAsUser('user');
+        expect((await client.post('/api/v1/devices/link', {})).status).toBe(400);
+        expect((await client.post('/api/v1/devices/link', { hostname: 'laptop', hardware: { memoryMb: 'lots' } })).status).toBe(400);
+    });
+
+    test('a linked computer is listed for its owner as offline, and its key is never stored or shown', async () => {
+        await testStartup.loginAsUser('user');
+        const { id, key } = await link();
+        expect(key).toMatch(/^[0-9a-f]{64}$/);
+
+        const mine = (await listed()).find((device) => device.id === id);
+        expect(mine).toMatchObject({ kind: 'companion', name: 'laptop', online: false, service: 'ai-base' });
+        expect(mine.hardware.memoryMb).toBe(16384);
+        expect(mine.ollama.available).toBe(false);
+        expect(JSON.stringify(mine)).not.toContain(key);
+
+        const stored = await Device.findById(id).select('+keyHash');
+        expect(stored.keyHash).toHaveLength(64);
+        expect(stored.keyHash).not.toBe(key);
+        expect(String(stored.registeredBy)).toBe(String(testStartup.user.id || testStartup.user._id || stored.registeredBy));
+    });
+
+    test('another person cannot see, read, change or remove it', async () => {
+        await testStartup.loginAsUser('user');
+        const { id } = await link();
+
+        await testStartup.loginAsUser('creator');
+        expect((await listed()).some((device) => device.id === id)).toBe(false);
+        expect((await client.get(`/api/v1/devices/${id}`)).status).toBe(404);
+        expect((await client.delete(`/api/v1/devices/${id}`)).status).toBe(404);
+        const status = await client.client.get('/api/v1/setup/status', through(id));
+        expect(status.data.device?.id).not.toBe(id);
+
+        await testStartup.loginAsUser('admin');
+        expect((await client.put(`/api/v1/devices/${id}`, { name: 'Taken' })).status).toBe(404);
+        expect(await Device.exists({ _id: id })).toBeTruthy();
+    });
+
+    test('the same computer name under two accounts makes two separate devices', async () => {
+        await testStartup.loginAsUser('user');
+        const first = await link('shared-name');
+        await testStartup.loginAsUser('creator');
+        const second = await link('shared-name');
+        expect(second.id).not.toBe(first.id);
+    });
+
+    test('a wrong key, an unknown device and a silent connection are all turned away', async () => {
+        await testStartup.loginAsUser('user');
+        const { id } = await link();
+        expect((await fakeApp(id, 'f'.repeat(64))).welcomed).toBe(false);
+        expect((await fakeApp('0'.repeat(24), 'f'.repeat(64))).welcomed).toBe(false);
+        expect((await fakeApp('not-an-id', 'x')).welcomed).toBe(false);
+        expect((await listed()).find((device) => device.id === id).online).toBe(false);
+    });
+
+    test('with the right key the computer comes online and requests travel through it', async () => {
+        await testStartup.loginAsUser('user');
+        const { id, key } = await link();
+        const app = await fakeApp(id, key);
+        expect(app.welcomed).toBe(true);
+
+        const mine = (await listed()).find((device) => device.id === id);
+        expect(mine.online).toBe(true);
+        expect(mine.ollama).toMatchObject({ available: true, version: '9.9.9', modelCount: 1 });
+
+        const status = await client.client.get('/api/v1/setup/status', through(id));
+        expect(status.status).toBe(200);
+        expect(status.data.device).toMatchObject({ id, kind: 'companion' });
+        expect(status.data.ollama).toMatchObject({ available: true, version: '9.9.9', modelCount: 1 });
+        expect(status.data.steps).toEqual({ ollama: true, device: true, model: true });
+
+        const running = await client.client.get('/api/v1/models/running', through(id));
+        expect(running.status).toBe(200);
+        expect(app.requests).toEqual(expect.arrayContaining(['GET /api/version', 'GET /api/tags', 'GET /api/ps']));
+
+        const withoutHeader = await client.get('/api/v1/setup/status');
+        expect(withoutHeader.data.device.kind).toBe('local');
+    });
+
+    test('reading the hardware again asks the computer itself', async () => {
+        await testStartup.loginAsUser('admin');
+        const { id, key } = await link('workstation');
+        await fakeApp(id, key);
+        const response = await client.post(`/api/v1/devices/${id}/detect`, {});
+        expect(response.status).toBe(200);
+        expect(response.data.device.hardware.memoryMb).toBe(32768);
+    });
+
+    test('when the app disconnects the computer goes offline and requests to it fail plainly', async () => {
+        await testStartup.loginAsUser('user');
+        const { id, key } = await link();
+        const app = await fakeApp(id, key);
+        app.ws.close();
+        await app.closed;
+        expect(await until(async () => (await listed()).find((device) => device.id === id).online === false)).toBe(true);
+
+        const status = await client.client.get('/api/v1/setup/status', through(id));
+        expect(status.data.ollama).toMatchObject({ available: false, code: 'DEVICE_OFFLINE' });
+        const models = await client.client.get('/api/v1/models/running', through(id));
+        expect(models.status).toBe(503);
+        expect(models.data.code).toBe('DEVICE_OFFLINE');
+    });
+
+    test('linking again replaces the key, so the old one stops working', async () => {
+        await testStartup.loginAsUser('user');
+        const first = await link();
+        const app = await fakeApp(first.id, first.key);
+        const second = await link();
+        expect(second.id).toBe(first.id);
+        expect(second.key).not.toBe(first.key);
+        await app.closed;
+        expect((await fakeApp(first.id, first.key)).welcomed).toBe(false);
+        expect((await fakeApp(second.id, second.key)).welcomed).toBe(true);
+    });
+
+    test('removing a computer disconnects it and cancels its key', async () => {
+        await testStartup.loginAsUser('user');
+        const { id, key } = await link('to-remove');
+        const app = await fakeApp(id, key);
+        expect((await client.delete(`/api/v1/devices/${id}`)).status).toBe(200);
+        await app.closed;
+        expect(await Device.exists({ _id: id })).toBeNull();
+        expect((await fakeApp(id, key)).welcomed).toBe(false);
+    });
+
+    test('the server\'s own computer cannot be removed', async () => {
+        await testStartup.loginAsUser('admin');
+        const local = (await listed()).find((device) => device.kind === 'local');
+        expect((await client.delete(`/api/v1/devices/${local.id}`)).status).toBe(404);
+    });
+
+    test('with the server\'s own computer switched off, only linked computers count', async () => {
+        await Device.deleteMany({ kind: 'companion' });
+        process.env.LOCAL_DEVICE = 'false';
+        try {
+            await testStartup.loginAsUser('creator');
+            expect(await listed()).toEqual([]);
+            const none = await client.get('/api/v1/setup/status');
+            expect(none.data.device).toBeNull();
+            expect(none.data.ollama).toMatchObject({ available: false, code: 'NO_DEVICE' });
+            const refused = await client.get('/api/v1/models/running');
+            expect(refused.status).toBe(503);
+            expect(refused.data.code).toBe('NO_DEVICE');
+
+            const { id, key } = await link('only-one');
+            const offline = await client.get('/api/v1/setup/status');
+            expect(offline.data.ollama.code).toBe('DEVICE_OFFLINE');
+
+            await fakeApp(id, key);
+            const devices = await listed();
+            expect(devices.map((device) => device.kind)).toEqual(['companion']);
+            const ready = await client.get('/api/v1/setup/status');
+            expect(ready.data.device).toMatchObject({ id, kind: 'companion' });
+            expect(ready.data.ollama.available).toBe(true);
+        } finally {
+            process.env.LOCAL_DEVICE = 'true';
+        }
+    });
+});
