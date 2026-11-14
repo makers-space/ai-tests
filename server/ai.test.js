@@ -7,7 +7,7 @@ import { ROLES, RIGHTS, hasRight } from '../../server/config/rights.js';
 import {
     setOllamaClientFactory, resetOllamaClientFactory, createOllamaClient,
     mapOllamaError, OllamaError, ERROR_CODES,
-    parseNvidiaSmi, detectHardware,
+    parseNvidiaSmi, appleGpus, parseDisplayAdapters, detectHardware,
     fitModel, rankCatalogue, memoryNeededMb, VERDICTS,
     GenerationQueue, extractText, estimateTokens, setFilesFetch, MAX_ATTACHMENT_BYTES,
     isPublicAddress, setRemoteTransport, MAX_REMOTE_BYTES, setSearchFetch
@@ -147,6 +147,42 @@ describe('Hardware reading', () => {
 
     test.each(['', null, undefined, 'not a csv line', 'Card, N/A', ', 8000'])('ignores unusable output %o', (text) => {
         expect(parseNvidiaSmi(text)).toEqual([]);
+    });
+
+    test('an Apple-chip Mac reports its built-in graphics with a share of system memory', () => {
+        const [gpu] = appleGpus({ platform: 'darwin', arch: 'arm64', cpu: 'Apple M2 Pro', memoryMb: 32768 });
+        expect(gpu.name).toBe('Apple M2 Pro built-in graphics');
+        expect(gpu.memoryMb).toBe(21845);
+        expect(appleGpus({ platform: 'darwin', arch: 'arm64', cpu: '', memoryMb: 8192 })[0].name).toBe('Apple chip built-in graphics');
+    });
+
+    test.each([
+        ['an Intel Mac', { platform: 'darwin', arch: 'x64', cpu: 'Intel Core i7', memoryMb: 16384 }],
+        ['a Windows computer', { platform: 'win32', arch: 'x64', cpu: 'AMD Ryzen 7', memoryMb: 32768 }],
+        ['a Linux computer on an ARM chip', { platform: 'linux', arch: 'arm64', cpu: 'Cortex', memoryMb: 8192 }],
+        ['a Mac with unknown memory', { platform: 'darwin', arch: 'arm64', cpu: 'Apple M1', memoryMb: 0 }]
+    ])('%s gets no Apple graphics', (_label, machine) => {
+        expect(appleGpus(machine)).toEqual([]);
+    });
+
+    test('Windows display adapters: an AMD card with its own memory counts, others do not', () => {
+        const GB = 1024 * 1024 * 1024;
+        const adapters = JSON.stringify([
+            { DriverDesc: 'AMD Radeon RX 7800 XT', 'HardwareInformation.qwMemorySize': 16 * GB },
+            { DriverDesc: 'AMD Radeon(TM) Graphics', 'HardwareInformation.qwMemorySize': 0.5 * GB },
+            { DriverDesc: 'Intel(R) UHD Graphics 770', 'HardwareInformation.qwMemorySize': 1 * GB },
+            { DriverDesc: 'NVIDIA GeForce RTX 4060', 'HardwareInformation.qwMemorySize': 8 * GB },
+            { DriverDesc: 'Microsoft Basic Display Adapter' }
+        ]);
+        expect(parseDisplayAdapters(adapters)).toEqual([{ name: 'AMD Radeon RX 7800 XT', memoryMb: 16384 }]);
+    });
+
+    test('Windows display adapters: one adapter arrives as a single object, and bad output is ignored', () => {
+        const one = JSON.stringify({ DriverDesc: 'Radeon RX 6600', 'HardwareInformation.qwMemorySize': 8 * 1024 * 1024 * 1024 });
+        expect(parseDisplayAdapters(one)).toEqual([{ name: 'Radeon RX 6600', memoryMb: 8192 }]);
+        for (const bad of ['', null, undefined, 'not json', '[1, 2]', '{"DriverDesc": 5}']) {
+            expect(parseDisplayAdapters(bad)).toEqual([]);
+        }
     });
 
     test('reads this machine without failing', async () => {
@@ -3794,6 +3830,17 @@ describe('Linked devices', () => {
         await testStartup.loginAsUser('admin');
         const local = (await listed()).find((device) => device.kind === 'local');
         expect((await client.delete(`/api/v1/devices/${local.id}`)).status).toBe(404);
+    });
+
+    test('a browser on another address is allowed to send the chosen device with its requests', async () => {
+        const origin = process.env.ALLOWED_ORIGINS.split(',')[0].trim();
+        const preflight = await fetch(`http://localhost:${testStartup.port}/api/v1/devices`, {
+            method: 'OPTIONS',
+            headers: { Origin: origin, 'Access-Control-Request-Method': 'GET', 'Access-Control-Request-Headers': 'x-mollama-device' }
+        });
+        expect(preflight.status).toBe(200);
+        expect(preflight.headers.get('access-control-allow-origin')).toBe(origin);
+        expect(preflight.headers.get('access-control-allow-headers').toLowerCase()).toContain('x-mollama-device');
     });
 
     test('a production server leaves its own computer out unless asked to include it', async () => {
