@@ -1,7 +1,7 @@
 {
-  "name": "ai-base-tests",
+  "name": "mollama-tests",
   "version": "1.0.0",
-  "description": "Test suite for AI Base API",
+  "description": "Test suite for Mollama API",
   "type": "module",
   "scripts": {
     "test": "vitest run",

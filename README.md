@@ -1,4 +1,4 @@
-# AI Base Test Suite
+# Mollama Test Suite
 
 > **Integration Testing Infrastructure with Vitest**
 
@@ -331,7 +331,7 @@ This approach provides true integration testing rather than mocked unit tests.
 
 ```bash
 # Ensure MongoDB is running
-mongosh mongodb://localhost:27017/ai-base-test-db
+mongosh mongodb://localhost:27017/mollama-test-db
 
 # Ensure Redis is running (if cache enabled)
 redis-cli ping
