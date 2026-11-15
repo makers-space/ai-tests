@@ -5,7 +5,7 @@ import { describe, test, expect, beforeAll, afterAll, beforeEach } from 'vitest'
 import TestStartup from '../utils/test.startup.js';
 import { ROLES, RIGHTS, hasRight } from '../../server/config/rights.js';
 import {
-    setOllamaClientFactory, resetOllamaClientFactory, createOllamaClient,
+    setOllamaClientFactory, resetOllamaClientFactory, createOllamaClient, setLibraryFetch, parseLibrary, parseParameters, parseLibrarySizes,
     mapOllamaError, OllamaError, ERROR_CODES,
     parseNvidiaSmi, appleGpus, parseDisplayAdapters, detectHardware,
     fitModel, rankCatalogue, memoryNeededMb, VERDICTS,
@@ -512,7 +512,50 @@ describe('Device, settings and setup endpoints', () => {
     });
 });
 
-const catalogue = JSON.parse(fs.readFileSync(new URL('../../server/config/ai.catalogue.json', import.meta.url), 'utf8'));
+// Sample models for the fit and ranking tests. The app itself reads the live list from ollama.com.
+const catalogue = [
+    {"tag":"llama3.2:3b","name":"Llama 3.2 3B","description":"Small and quick. Good for short questions, rewording and simple summaries.","goodFor":["chat","writing"],"parameters":3.2,"sizeMb":2000,"moe":false,"capabilities":["tools"]},
+    {"tag":"phi4-mini:3.8b","name":"Phi-4 Mini","description":"A compact model that reasons well for its size. Good for quick answers on modest hardware.","goodFor":["chat","reasoning"],"parameters":3.8,"sizeMb":2500,"moe":false,"capabilities":["tools"]},
+    {"tag":"gemma3:4b","name":"Gemma 3 4B","description":"A small general model with a friendly writing style. Good for drafting and everyday chat.","goodFor":["chat","writing"],"parameters":4.3,"sizeMb":3300,"moe":false,"capabilities":["vision"]},
+    {"tag":"mistral:7b","name":"Mistral 7B","description":"A dependable all-rounder for chat, summaries and short documents.","goodFor":["chat","writing"],"parameters":7.2,"sizeMb":4400,"moe":false,"capabilities":["tools"]},
+    {"tag":"qwen2.5-coder:7b","name":"Qwen 2.5 Coder 7B","description":"Tuned for programming. Good for explaining, writing and fixing code.","goodFor":["code"],"parameters":7.6,"sizeMb":4700,"moe":false,"capabilities":["tools"]},
+    {"tag":"llama3.1:8b","name":"Llama 3.1 8B","description":"A well-rounded everyday assistant that can also use tools, so it suits simple agents.","goodFor":["chat","writing"],"parameters":8,"sizeMb":4900,"moe":false,"capabilities":["tools"]},
+    {"tag":"deepseek-r1:8b","name":"DeepSeek R1 8B","description":"Thinks step by step before answering. Good for problems that need working out.","goodFor":["reasoning"],"parameters":8.2,"sizeMb":5200,"moe":false,"capabilities":["thinking"]},
+    {"tag":"gemma3:12b","name":"Gemma 3 12B","description":"A stronger writer than the small models. Good for longer drafts and careful rewording.","goodFor":["chat","writing"],"parameters":12.2,"sizeMb":8100,"moe":false,"capabilities":["vision"]},
+    {"tag":"qwen2.5:14b","name":"Qwen 2.5 14B","description":"A capable general model for documents, analysis and tool use.","goodFor":["chat","writing","reasoning"],"parameters":14.8,"sizeMb":9000,"moe":false,"capabilities":["tools"]},
+    {"tag":"phi4:14b","name":"Phi-4 14B","description":"Careful and precise. Good for analysis, structured answers and checking work.","goodFor":["reasoning","writing"],"parameters":14.7,"sizeMb":9100,"moe":false,"capabilities":[]},
+    {"tag":"deepseek-r1:14b","name":"DeepSeek R1 14B","description":"Step-by-step reasoning with more depth than the 8B version.","goodFor":["reasoning"],"parameters":14.8,"sizeMb":9000,"moe":false,"capabilities":["thinking"]},
+    {"tag":"gpt-oss:20b","name":"GPT-OSS 20B","description":"A strong general model that reasons and uses tools. Only part of it is active at a time, so it runs on less graphics memory than its size suggests.","goodFor":["chat","reasoning","writing"],"parameters":20.9,"sizeMb":14000,"moe":true,"capabilities":["tools","thinking"]},
+    {"tag":"gemma3:27b","name":"Gemma 3 27B","description":"The largest Gemma. Good for long-form writing and detailed answers on a large graphics card.","goodFor":["chat","writing"],"parameters":27.4,"sizeMb":17000,"moe":false,"capabilities":["vision"]},
+    {"tag":"qwen3:30b","name":"Qwen 3 30B","description":"A large general model that thinks before answering and uses tools. Only part of it is active at a time, so system memory can carry most of it.","goodFor":["chat","reasoning","writing"],"parameters":30.5,"sizeMb":19000,"moe":true,"capabilities":["tools","thinking"]},
+    {"tag":"qwen3-coder:30b","name":"Qwen 3 Coder 30B","description":"A large programming model for bigger coding tasks and agents. Only part of it is active at a time, so system memory can carry most of it.","goodFor":["code"],"parameters":30.5,"sizeMb":19000,"moe":true,"capabilities":["tools"]},
+    {"tag":"qwen2.5-coder:32b","name":"Qwen 2.5 Coder 32B","description":"A top programming model for a 24 GB graphics card.","goodFor":["code"],"parameters":32.8,"sizeMb":20000,"moe":false,"capabilities":["tools"]},
+    {"tag":"llama3.3:70b","name":"Llama 3.3 70B","description":"A very large general model for workstations with a lot of graphics memory.","goodFor":["chat","writing","reasoning"],"parameters":70.6,"sizeMb":43000,"moe":false,"capabilities":["tools"]}
+];
+
+// Stands in for ollama.com: a search page built from the sample models, and a tags page with each size on disk.
+const library = { down: false, empty: false, asked: [] };
+const libraryNames = () => [...new Set(catalogue.map((model) => model.tag.split(':')[0]))];
+const fakeLibrary = async (address) => {
+    const url = new URL(address);
+    library.asked.push(url.pathname + url.search);
+    if (library.down) throw new TypeError('fetch failed');
+    const page = (html) => ({ ok: true, status: 200, text: async () => html });
+    const tags = url.pathname.match(/^\/library\/([^/]+)\/tags$/);
+    if (tags) {
+        return page(catalogue.filter((model) => model.tag.startsWith(`${tags[1]}:`)).map((model) => `<a href="/library/${model.tag}"><span>${model.tag}</span><span>abc123 • ${model.sizeMb}MB • 128K context window</span></a>`).join(''));
+    }
+    if (library.empty) return page('<html><body>Nothing here</body></html>');
+    const wanted = (url.searchParams.get('q') || '').toLowerCase();
+    const second = url.searchParams.get('page') === '2';
+    const names = libraryNames().filter((name) => name.includes(wanted)).filter((name, index) => (wanted ? true : second ? index >= 8 : index < 8));
+    const items = names.map((name) => {
+        const sizes = catalogue.filter((model) => model.tag.startsWith(`${name}:`));
+        return `<li><a href="/library/${name}" class="group"><h2 title="${name}"><span>${name}</span></h2><span title="Updated October 1, 2026">1mo</span>${sizes[0].capabilities.map((ability) => `<span class="a">${ability}</span>`).join('')}${sizes.map((model) => `<span class="s">${model.tag.split(':')[1]}</span>`).join('')}<p class="d">${sizes[0].description}${sizes[0].moe ? ' A mixture of experts model.' : ''}</p><span title="1,234,567 downloads"><span>1.2M</span></span></a></li>`;
+    });
+    return page(`<ul>${items.join('')}</ul>${!wanted && !second ? '<div hx-get="/search?page=2"></div>' : ''}`);
+};
+setLibraryFetch(fakeLibrary);
 const entry = (tag) => catalogue.find((model) => model.tag === tag);
 
 const notFound = (name) => Object.assign(new Error(`model '${name}' not found`), { error: `model '${name}' not found`, status_code: 404 });
@@ -936,7 +979,7 @@ describe('Model endpoints', () => {
 
             const known = response.data.models.find((model) => model.name === 'qwen2.5-coder:7b');
             expect(known).toMatchObject({
-                displayName: 'Qwen 2.5 Coder 7B',
+                displayName: 'qwen2.5-coder:7b',
                 family: 'testfam',
                 parameterSize: '7.6B',
                 quantization: 'Q4_K_M',
@@ -1141,25 +1184,84 @@ describe('Model endpoints', () => {
     });
 
     describe('Catalogue', () => {
-        test('is public and lists every model', async () => {
+        const everything = async (query = '') => {
+            const first = await get(`/catalogue${query ? `?${query}` : ''}`);
+            const second = await get(`/catalogue?${query ? `${query}&` : ''}page=2`);
+            return { first, second, models: [...first.data.models, ...second.data.models] };
+        };
+
+        test('is public and lists the models on ollama.com, a page at a time', async () => {
             signOut();
-            const response = await get('/catalogue');
-            expect(response.status).toBe(200);
-            expect(response.data.models).toHaveLength(catalogue.length);
-            expect(response.data.models[0].fit).toBeNull();
+            const { first, second, models } = await everything();
+            expect(first.status).toBe(200);
+            expect(first.data).toMatchObject({ source: 'ollama.com', page: 1, more: true, query: '' });
+            expect(second.data).toMatchObject({ page: 2, more: false });
+            expect(models.map((model) => model.tag).sort()).toEqual(catalogue.map((model) => model.tag).sort());
+            expect(models[0].fit).toBeNull();
+            const gemma = models.find((model) => model.tag === 'gemma3:12b');
+            expect(gemma).toMatchObject({ parameters: 12, sizeEstimated: false, capabilities: ['vision'], pulls: 1234567, updated: 'October 1, 2026' });
+            expect(Math.abs(gemma.sizeMb - 8100)).toBeLessThan(20);
+            expect(models.find((model) => model.tag === 'qwen2.5-coder:7b').goodFor).toContain('code');
+            expect(models.find((model) => model.tag === 'qwen3:30b').moe).toBe(true);
+        });
+
+        test('searches the whole library by name', async () => {
+            signOut();
+            const found = await get('/catalogue?q=gemma&memoryMb=32768&gpuMemoryMb=8192');
+            expect(found.data.query).toBe('gemma');
+            expect(found.data.models.map((model) => model.tag).sort()).toEqual(['gemma3:12b', 'gemma3:27b', 'gemma3:4b']);
+            expect(found.data.models.every((model) => model.fit.verdict)).toBe(true);
+            expect(library.asked.some((address) => address.startsWith('/search?q=gemma'))).toBe(true);
+            expect((await get('/catalogue?q=nothing-like-this')).data.models).toEqual([]);
+            expect((await get('/catalogue?page=0')).status).toBe(400);
+        });
+
+        test('says plainly when ollama.com cannot be reached or its page cannot be read', async () => {
+            signOut();
+            setLibraryFetch(fakeLibrary);
+            library.down = true;
+            try {
+                const response = await get('/catalogue');
+                expect(response.status).toBe(502);
+                expect(response.data).toMatchObject({ code: 'LIBRARY_UNREACHABLE' });
+                expect(response.data.message).toMatch(/ollama\.com/);
+                library.down = false;
+                library.empty = true;
+                expect((await get('/catalogue')).data).toMatchObject({ code: 'LIBRARY_UNREADABLE' });
+            } finally {
+                library.down = false;
+                library.empty = false;
+                setLibraryFetch(fakeLibrary);
+            }
+            expect((await get('/catalogue')).status).toBe(200);
+        });
+
+        test('reads sizes, abilities and counts from the library pages', () => {
+            expect(parseParameters('12b')).toBe(12);
+            expect(parseParameters('270m')).toBe(0.27);
+            expect(parseParameters('e4b')).toBe(4);
+            expect(parseParameters('8x7b')).toBe(56);
+            expect(parseParameters('29.2M')).toBeNull();
+            expect(parseParameters('latest')).toBeNull();
+            const [model, other] = parseLibrary('<a href="/library/duck" class="x"><h2><span>duck</span></h2><span>tools</span><span>1b</span><span>7b</span><p>Quacks &amp; codes.</p><span title="2,500 downloads"><span>2.5K</span></span></a><a href="/library/duck:7b">tag</a><a href="/library/goose"><p>Honks.</p><span>cloud</span></a>');
+            expect(model).toEqual({ name: 'duck', description: 'Quacks & codes.', capabilities: ['tools'], sizes: ['1b', '7b'], pulls: 2500, updated: null });
+            expect(other).toMatchObject({ name: 'goose', capabilities: ['cloud'], sizes: [] });
+            expect(parseLibrary('<html>nothing</html>')).toEqual([]);
+            expect([...parseLibrarySizes('<a href="/library/duck:7b"><span>duck:7b</span> abc • 4.4GB • 8K</a><a href="/library/duck:1b">x • 815MB •</a>')]).toEqual([['7b', 4506], ['1b', 815]]);
         });
 
         test('gives verdicts for the specs a visitor enters', async () => {
             signOut();
-            const response = await get('/catalogue?memoryMb=32768&gpuMemoryMb=8192');
+            const { first: response, models } = await everything('memoryMb=32768&gpuMemoryMb=8192');
             expect(response.status).toBe(200);
-            const verdict = (tag) => response.data.models.find((model) => model.tag === tag).fit.verdict;
+            const verdict = (tag) => models.find((model) => model.tag === tag).fit.verdict;
             expect(verdict('llama3.1:8b')).toBe('gpu');
             expect(verdict('qwen3-coder:30b')).toBe('mixed');
             expect(verdict('llama3.3:70b')).toBe('too_large');
             expect(response.data.models.slice(0, 3).map((model) => model.pick)).toEqual(['fast', 'balanced', 'best']);
             expect(response.data.reserved).toEqual({ gpuMemoryMb: 1536, memoryMb: 4096 });
-            expect(response.data.notes.join(' ')).toMatch(/mixture-of-experts/);
+            const notes = (await get('/catalogue?memoryMb=32768&gpuMemoryMb=8192&page=2')).data.notes.join(' ');
+            expect(notes).toMatch(/mixture-of-experts/);
             expect(response.data.notes.join(' ')).not.toMatch(/two 7 to 8B/);
         });
 
