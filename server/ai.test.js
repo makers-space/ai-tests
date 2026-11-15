@@ -13,7 +13,7 @@ import {
     isPublicAddress, setRemoteTransport, MAX_REMOTE_BYTES, setSearchFetch
 } from '../../server/middleware/ai.middleware.js';
 import { Device, Setting, Download, PersonalModel, Chat, Prompt, Guide, GUIDE_STEPS, MANAGER_GUIDE_STEPS, deviceSchemas, modelSchemas, chatSchemas, promptSchemas } from '../../server/models/ai.model.js';
-import { downloads, health, queue, COMPONENT_GUIDE, SEARCH_GUIDE, PLAN_GUIDE, RESULTS_GUIDE, REVIEW_GUIDE, writtenToolCalls } from '../../server/controllers/ai.controller.js';
+import { downloads, health, queue, COMPONENT_GUIDE, SEARCH_GUIDE, PLAN_GUIDE, RESULTS_GUIDE, REVIEW_GUIDE, TOUCH_GUIDE, writtenToolCalls } from '../../server/controllers/ai.controller.js';
 
 const MB = 1024 * 1024;
 
@@ -2635,13 +2635,19 @@ describe('Chat endpoints', () => {
             expect(COMPONENT_GUIDE.split('\n')[0]).toMatch(/Answer the user.s message directly in normal Markdown/);
             expect(COMPONENT_GUIDE).toMatch(/Most replies need none/);
             expect(COMPONENT_GUIDE).toMatch(/Never talk about components/);
-            expect(COMPONENT_GUIDE).toMatch(/once in a while, not in every reply/);
-            expect(COMPONENT_GUIDE).toMatch(/Never put the whole reply/);
+            expect(COMPONENT_GUIDE).toMatch(/Do not wrap ordinary text in a Card/);
+            expect(COMPONENT_GUIDE).toMatch(/Do not make up rows/);
+            expect(COMPONENT_GUIDE).toMatch(/A code fence is only for code/);
+            expect(COMPONENT_GUIDE).not.toContain(TOUCH_GUIDE);
+            expect(TOUCH_GUIDE).toMatch(/For this one reply only/);
             expect(COMPONENT_GUIDE).toMatch(/never repeat, summarise or explain it to the user/);
             expect(COMPONENT_GUIDE.trim().slice(-200)).toMatch(/Never list, describe or explain components/);
             expect(PLAN_GUIDE).toMatch(/Start with a verb ending in -ing/);
             expect(RESULTS_GUIDE).toMatch(/the source.s own words or your account of it/);
             expect(RESULTS_GUIDE).toMatch(/Give the answer first/);
+            expect(RESULTS_GUIDE).toMatch(/Never write a quotation, a wording or a figure from memory/);
+            expect(RESULTS_GUIDE).toMatch(/do not fill the gap yourself/);
+            expect(RESULTS_GUIDE).toMatch(/A whole published work[^.]*is not written out/);
             for (const heading of ['VALUES', 'COMPONENTS', 'SHARED ATTRIBUTES', 'LAYOUT ATTRIBUTES (Container and Card)', 'TAGS THAT GO INSIDE OTHERS', 'FILES BY TYPE']) {
                 expect(COMPONENT_GUIDE).toContain(`\n${heading}\n|`);
             }
@@ -3138,6 +3144,14 @@ describe('Chat endpoints', () => {
             });
         });
 
+        test('a decorative touch is offered only after several replies without a component', async () => {
+            const chat = await newChat({ model: 'qwen2.5-coder:7b' });
+            for (let turn = 0; turn < 5; turn++) await send(chat.id, { content: `question ${turn}` });
+            const systems = state.chatCalls.map((call) => call.messages[0].content);
+            expect(systems.slice(0, 4).some((text) => text.includes(TOUCH_GUIDE))).toBe(false);
+            expect(systems[4].endsWith(TOUCH_GUIDE)).toBe(true);
+        });
+
         describe('run by the app', () => {
             const request0 = (now) => now.chatCalls[0].messages[now.chatCalls[0].messages.length - 1].content;
 
@@ -3357,7 +3371,8 @@ describe('Chat endpoints', () => {
                     const chat = await newChat({ model: 'qwen2.5-coder:7b' });
                     await send(chat.id, { content: 'tell me about ducks' });
                     const asked = state.chatCalls[0].messages[state.chatCalls[0].messages.length - 1].content;
-                    expect(state.fetches).toEqual(['https://models.example/duck']);
+                    expect(state.fetches[0]).toBe('https://models.example/duck');
+                    expect(state.fetches.length).toBe(2);
                     expect(asked).toContain('Text of https://models.example/duck:\nDownload the duck below.');
                     expect(asked).not.toContain('Files found');
                 });
@@ -3386,7 +3401,7 @@ describe('Chat endpoints', () => {
             expect(RESULTS_GUIDE).toMatch(/Never tell the user that you cannot search the web/);
             expect(PLAN_GUIDE).toMatch(/always plan at least one search/);
             expect(REVIEW_GUIDE).toMatch(/deeper searches/);
-            expect(estimateTokens(PLAN_GUIDE) + estimateTokens(RESULTS_GUIDE) + estimateTokens(REVIEW_GUIDE)).toBeLessThan(1300);
+            expect(estimateTokens(PLAN_GUIDE) + estimateTokens(RESULTS_GUIDE) + estimateTokens(REVIEW_GUIDE)).toBeLessThan(1500);
         });
 
         test('stops offering tools after six rounds so a reply always ends', async () => {
