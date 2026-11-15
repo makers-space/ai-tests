@@ -3866,6 +3866,41 @@ describe('Linked devices', () => {
         await Download.deleteMany({ model });
     });
 
+    test('a chat remembers its computer and uses it without being told again', async () => {
+        await testStartup.loginAsUser('user');
+        const { id, key } = await link('chat-computer');
+        const app = await fakeApp(id, key);
+
+        const created = await client.post('/api/v1/chats', { device: id, model: 'tiny:1b' });
+        expect(created.status).toBe(201);
+        expect(created.data.chat.device).toBe(id);
+
+        app.requests.length = 0;
+        const opened = await client.get(`/api/v1/chats/${created.data.chat.id}`);
+        expect(opened.data.chat.device).toBe(id);
+        expect(app.requests.some((request) => request.startsWith('POST /api/show'))).toBe(true);
+
+        const plain = await client.post('/api/v1/chats', { model: 'tiny:1b' });
+        expect(plain.data.chat.device).toBeNull();
+        app.requests.length = 0;
+        await client.get(`/api/v1/chats/${plain.data.chat.id}`);
+        expect(app.requests).toEqual([]);
+
+        const cleared = await client.patch(`/api/v1/chats/${created.data.chat.id}`, { device: null });
+        expect(cleared.data.chat.device).toBeNull();
+        expect((await client.patch(`/api/v1/chats/${created.data.chat.id}`, { device: id })).data.chat.device).toBe(id);
+    });
+
+    test('a chat cannot be put on another person\'s computer', async () => {
+        await testStartup.loginAsUser('user');
+        const { id } = await link('not-yours');
+        await testStartup.loginAsUser('creator');
+        expect((await client.post('/api/v1/chats', { device: id })).status).toBe(404);
+        const mine = await client.post('/api/v1/chats', {});
+        expect((await client.patch(`/api/v1/chats/${mine.data.chat.id}`, { device: id })).status).toBe(404);
+        expect((await client.patch(`/api/v1/chats/${mine.data.chat.id}`, { device: 'not-an-id' })).status).toBe(400);
+    });
+
     test('removing a computer disconnects it and cancels its key', async () => {
         await testStartup.loginAsUser('user');
         const { id, key } = await link('to-remove');
