@@ -1803,6 +1803,24 @@ describe('Generation queue', () => {
         await third.done;
     });
 
+    test('each computer has its own line, so one never waits for another', async () => {
+        const line = new GenerationQueue();
+        const first = gate();
+        const ran = [];
+        line.add({ userId: 'a', lane: 'mac', run: async () => { ran.push('mac'); await first.waiting; } });
+        const other = line.add({ userId: 'a', lane: 'pc', run: async () => ran.push('pc') });
+        const behind = line.add({ userId: 'b', lane: 'mac', run: async () => ran.push('mac again') });
+        await other.done;
+        expect(ran).toEqual(['mac', 'pc']);
+        expect(behind.ahead()).toBe(1);
+        expect(line.runningIn('mac')).toBe(1);
+        await settle();
+        expect(line.busyIn('pc')).toBe(false);
+        first.open();
+        await behind.done;
+        expect(ran).toEqual(['mac', 'pc', 'mac again']);
+    });
+
     test('a cancelled job never runs, and a failed job does not block the next', async () => {
         const line = new GenerationQueue();
         const first = gate();
@@ -2617,7 +2635,8 @@ describe('Chat endpoints', () => {
             expect(COMPONENT_GUIDE.split('\n')[0]).toMatch(/Answer the user.s message directly in normal Markdown/);
             expect(COMPONENT_GUIDE).toMatch(/Most replies need none/);
             expect(COMPONENT_GUIDE).toMatch(/Never talk about components/);
-            expect(COMPONENT_GUIDE).toMatch(/Do not wrap ordinary text in a Card/);
+            expect(COMPONENT_GUIDE).toMatch(/once in a while, not in every reply/);
+            expect(COMPONENT_GUIDE).toMatch(/Never put the whole reply/);
             expect(COMPONENT_GUIDE).toMatch(/never repeat, summarise or explain it to the user/);
             expect(COMPONENT_GUIDE.trim().slice(-200)).toMatch(/Never list, describe or explain components/);
             expect(PLAN_GUIDE).toMatch(/Start with a verb ending in -ing/);
@@ -3790,6 +3809,26 @@ describe('Linked devices', () => {
         expect(withoutHeader.data.device.kind).toBe('local');
     });
 
+    test('one computer without Ollama is not a problem while another can run models', async () => {
+        await testStartup.loginAsUser('user');
+        const { id, key } = await link('works');
+        const app = await fakeApp(id, key);
+
+        setOllamaClientFactory(simpleOllama({ up: false }));
+        const status = await client.get('/api/v1/setup/status');
+        expect(status.data.ollama).toMatchObject({ available: false, code: 'OLLAMA_DOWN' });
+        expect(status.data.account).toEqual({ available: true });
+        expect(status.data.ready).toBe(id);
+
+        for (const ws of open) ws.close();
+        await app.closed;
+        expect(await until(async () => (await listed()).every((device) => device.kind === 'local' || !device.online))).toBe(true);
+        const none = await client.get('/api/v1/setup/status');
+        expect(none.data.ready).toBeNull();
+        expect(none.data.account).toMatchObject({ available: false, code: 'NOTHING_READY' });
+        expect(none.data.account.message).not.toMatch(/this device/i);
+    });
+
     test('reading the hardware again asks the computer itself', async () => {
         await testStartup.loginAsUser('admin');
         const { id, key } = await link('workstation');
@@ -3976,6 +4015,7 @@ describe('Linked devices', () => {
             const none = await client.get('/api/v1/setup/status');
             expect(none.data.device).toBeNull();
             expect(none.data.ollama).toMatchObject({ available: false, code: 'NO_DEVICE' });
+            expect(none.data.account).toMatchObject({ available: false, code: 'NO_DEVICE' });
             const refused = await client.get('/api/v1/models/running');
             expect(refused.status).toBe(503);
             expect(refused.data.code).toBe('NO_DEVICE');
@@ -3990,6 +4030,7 @@ describe('Linked devices', () => {
             const ready = await client.get('/api/v1/setup/status');
             expect(ready.data.device).toMatchObject({ id, kind: 'companion' });
             expect(ready.data.ollama.available).toBe(true);
+            expect(ready.data.ready).toBe(id);
         } finally {
             process.env.LOCAL_DEVICE = 'true';
         }
