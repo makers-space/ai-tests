@@ -3816,6 +3816,25 @@ describe('Linked devices', () => {
         expect((await fakeApp(second.id, second.key)).welcomed).toBe(true);
     });
 
+    test('signing out of the desktop app takes the computer off the account, but a dropped connection does not', async () => {
+        await testStartup.loginAsUser('user');
+        const kept = await link('just-offline');
+        const dropped = await fakeApp(kept.id, kept.key);
+        dropped.ws.close();
+        await dropped.closed;
+        expect(await until(async () => (await listed()).find((device) => device.id === kept.id)?.online === false)).toBe(true);
+
+        const leaving = await link('signing-out');
+        const app = await fakeApp(leaving.id, leaving.key);
+        app.ws.send(JSON.stringify({ type: 'goodbye' }));
+        app.ws.close();
+        await app.closed;
+        expect(await until(async () => !(await listed()).some((device) => device.id === leaving.id))).toBe(true);
+        expect(await Device.exists({ _id: leaving.id })).toBeNull();
+        expect((await fakeApp(leaving.id, leaving.key)).welcomed).toBe(false);
+        expect(await Device.exists({ _id: kept.id })).toBeTruthy();
+    });
+
     test('removing a computer disconnects it and cancels its key', async () => {
         await testStartup.loginAsUser('user');
         const { id, key } = await link('to-remove');
@@ -3830,6 +3849,18 @@ describe('Linked devices', () => {
         await testStartup.loginAsUser('admin');
         const local = (await listed()).find((device) => device.kind === 'local');
         expect((await client.delete(`/api/v1/devices/${local.id}`)).status).toBe(404);
+    });
+
+    test('an Apple-chip Mac shows its built-in graphics even when its app reported none', async () => {
+        await testStartup.loginAsUser('user');
+        const reported = { ...hardware, platform: 'darwin', gpus: [], gpuMemoryMb: 0 };
+        const mac = await client.post('/api/v1/devices/link', { hostname: 'apple-mac', hardware: { ...reported, cpu: 'Apple M3 Pro', memoryMb: 18432 } });
+        const intel = await client.post('/api/v1/devices/link', { hostname: 'intel-mac', hardware: { ...reported, cpu: 'Intel(R) Core(TM) i7-9750H', memoryMb: 16384 } });
+        const devices = await listed();
+        const shown = (id) => devices.find((device) => device.id === id).hardware;
+
+        expect(shown(mac.data.device.id)).toMatchObject({ gpuName: 'Apple M3 Pro built-in graphics', gpuMemoryMb: 12288, hasGpu: true });
+        expect(shown(intel.data.device.id)).toMatchObject({ gpuName: null, gpuMemoryMb: 0, hasGpu: false });
     });
 
     test('a browser on another address is allowed to send the chosen device with its requests', async () => {
