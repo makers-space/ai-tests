@@ -5,7 +5,7 @@ import { describe, test, expect, beforeAll, afterAll, beforeEach } from 'vitest'
 import TestStartup from '../utils/test.startup.js';
 import { ROLES, RIGHTS, hasRight } from '../../server/config/rights.js';
 import {
-    setOllamaClientFactory, resetOllamaClientFactory, createOllamaClient, setLibraryFetch, parseLibrary, parseParameters, parseLibrarySizes,
+    setOllamaClientFactory, resetOllamaClientFactory, createOllamaClient, setLibraryFetch, parseLibrary, parseParameters, parseLibrarySizes, friendlyName,
     mapOllamaError, OllamaError, ERROR_CODES,
     parseNvidiaSmi, appleGpus, parseDisplayAdapters, detectHardware,
     fitModel, rankCatalogue, memoryNeededMb, VERDICTS,
@@ -534,11 +534,12 @@ const catalogue = [
 ];
 
 // Stands in for ollama.com: a search page built from the sample models, and a tags page with each size on disk.
-const library = { down: false, empty: false, asked: [] };
+const library = { down: false, empty: false, asked: [], marked: [] };
 const libraryNames = () => [...new Set(catalogue.map((model) => model.tag.split(':')[0]))];
-const fakeLibrary = async (address) => {
+const fakeLibrary = async (address, options = {}) => {
     const url = new URL(address);
     library.asked.push(url.pathname + url.search);
+    if (options.headers?.['HX-Request']) library.marked.push(url.pathname + url.search);
     if (library.down) throw new TypeError('fetch failed');
     const page = (html) => ({ ok: true, status: 200, text: async () => html });
     const tags = url.pathname.match(/^\/library\/([^/]+)\/tags$/);
@@ -547,7 +548,8 @@ const fakeLibrary = async (address) => {
     }
     if (library.empty) return page('<html><body>Nothing here</body></html>');
     const wanted = (url.searchParams.get('q') || '').toLowerCase();
-    const second = url.searchParams.get('page') === '2';
+    const second = url.searchParams.get('page') === '2' && Boolean(options.headers?.['HX-Request']);
+    if (Number(url.searchParams.get('page')) > 2) return page('<ul></ul>');
     const names = libraryNames().filter((name) => name.includes(wanted)).filter((name, index) => (wanted ? true : second ? index >= 8 : index < 8));
     const items = names.map((name) => {
         const sizes = catalogue.filter((model) => model.tag.startsWith(`${name}:`));
@@ -979,7 +981,7 @@ describe('Model endpoints', () => {
 
             const known = response.data.models.find((model) => model.name === 'qwen2.5-coder:7b');
             expect(known).toMatchObject({
-                displayName: 'qwen2.5-coder:7b',
+                displayName: 'Qwen 2.5 Coder 7B',
                 family: 'testfam',
                 parameterSize: '7.6B',
                 quantization: 'Q4_K_M',
@@ -991,7 +993,7 @@ describe('Model endpoints', () => {
             expect(known.sizeBytes).toBe(4700 * MB);
 
             const unknown = response.data.models.find((model) => model.name === 'custom-thing:latest');
-            expect(unknown.displayName).toBe('custom-thing:latest');
+            expect(unknown.displayName).toBe('Custom Thing');
             expect(response.data.disk).toEqual(expect.objectContaining({ usedByModelsMb: 4750 }));
         });
 
@@ -1194,13 +1196,14 @@ describe('Model endpoints', () => {
             signOut();
             const { first, second, models } = await everything();
             expect(first.status).toBe(200);
-            expect(first.data).toMatchObject({ source: 'ollama.com', page: 1, more: true, query: '' });
-            expect(second.data).toMatchObject({ page: 2, more: false });
-            expect(models.map((model) => model.tag).sort()).toEqual(catalogue.map((model) => model.tag).sort());
+            expect(first.data).toMatchObject({ source: 'ollama.com', page: 1, more: false, query: '', total: catalogue.length, library: libraryNames().length });
+            expect(second.data).toMatchObject({ page: 2, more: false, models: [] });
+            expect(first.data.models.map((model) => model.tag).sort()).toEqual(catalogue.map((model) => model.tag).sort());
+            expect(library.marked).toContain('/search?page=2');
+            expect(library.asked).toContain('/search');
             expect(models[0].fit).toBeNull();
             const gemma = models.find((model) => model.tag === 'gemma3:12b');
-            expect(gemma).toMatchObject({ parameters: 12, sizeEstimated: false, capabilities: ['vision'], pulls: 1234567, updated: 'October 1, 2026' });
-            expect(Math.abs(gemma.sizeMb - 8100)).toBeLessThan(20);
+            expect(gemma).toMatchObject({ name: 'Gemma 3 12B', parameters: 12, sizeEstimated: false, sizeMb: 8100, capabilities: ['vision'], pulls: 1234567, updated: 'October 1, 2026' });
             expect(models.find((model) => model.tag === 'qwen2.5-coder:7b').goodFor).toContain('code');
             expect(models.find((model) => model.tag === 'qwen3:30b').moe).toBe(true);
         });
@@ -1211,7 +1214,8 @@ describe('Model endpoints', () => {
             expect(found.data.query).toBe('gemma');
             expect(found.data.models.map((model) => model.tag).sort()).toEqual(['gemma3:12b', 'gemma3:27b', 'gemma3:4b']);
             expect(found.data.models.every((model) => model.fit.verdict)).toBe(true);
-            expect(library.asked.some((address) => address.startsWith('/search?q=gemma'))).toBe(true);
+            expect(found.data).toMatchObject({ total: 3, fitting: 3, library: libraryNames().length });
+            expect((await get('/catalogue?q=coder%20qwen3')).data.models.map((model) => model.tag)).toEqual(['qwen3-coder:30b']);
             expect((await get('/catalogue?q=nothing-like-this')).data.models).toEqual([]);
             expect((await get('/catalogue?page=0')).status).toBe(400);
         });
@@ -1243,6 +1247,8 @@ describe('Model endpoints', () => {
             expect(parseParameters('8x7b')).toBe(56);
             expect(parseParameters('29.2M')).toBeNull();
             expect(parseParameters('latest')).toBeNull();
+            expect(['gemma3:12b', 'qwen2.5-coder:7b', 'deepseek-r1:14b', 'gpt-oss:20b', 'phi4-mini:3.8b', 'mixtral:8x7b', 'glm-5.3:latest', 'someone/unlisted:q4'].map(friendlyName))
+                .toEqual(['Gemma 3 12B', 'Qwen 2.5 Coder 7B', 'Deepseek R1 14B', 'GPT OSS 20B', 'Phi 4 Mini 3.8B', 'Mixtral 8x7B', 'GLM 5.3', 'someone/unlisted:q4']);
             const [model, other] = parseLibrary('<a href="/library/duck" class="x"><h2><span>duck</span></h2><span>tools</span><span>1b</span><span>7b</span><p>Quacks &amp; codes.</p><span title="2,500 downloads"><span>2.5K</span></span></a><a href="/library/duck:7b">tag</a><a href="/library/goose"><p>Honks.</p><span>cloud</span></a>');
             expect(model).toEqual({ name: 'duck', description: 'Quacks & codes.', capabilities: ['tools'], sizes: ['1b', '7b'], pulls: 2500, updated: null });
             expect(other).toMatchObject({ name: 'goose', capabilities: ['cloud'], sizes: [] });
