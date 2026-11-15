@@ -3260,6 +3260,7 @@ describe('Chat endpoints', () => {
         });
 
         test('skills are listed, and a chat sends only the ones it has turned on', async () => {
+            expect((await get('/skills')).data.webSearch).toBe(false);
             const listed = (await get('/skills')).data.skills;
             expect(listed.map((skill) => skill.id)).toEqual(SKILLS.map((skill) => skill.id));
             expect(listed.find((skill) => skill.id === 'components')).toMatchObject({ default: true });
@@ -3499,6 +3500,10 @@ describe('Chat endpoints', () => {
             test('a chat with web search switched off is answered without searching', async () => {
                 await withApp(async () => {
                     state.plan = { searches: [{ query: 'duck facts', fileTypes: [] }] };
+                    expect((await get('/skills')).data.webSearch).toBe(true);
+                    state.up = false;
+                    expect((await get('/models')).data).toMatchObject({ ollamaAvailable: false, webSearch: true });
+                    state.up = true;
                     const chat = await newChat({ model: 'qwen2.5-coder:7b', webSearch: false });
                     expect(chat.webSearch).toBe(false);
                     await send(chat.id, { content: 'search the web for ducks' });
