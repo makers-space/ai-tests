@@ -3835,6 +3835,37 @@ describe('Linked devices', () => {
         expect(await Device.exists({ _id: kept.id })).toBeTruthy();
     });
 
+    test('the same model can be downloading on two computers, each with its own list', async () => {
+        await testStartup.loginAsUser('admin');
+        const model = 'shared-model:1b';
+        await Download.deleteMany({ model });
+        const { id, key } = await link('second-computer');
+        await fakeApp(id, key);
+
+        const onServer = await client.post('/api/v1/models/pull', { name: model });
+        const onLinked = await client.client.post('/api/v1/models/pull', { name: model }, through(id));
+        expect(onServer.status).toBe(202);
+        expect(onLinked.status).toBe(202);
+        expect(onLinked.data.download.id).not.toBe(onServer.data.download.id);
+        expect(onServer.data.download.device).toBeNull();
+        expect(onLinked.data.download.device).toBe(id);
+
+        const again = await client.client.post('/api/v1/models/pull', { name: model }, through(id));
+        expect(again.data.download.id).toBe(onLinked.data.download.id);
+
+        const serverList = (await client.get('/api/v1/models/downloads')).data.downloads.filter((job) => job.model === model);
+        const linkedList = (await client.client.get('/api/v1/models/downloads', through(id))).data.downloads.filter((job) => job.model === model);
+        expect(serverList.map((job) => job.id)).toEqual([onServer.data.download.id]);
+        expect(linkedList.map((job) => job.id)).toEqual([onLinked.data.download.id]);
+
+        await testStartup.loginAsUser('creator');
+        const others = (await client.client.get('/api/v1/models/downloads', through(id))).data.downloads;
+        expect(others.some((job) => job.id === onLinked.data.download.id)).toBe(false);
+        await downloads.settled(onServer.data.download.id).catch(() => {});
+        await downloads.settled(onLinked.data.download.id).catch(() => {});
+        await Download.deleteMany({ model });
+    });
+
     test('removing a computer disconnects it and cancels its key', async () => {
         await testStartup.loginAsUser('user');
         const { id, key } = await link('to-remove');
