@@ -2648,6 +2648,8 @@ describe('Chat endpoints', () => {
             expect(RESULTS_GUIDE).toMatch(/Never write a quotation, a wording or a figure from memory/);
             expect(RESULTS_GUIDE).toMatch(/do not fill the gap yourself/);
             expect(RESULTS_GUIDE).toMatch(/A whole published work[^.]*is not written out/);
+            expect(RESULTS_GUIDE).toMatch(/Say plainly that it is copyrighted[^.]*\. Then give the direct source/);
+            expect(COMPONENT_GUIDE).toMatch(/Do not write out a whole copyrighted work/);
             for (const heading of ['VALUES', 'COMPONENTS', 'SHARED ATTRIBUTES', 'LAYOUT ATTRIBUTES (Container and Card)', 'TAGS THAT GO INSIDE OTHERS', 'FILES BY TYPE']) {
                 expect(COMPONENT_GUIDE).toContain(`\n${heading}\n|`);
             }
