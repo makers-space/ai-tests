@@ -2614,7 +2614,15 @@ describe('Chat endpoints', () => {
 
     describe('Built-in component guide', () => {
         test('explains the tag format, every component and its attributes', () => {
-            expect(COMPONENT_GUIDE.split('\n')[0]).toMatch(/used primarily to display information in the chat/);
+            expect(COMPONENT_GUIDE.split('\n')[0]).toMatch(/Answer the user.s message directly in normal Markdown/);
+            expect(COMPONENT_GUIDE).toMatch(/Most replies need none/);
+            expect(COMPONENT_GUIDE).toMatch(/Never talk about components/);
+            expect(COMPONENT_GUIDE).toMatch(/Do not wrap ordinary text in a Card/);
+            expect(COMPONENT_GUIDE).toMatch(/never repeat, summarise or explain it to the user/);
+            expect(COMPONENT_GUIDE.trim().slice(-200)).toMatch(/Never list, describe or explain components/);
+            expect(PLAN_GUIDE).toMatch(/Start with a verb ending in -ing/);
+            expect(RESULTS_GUIDE).toMatch(/the source.s own words or your account of it/);
+            expect(RESULTS_GUIDE).toMatch(/Give the answer first/);
             for (const heading of ['VALUES', 'COMPONENTS', 'SHARED ATTRIBUTES', 'LAYOUT ATTRIBUTES (Container and Card)', 'TAGS THAT GO INSIDE OTHERS', 'FILES BY TYPE']) {
                 expect(COMPONENT_GUIDE).toContain(`\n${heading}\n|`);
             }
@@ -3356,8 +3364,10 @@ describe('Chat endpoints', () => {
         test('the plan and results instructions are short and say what the app does', () => {
             expect(PLAN_GUIDE).toMatch(/at most 8/);
             expect(RESULTS_GUIDE).toMatch(/Never put a page address in src/);
+            expect(RESULTS_GUIDE).toMatch(/Never tell the user that you cannot search the web/);
+            expect(PLAN_GUIDE).toMatch(/always plan at least one search/);
             expect(REVIEW_GUIDE).toMatch(/deeper searches/);
-            expect(estimateTokens(PLAN_GUIDE) + estimateTokens(RESULTS_GUIDE) + estimateTokens(REVIEW_GUIDE)).toBeLessThan(1100);
+            expect(estimateTokens(PLAN_GUIDE) + estimateTokens(RESULTS_GUIDE) + estimateTokens(REVIEW_GUIDE)).toBeLessThan(1300);
         });
 
         test('stops offering tools after six rounds so a reply always ends', async () => {
