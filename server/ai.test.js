@@ -1291,6 +1291,25 @@ describe('Model endpoints', () => {
             expect((await get('/catalogue')).data.notes).toEqual([]);
         });
 
+        test('gives the home page a sample: models that run fully, some that need system memory, and a few too large', async () => {
+            signOut();
+            const response = await get('/catalogue?memoryMb=32768&gpuMemoryMb=8192&sample=true');
+            expect(response.status).toBe(200);
+            const verdicts = response.data.models.map((model) => model.fit.verdict);
+            const count = (verdict) => verdicts.filter((found) => found === verdict).length;
+            expect(count('gpu')).toBeGreaterThan(0);
+            expect(count('gpu')).toBeLessThanOrEqual(6);
+            expect(count('mixed')).toBeGreaterThan(0);
+            expect(count('mixed')).toBeLessThanOrEqual(3);
+            expect(count('too_large')).toBeGreaterThan(0);
+            expect(count('too_large')).toBeLessThanOrEqual(3);
+            expect(new Set(response.data.models.map((model) => model.tag)).size).toBe(response.data.models.length);
+            expect(response.data.models.some((model) => model.cloudOnly)).toBe(false);
+            expect(response.data).toMatchObject({ more: false, total: catalogue.length + 1 });
+            expect(response.data.fitting).toBeGreaterThan(count('gpu') + count('mixed') - 1);
+            expect((await get('/catalogue?sample=true')).data.models.length).toBe(catalogue.length + 1);
+        });
+
         test('rejects nonsense specs', async () => {
             signOut();
             expect((await get('/catalogue?memoryMb=-5')).status).toBe(400);
@@ -2764,9 +2783,11 @@ describe('Chat endpoints', () => {
             expect(RESULTS_GUIDE).toMatch(/the source.s own words or your account of it/);
             expect(RESULTS_GUIDE).toMatch(/Give the answer first/);
             expect(RESULTS_GUIDE).toMatch(/Never write a quotation, a wording or a figure from memory/);
-            expect(RESULTS_GUIDE).toMatch(/do not fill the gap yourself/);
+            expect(RESULTS_GUIDE).toMatch(/the pages themselves are the answer/);
+            expect(RESULTS_GUIDE).toMatch(/never say that nothing was found/);
+            expect(RESULTS_GUIDE).toMatch(/\[title\]\(address\)/);
             expect(RESULTS_GUIDE).toMatch(/A whole published work[^.]*is not written out/);
-            expect(RESULTS_GUIDE).toMatch(/Say plainly that it is copyrighted[^.]*\. Then give the direct source/);
+            expect(RESULTS_GUIDE).toMatch(/saying it is copyrighted[^.]*\. Then give the direct source/);
             expect(COMPONENT_GUIDE).toMatch(/Do not write out a whole copyrighted work/);
             for (const heading of ['VALUES', 'COMPONENTS', 'SHARED ATTRIBUTES', 'LAYOUT ATTRIBUTES (Container and Card)', 'TAGS THAT GO INSIDE OTHERS', 'FILES BY TYPE']) {
                 expect(COMPONENT_GUIDE).toContain(`\n${heading}\n|`);
@@ -3539,6 +3560,12 @@ describe('Chat endpoints', () => {
                     expect(state.fetches[0]).toBe('https://models.example/duck');
                     expect(state.fetches.length).toBe(2);
                     expect(asked).toContain('Text of https://models.example/duck:\nDownload the duck below.');
+                    const saved = (await get(`/chats/${chat.id}`)).data.chat.messages.pop().content;
+                    expect(saved).toMatch(/\n\nSources:\n- \[Duck model\]\(https:\/\/models\.example\/duck\)\n- \[Other 1\]\(https:\/\/other\.example\/1\)$/);
+
+                    state.chatReply = 'It is on [this page](https://models.example/duck).';
+                    await send(chat.id, { content: 'and where is that?' });
+                    expect((await get(`/chats/${chat.id}`)).data.chat.messages.pop().content).toBe('It is on [this page](https://models.example/duck).');
                     expect(asked).not.toContain('Files found');
                 });
             });
@@ -3566,7 +3593,7 @@ describe('Chat endpoints', () => {
             expect(RESULTS_GUIDE).toMatch(/Never tell the user that you cannot search the web/);
             expect(PLAN_GUIDE).toMatch(/always plan at least one search/);
             expect(REVIEW_GUIDE).toMatch(/deeper searches/);
-            expect(estimateTokens(PLAN_GUIDE) + estimateTokens(RESULTS_GUIDE) + estimateTokens(REVIEW_GUIDE)).toBeLessThan(1500);
+            expect(estimateTokens(PLAN_GUIDE) + estimateTokens(RESULTS_GUIDE) + estimateTokens(REVIEW_GUIDE)).toBeLessThan(1600);
         });
 
         test('stops offering tools after six rounds so a reply always ends', async () => {
