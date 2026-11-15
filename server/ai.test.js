@@ -551,11 +551,12 @@ const fakeLibrary = async (address, options = {}) => {
     const second = url.searchParams.get('page') === '2' && Boolean(options.headers?.['HX-Request']);
     if (Number(url.searchParams.get('page')) > 2) return page('<ul></ul>');
     const names = libraryNames().filter((name) => name.includes(wanted)).filter((name, index) => (wanted ? true : second ? index >= 8 : index < 8));
+    const cloud = !second && 'kimi-k3'.includes(wanted) ? '<li><a href="/library/kimi-k3"><h2><span>kimi-k3</span></h2><span>tools</span><span>cloud</span><p>Runs on the maker\'s servers.</p></a></li>' : '';
     const items = names.map((name) => {
         const sizes = catalogue.filter((model) => model.tag.startsWith(`${name}:`));
         return `<li><a href="/library/${name}" class="group"><h2 title="${name}"><span>${name}</span></h2><span title="Updated October 1, 2026">1mo</span>${sizes[0].capabilities.map((ability) => `<span class="a">${ability}</span>`).join('')}${sizes.map((model) => `<span class="s">${model.tag.split(':')[1]}</span>`).join('')}<p class="d">${sizes[0].description}${sizes[0].moe ? ' A mixture of experts model.' : ''}</p><span title="1,234,567 downloads"><span>1.2M</span></span></a></li>`;
     });
-    return page(`<ul>${items.join('')}</ul>${!wanted && !second ? '<div hx-get="/search?page=2"></div>' : ''}`);
+    return page(`<ul>${cloud}${items.join('')}</ul>${!wanted && !second ? '<div hx-get="/search?page=2"></div>' : ''}`);
 };
 setLibraryFetch(fakeLibrary);
 const entry = (tag) => catalogue.find((model) => model.tag === tag);
@@ -1196,9 +1197,11 @@ describe('Model endpoints', () => {
             signOut();
             const { first, second, models } = await everything();
             expect(first.status).toBe(200);
-            expect(first.data).toMatchObject({ source: 'ollama.com', page: 1, more: false, query: '', total: catalogue.length, library: libraryNames().length });
+            expect(first.data).toMatchObject({ source: 'ollama.com', page: 1, more: false, query: '', total: catalogue.length + 1, library: libraryNames().length + 1 });
             expect(second.data).toMatchObject({ page: 2, more: false, models: [] });
-            expect(first.data.models.map((model) => model.tag).sort()).toEqual(catalogue.map((model) => model.tag).sort());
+            expect(first.data.models.map((model) => model.tag).sort()).toEqual([...catalogue.map((model) => model.tag), 'kimi-k3'].sort());
+            expect(first.data.models[first.data.models.length - 1]).toMatchObject({ tag: 'kimi-k3', name: 'Kimi K3', cloudOnly: true, sizeMb: 0 });
+            expect((await get('/catalogue?all=true')).data).toMatchObject({ more: false, total: catalogue.length + 1 });
             expect(library.marked).toContain('/search?page=2');
             expect(library.asked).toContain('/search');
             expect(models[0].fit).toBeNull();
@@ -1214,7 +1217,11 @@ describe('Model endpoints', () => {
             expect(found.data.query).toBe('gemma');
             expect(found.data.models.map((model) => model.tag).sort()).toEqual(['gemma3:12b', 'gemma3:27b', 'gemma3:4b']);
             expect(found.data.models.every((model) => model.fit.verdict)).toBe(true);
-            expect(found.data).toMatchObject({ total: 3, fitting: 3, library: libraryNames().length });
+            expect(found.data).toMatchObject({ total: 3, fitting: 3, library: libraryNames().length + 1 });
+            const kimi = (await get('/catalogue?q=kimi&memoryMb=32768&gpuMemoryMb=8192')).data;
+            expect(kimi.models).toHaveLength(1);
+            expect(kimi.models[0]).toMatchObject({ cloudOnly: true, pick: null, fit: { verdict: 'cloud', fits: false, label: 'Cloud only' } });
+            expect(kimi.fitting).toBe(0);
             expect((await get('/catalogue?q=coder%20qwen3')).data.models.map((model) => model.tag)).toEqual(['qwen3-coder:30b']);
             expect((await get('/catalogue?q=nothing-like-this')).data.models).toEqual([]);
             expect((await get('/catalogue?page=0')).status).toBe(400);
