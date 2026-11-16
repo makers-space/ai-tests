@@ -3,6 +3,7 @@ import { createRequire } from 'node:module';
 import { Readable } from 'node:stream';
 import { describe, test, expect, beforeAll, afterAll, beforeEach } from 'vitest';
 import TestStartup from '../utils/test.startup.js';
+import { getNotificationService } from '../../server/middleware/app.middleware.js';
 import { ROLES, RIGHTS, hasRight } from '../../server/config/rights.js';
 import {
     setOllamaClientFactory, resetOllamaClientFactory, createOllamaClient, setLibraryFetch, parseLibrary, parseParameters, parseLibrarySizes, friendlyName,
@@ -2500,6 +2501,42 @@ describe('Chat endpoints', () => {
             expect((await fetch(`${client.baseURL}/api/v1/chats/${chat.id}/reply`, { headers: { Cookie: cookie } })).status).toBe(204);
         });
 
+        test('a reply sent live answers at once and goes out on the live connection, numbered and in order', async () => {
+            const service = getNotificationService();
+            const sent = [];
+            const real = service.sendToUser.bind(service);
+            service.sendToUser = (userId, notification) => {
+                if (notification.type === 'chat:reply') sent.push({ userId: String(userId), ...notification.data });
+                return real(userId, notification);
+            };
+            try {
+                const chat = await newChat({ model: 'qwen2.5-coder:7b' });
+                expect((await get(`/chats/${chat.id}/live`)).data).toMatchObject({ replying: false, seq: 0, events: [] });
+
+                const started = await post(`/chats/${chat.id}/messages`, { content: 'say something', live: true });
+                expect(started.status).toBe(202);
+                expect(started.data).toEqual({ success: true, started: true });
+
+                for (let attempt = 0; attempt < 200 && !sent.some((piece) => piece.event.type === 'end'); attempt++) await wait(25);
+                const mine = sent.filter((piece) => piece.chatId === chat.id);
+                expect(mine.map((piece) => piece.seq)).toEqual(mine.map((_, index) => index + 1));
+                expect(mine[0].event.type).toBe('accepted');
+                expect(mine.some((piece) => piece.event.type === 'token')).toBe(true);
+                expect(mine[mine.length - 1].event).toEqual({ type: 'end' });
+                expect(new Set(mine.map((piece) => piece.userId)).size).toBe(1);
+
+                for (let attempt = 0; attempt < 100 && (await get(`/chats/${chat.id}/live`)).data.replying; attempt++) await wait(25);
+                const saved = (await get(`/chats/${chat.id}`)).data.chat;
+                expect(saved.messages[saved.messages.length - 1].role).toBe('assistant');
+                expect(saved.messages[saved.messages.length - 1].content.length).toBeGreaterThan(0);
+
+                const refused = await post(`/chats/${chat.id}/messages`, { live: true });
+                expect(refused.status).toBe(400);
+            } finally {
+                service.sendToUser = real;
+            }
+        });
+
         test('activity lists your own replies in progress and the downloads, and nobody else\'s replies', async () => {
             expect((await get('/activity')).data).toMatchObject({ replies: [], downloads: expect.any(Array) });
             const chat = await newChat({ model: 'qwen2.5-coder:7b' });
@@ -4173,6 +4210,40 @@ describe('Linked devices', () => {
         const mine = await client.post('/api/v1/chats', {});
         expect((await client.patch(`/api/v1/chats/${mine.data.chat.id}`, { device: id })).status).toBe(404);
         expect((await client.patch(`/api/v1/chats/${mine.data.chat.id}`, { device: 'not-an-id' })).status).toBe(400);
+    });
+
+    test('a paused computer stays connected, is given no work, and works again when resumed', async () => {
+        await testStartup.loginAsUser('user');
+        const { id, key } = await link('pause-me');
+        const app = await fakeApp(id, key);
+
+        app.requests.length = 0;
+        const paused = await client.post(`/api/v1/devices/${id}/pause`, {});
+        expect(paused.status).toBe(200);
+        expect(paused.data.device).toMatchObject({ id, paused: true, online: true });
+        expect(paused.data.device.ollama).toMatchObject({ available: false, paused: true });
+        expect(app.requests).toContain('GET /api/ps');
+        expect((await Device.findById(id)).paused).toBe(true);
+
+        app.requests.length = 0;
+        const mine = (await listed()).find((device) => device.id === id);
+        expect(mine).toMatchObject({ paused: true, online: true });
+        const refused = await client.client.get('/api/v1/models/running', through(id));
+        expect(refused.status).toBe(503);
+        expect(refused.data).toMatchObject({ code: 'DEVICE_PAUSED' });
+        expect(refused.data.message).toMatch(/paused/i);
+        const status = await client.client.get('/api/v1/setup/status', through(id));
+        expect(status.data.ollama).toMatchObject({ available: false, code: 'DEVICE_PAUSED' });
+        expect(app.requests).toEqual([]);
+
+        const resumed = await client.post(`/api/v1/devices/${id}/resume`, {});
+        expect(resumed.data.device).toMatchObject({ paused: false });
+        expect(resumed.data.device.ollama).toMatchObject({ available: true });
+        expect((await client.client.get('/api/v1/models/running', through(id))).status).toBe(200);
+
+        await testStartup.loginAsUser('creator');
+        expect((await client.post(`/api/v1/devices/${id}/pause`, {})).status).toBe(404);
+        expect((await Device.findById(id)).paused).toBe(false);
     });
 
     test('removing a computer disconnects it and cancels its key', async () => {
