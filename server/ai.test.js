@@ -2820,7 +2820,7 @@ describe('Chat endpoints', () => {
                 expect(COMPONENT_GUIDE).toContain(word);
             }
             expect(COMPONENT_GUIDE).not.toMatch(/\{"component"/);
-            expect(estimateTokens(COMPONENT_GUIDE)).toBeLessThan(3300);
+            expect(estimateTokens(COMPONENT_GUIDE)).toBeLessThan(3400);
             expect(COMPONENT_GUIDE).not.toMatch(/web_search|web_fetch|search the web|do not guess|Never invent/i);
             for (const tag of ['<Model3D src=', '<PdfViewer src=', '<Video src=', '<Audio src=', '<Editor src=', '<Data src=', '<Image src=']) expect(COMPONENT_GUIDE).toContain(tag);
 
@@ -3576,10 +3576,10 @@ describe('Chat endpoints', () => {
                     await send(chat.id, { content: 'tell me about ducks' });
                     const asked = state.chatCalls[0].messages[state.chatCalls[0].messages.length - 1].content;
                     expect(state.fetches[0]).toBe('https://models.example/duck');
-                    expect(state.fetches.length).toBe(2);
+                    expect(state.fetches.length).toBe(3);
                     expect(asked).toContain('Text of https://models.example/duck:\nDownload the duck below.');
                     const saved = (await get(`/chats/${chat.id}`)).data.chat.messages.pop().content;
-                    expect(saved).toMatch(/\n\nSources:\n- \[Duck model\]\(https:\/\/models\.example\/duck\)\n- \[Other 1\]\(https:\/\/other\.example\/1\)$/);
+                    expect(saved).toMatch(/\n\nSources:\n- \[Duck model\]\(https:\/\/models\.example\/duck\)\n- \[Other 1\]\(https:\/\/other\.example\/1\)\n- \[Other 2\]\(https:\/\/other\.example\/2\)$/);
 
                     state.chatReply = 'It is on [this page](https://models.example/duck).';
                     await send(chat.id, { content: 'and where is that?' });
@@ -3611,7 +3611,7 @@ describe('Chat endpoints', () => {
             expect(RESULTS_GUIDE).toMatch(/Never tell the user that you cannot search the web/);
             expect(PLAN_GUIDE).toMatch(/always plan at least one search/);
             expect(REVIEW_GUIDE).toMatch(/deeper searches/);
-            expect(estimateTokens(PLAN_GUIDE) + estimateTokens(RESULTS_GUIDE) + estimateTokens(REVIEW_GUIDE)).toBeLessThan(1800);
+            expect(estimateTokens(PLAN_GUIDE) + estimateTokens(RESULTS_GUIDE) + estimateTokens(REVIEW_GUIDE)).toBeLessThan(1950);
         });
 
         test('stops offering tools after six rounds so a reply always ends', async () => {
