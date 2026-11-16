@@ -2537,6 +2537,55 @@ describe('Chat endpoints', () => {
             }
         });
 
+        test('a change to a chat is announced to the person\'s open apps, and a read is not', async () => {
+            const service = getNotificationService();
+            const sent = [];
+            const real = service.sendToUser.bind(service);
+            service.sendToUser = (userId, notification) => {
+                if (['chat:changed', 'models:changed', 'device:changed'].includes(notification.type)) sent.push({ type: notification.type, ...notification.data });
+                return real(userId, notification);
+            };
+            const settled = async (count) => {
+                for (let attempt = 0; attempt < 80 && sent.length < count; attempt++) await wait(10);
+            };
+            try {
+                const chat = await newChat({ model: 'qwen2.5-coder:7b' });
+                await settled(1);
+                expect(sent).toEqual([{ type: 'chat:changed', id: null, removed: false }]);
+
+                sent.length = 0;
+                await get(`/chats/${chat.id}`);
+                await get('/chats');
+                await wait(60);
+                expect(sent).toEqual([]);
+
+                await client.patch(`/api/v1/chats/${chat.id}`, { title: 'Renamed elsewhere' });
+                await settled(1);
+                expect(sent).toEqual([{ type: 'chat:changed', id: chat.id, removed: false }]);
+
+                sent.length = 0;
+                expect((await client.patch(`/api/v1/chats/${chat.id}`, { title: '' })).status).toBe(400);
+                await wait(60);
+                expect(sent).toEqual([]);
+
+                await send(chat.id, { content: 'hello' });
+                await settled(2);
+                expect(sent.filter((note) => note.type === 'chat:changed' && note.id === chat.id).length).toBeGreaterThanOrEqual(2);
+
+                sent.length = 0;
+                await client.delete(`/api/v1/chats/${chat.id}`);
+                await settled(1);
+                expect(sent).toEqual([{ type: 'chat:changed', id: chat.id, removed: true }]);
+
+                sent.length = 0;
+                await post('/models/load', { name: 'qwen2.5-coder:7b' });
+                await settled(1);
+                expect(sent.some((note) => note.type === 'models:changed')).toBe(true);
+            } finally {
+                service.sendToUser = real;
+            }
+        });
+
         test('activity lists your own replies in progress and the downloads, and nobody else\'s replies', async () => {
             expect((await get('/activity')).data).toMatchObject({ replies: [], downloads: expect.any(Array) });
             const chat = await newChat({ model: 'qwen2.5-coder:7b' });
