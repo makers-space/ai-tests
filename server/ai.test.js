@@ -2524,6 +2524,7 @@ describe('Chat endpoints', () => {
                 expect(mine.some((piece) => piece.event.type === 'token')).toBe(true);
                 expect(mine[mine.length - 1].event).toEqual({ type: 'end' });
                 expect(new Set(mine.map((piece) => piece.userId)).size).toBe(1);
+                expect(mine[0].userId).toBe(String((await Chat.findById(chat.id)).owner));
 
                 for (let attempt = 0; attempt < 100 && (await get(`/chats/${chat.id}/live`)).data.replying; attempt++) await wait(25);
                 const saved = (await get(`/chats/${chat.id}`)).data.chat;
@@ -2582,6 +2583,45 @@ describe('Chat endpoints', () => {
                 await settled(1);
                 expect(sent.some((note) => note.type === 'models:changed')).toBe(true);
             } finally {
+                service.sendToUser = real;
+            }
+        });
+
+        test('an app that joins a reply part-way gets what was sent so far and the number to carry on from', async () => {
+            const service = getNotificationService();
+            const sent = [];
+            const real = service.sendToUser.bind(service);
+            service.sendToUser = (userId, notification) => {
+                if (notification.type === 'chat:reply') sent.push(notification.data);
+                return real(userId, notification);
+            };
+            try {
+                const chat = await newChat({ model: 'qwen2.5-coder:7b' });
+                state.chatReply = 'One two three four';
+                state.chatHold = true;
+                expect((await post(`/chats/${chat.id}/messages`, { content: 'count for me', live: true })).status).toBe(202);
+                for (let attempt = 0; attempt < 200 && !sent.some((piece) => piece.chatId === chat.id && piece.event.type === 'token'); attempt++) await wait(15);
+
+                const joined = (await get(`/chats/${chat.id}/live`)).data;
+                expect(joined.replying).toBe(true);
+                const before = sent.filter((piece) => piece.chatId === chat.id && piece.seq <= joined.seq);
+                expect(joined.seq).toBe(before.length);
+                const text = (list) => list.filter((event) => event.type === 'token').map((event) => event.text).join('');
+                expect(text(joined.events)).toBe(text(before.map((piece) => piece.event)));
+
+                state.chatHold = false;
+                for (let attempt = 0; attempt < 300 && !sent.some((piece) => piece.chatId === chat.id && piece.event.type === 'end'); attempt++) await wait(15);
+                const later = sent.filter((piece) => piece.chatId === chat.id && piece.seq > joined.seq);
+                expect(later.map((piece) => piece.seq)).toEqual(later.map((_, index) => joined.seq + 1 + index));
+                expect(text(joined.events) + text(later.map((piece) => piece.event))).toBe('One two three four');
+                expect(later[later.length - 1].event).toEqual({ type: 'end' });
+
+                const other = client.authenticatedAs;
+                await testStartup.loginAsUser(other === 'admin' ? 'user' : 'admin');
+                expect((await get(`/chats/${chat.id}/live`)).status).toBe(404);
+                await testStartup.loginAsUser(other);
+            } finally {
+                state.chatHold = false;
                 service.sendToUser = real;
             }
         });
@@ -4293,6 +4333,120 @@ describe('Linked devices', () => {
         await testStartup.loginAsUser('creator');
         expect((await client.post(`/api/v1/devices/${id}/pause`, {})).status).toBe(404);
         expect((await Device.findById(id)).paused).toBe(false);
+    });
+
+    // Stands in for a desktop app whose computer can chat and download, and whose connection can be cut part-way.
+    const workingApp = (deviceId, key, { cutPull = false, cutChat = false } = {}) => new Promise((resolve) => {
+        const ws = new WebSocket(`ws://localhost:${testStartup.port}/devices`);
+        const app = { ws, requests: [], closed: new Promise((done) => ws.addEventListener('close', done)) };
+        open.push(ws);
+        const say = (message) => ws.readyState === WebSocket.OPEN && ws.send(JSON.stringify(message));
+        const head = (id, status = 200, type = 'application/json') => say({ id, type: 'head', status, headers: { 'content-type': type } });
+        const piece = (id, value) => say({ id, type: 'chunk', data: Buffer.from(typeof value === 'string' ? value : `${JSON.stringify(value)}\n`).toString('base64') });
+        const whole = (id, body) => {
+            head(id);
+            piece(id, JSON.stringify(body));
+            say({ id, type: 'end' });
+        };
+        ws.addEventListener('open', () => say({ type: 'hello', deviceId, key }));
+        ws.addEventListener('close', () => resolve(app));
+        ws.addEventListener('message', (event) => {
+            const message = JSON.parse(event.data);
+            if (message.type === 'welcome') return resolve(app);
+            if (message.type === 'ask') return say({ id: message.id, type: 'answer', data: message.what === 'disk' ? { diskFreeMb: 900000, diskTotalMb: 1000000 } : { ...hardware, memoryMb: 32768 } });
+            if (message.type !== 'request') return undefined;
+            app.requests.push(`${message.method} ${message.path}`);
+            if (message.path === '/api/version') return whole(message.id, { version: '9.9.9' });
+            if (message.path === '/api/tags') return whole(message.id, TAGS);
+            if (message.path === '/api/ps') return whole(message.id, { models: [] });
+            if (message.path === '/api/show') return whole(message.id, { capabilities: ['completion'], details: { parameter_size: '1B' }, model_info: { 'tiny.context_length': 8192 } });
+            if (message.path === '/api/pull') {
+                head(message.id, 200, 'application/x-ndjson');
+                piece(message.id, { status: 'pulling manifest' });
+                piece(message.id, { status: 'downloading', digest: 'sha256:abc', total: 1000, completed: 400 });
+                if (cutPull) return setTimeout(() => ws.close(), 60);
+                piece(message.id, { status: 'downloading', digest: 'sha256:abc', total: 1000, completed: 1000 });
+                piece(message.id, { status: 'success' });
+                return say({ id: message.id, type: 'end' });
+            }
+            if (message.path === '/api/chat') {
+                head(message.id, 200, 'application/x-ndjson');
+                piece(message.id, { model: 'tiny:1b', message: { role: 'assistant', content: 'Half an ' }, done: false });
+                if (cutChat) return setTimeout(() => ws.close(), 60);
+                piece(message.id, { model: 'tiny:1b', message: { role: 'assistant', content: 'answer.' }, done: false });
+                piece(message.id, { model: 'tiny:1b', message: { role: 'assistant', content: '' }, done: true, eval_count: 3, eval_duration: 1000000 });
+                return say({ id: message.id, type: 'end' });
+            }
+            head(message.id, 404);
+            piece(message.id, '{"error":"not found"}');
+            return say({ id: message.id, type: 'end' });
+        });
+    });
+
+    test('a download whose computer drops off fails plainly, then carries on when the computer returns', async () => {
+        await Download.deleteMany({});
+        await testStartup.loginAsUser('admin');
+        const { id, key } = await link('drops-mid-download');
+        const first = await workingApp(id, key, { cutPull: true });
+
+        const started = await client.client.post('/api/v1/models/pull', { name: 'someone/unlisted:q4' }, through(id));
+        expect(started.status).toBe(202);
+        const jobId = started.data.download.id;
+        await first.closed;
+        expect(await until(async () => (await Download.findById(jobId)).status === 'failed')).toBe(true);
+        const failed = await Download.findById(jobId);
+        expect(failed.errorCode).toBe('DEVICE_OFFLINE');
+        expect(failed.completedBytes).toBe(400);
+        expect(new OllamaError(failed.errorCode).message).toMatch(/not connected/i);
+
+        const second = await workingApp(id, key);
+        expect(await until(async () => (await Download.findById(jobId)).status === 'completed')).toBe(true);
+        expect(second.requests).toContain('POST /api/pull');
+        const done = await Download.findById(jobId);
+        expect(done.errorCode).toBeNull();
+        expect(done.completedBytes).toBe(1000);
+        expect(String(done.device)).toBe(id);
+    });
+
+    test('a download that failed for another reason is not started again when the computer returns', async () => {
+        await Download.deleteMany({});
+        await testStartup.loginAsUser('admin');
+        const { id, key } = await link('no-auto-resume');
+        const owner = (await Device.findById(id)).registeredBy;
+        const old = await Download.create({ model: 'someone/old:q4', device: id, status: 'failed', errorCode: 'DEVICE_OFFLINE', requestedBy: owner, finishedAt: new Date(Date.now() - 2 * 60 * 60 * 1000) });
+        const other = await Download.create({ model: 'someone/full:q4', device: id, status: 'failed', errorCode: 'DISK_FULL', requestedBy: owner, finishedAt: new Date() });
+        const app = await workingApp(id, key);
+        await new Promise((resolve) => setTimeout(resolve, 400));
+        expect(app.requests).not.toContain('POST /api/pull');
+        expect((await Download.findById(old.id)).status).toBe('failed');
+        expect((await Download.findById(other.id)).status).toBe('failed');
+    });
+
+    test('a reply whose computer drops off keeps what was written and ends with a plain reason', async () => {
+        await testStartup.loginAsUser('user');
+        const { id, key } = await link('drops-mid-reply');
+        const app = await workingApp(id, key, { cutChat: true });
+        const chat = (await client.post('/api/v1/chats', { device: id, model: 'tiny:1b' })).data.chat;
+
+        const response = await client.post(`/api/v1/chats/${chat.id}/messages`, { content: 'say something long' }, { responseType: 'text', transformResponse: [(data) => data] });
+        expect(response.status).toBe(200);
+        const pieces = String(response.data).split('\n').filter(Boolean).map((line) => JSON.parse(line));
+        expect(pieces.filter((piece) => piece.type === 'token').map((piece) => piece.text).join('')).toBe('Half an ');
+        await app.closed;
+
+        const saved = (await client.get(`/api/v1/chats/${chat.id}`)).data.chat;
+        const last = saved.messages[saved.messages.length - 1];
+        expect(last).toMatchObject({ role: 'assistant', content: 'Half an ' });
+        expect(last.error).toMatchObject({ code: 'DEVICE_OFFLINE' });
+        expect(last.error.message).toMatch(/not connected/i);
+        expect(saved.replying).toBe(false);
+
+        await workingApp(id, key);
+        const again = await client.post(`/api/v1/chats/${chat.id}/messages`, { regenerate: true }, { responseType: 'text', transformResponse: [(data) => data] });
+        expect(again.status).toBe(200);
+        const after = (await client.get(`/api/v1/chats/${chat.id}`)).data.chat;
+        expect(after.messages[after.messages.length - 1]).toMatchObject({ role: 'assistant', content: 'Half an answer.' });
+        expect(after.messages[after.messages.length - 1].error).toBeNull();
     });
 
     test('removing a computer disconnects it and cancels its key', async () => {
