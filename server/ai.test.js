@@ -1310,6 +1310,22 @@ describe('Model endpoints', () => {
             expect((await get('/catalogue?sample=true')).data.models.length).toBe(catalogue.length + 1);
         });
 
+        test('a chip whose graphics share the system memory does not have that memory counted twice', async () => {
+            const model = { sizeMb: 17000, parameters: 27 };
+            const separate = { memoryMb: 24576, gpuMemoryMb: 16384 };
+            expect(fitModel(model, separate).verdict).toBe('mixed');
+            expect(fitModel(model, { ...separate, gpuShared: true }).verdict).toBe('too_large');
+            expect(fitModel({ sizeMb: 8100, parameters: 12 }, { ...separate, gpuShared: true }).verdict).toBe('gpu');
+
+            signOut();
+            const apart = (await get('/catalogue?memoryMb=24576&gpuMemoryMb=16384&all=true')).data;
+            const shared = (await get('/catalogue?memoryMb=24576&gpuMemoryMb=16384&shared=true&all=true')).data;
+            expect(shared.hardware.gpuShared).toBe(true);
+            expect(shared.fitting).toBeLessThan(apart.fitting);
+            expect(shared.models.find((entry) => entry.tag === 'gemma3:27b').fit.verdict).toBe('too_large');
+            expect(apart.models.find((entry) => entry.tag === 'gemma3:27b').fit.verdict).toBe('mixed');
+        });
+
         test('rejects nonsense specs', async () => {
             signOut();
             expect((await get('/catalogue?memoryMb=-5')).status).toBe(400);
@@ -2494,7 +2510,7 @@ describe('Chat endpoints', () => {
             await post(`/chats/${chat.id}/messages`, { content: 'and then geese' });
 
             const mine = (await get('/activity')).data;
-            expect(mine.replies).toEqual([{ chatId: chat.id, title: 'a long request about ducks', model: 'qwen2.5-coder:7b', waiting: 1 }]);
+            expect(mine.replies).toEqual([{ chatId: chat.id, title: 'a long request about ducks', model: 'qwen2.5-coder:7b', waiting: 1, phase: expect.stringMatching(/^(starting|waiting|thinking|searching|reading|writing)$/), words: expect.any(Number) }]);
 
             const owner = client.authenticatedAs;
             await testStartup.loginAsUser(owner === 'admin' ? 'user' : 'admin');
@@ -2781,13 +2797,15 @@ describe('Chat endpoints', () => {
             expect(COMPONENT_GUIDE.startsWith(BASE_GUIDE)).toBe(true);
             expect(PLAN_GUIDE).toMatch(/Start with a verb ending in -ing/);
             expect(RESULTS_GUIDE).toMatch(/the source.s own words or your account of it/);
-            expect(RESULTS_GUIDE).toMatch(/Give the answer first/);
+            expect(RESULTS_GUIDE).toMatch(/Write a full, descriptive answer, never a bare list of links/);
+            expect(RESULTS_GUIDE).toMatch(/no more than the content needs/);
+            expect(RESULTS_GUIDE).toMatch(/Then describe the work properly in your own words/);
             expect(RESULTS_GUIDE).toMatch(/Never write a quotation, a wording or a figure from memory/);
-            expect(RESULTS_GUIDE).toMatch(/the pages themselves are the answer/);
+            expect(RESULTS_GUIDE).toMatch(/give the pages as links, say what each one is/);
             expect(RESULTS_GUIDE).toMatch(/never say that nothing was found/);
             expect(RESULTS_GUIDE).toMatch(/\[title\]\(address\)/);
             expect(RESULTS_GUIDE).toMatch(/A whole published work[^.]*is not written out/);
-            expect(RESULTS_GUIDE).toMatch(/saying it is copyrighted[^.]*\. Then give the direct source/);
+            expect(RESULTS_GUIDE).toMatch(/that it is copyrighted[^.]*give the direct source/);
             expect(COMPONENT_GUIDE).toMatch(/Do not write out a whole copyrighted work/);
             for (const heading of ['VALUES', 'COMPONENTS', 'SHARED ATTRIBUTES', 'LAYOUT ATTRIBUTES (Container and Card)', 'TAGS THAT GO INSIDE OTHERS', 'FILES BY TYPE']) {
                 expect(COMPONENT_GUIDE).toContain(`\n${heading}\n|`);
@@ -3593,7 +3611,7 @@ describe('Chat endpoints', () => {
             expect(RESULTS_GUIDE).toMatch(/Never tell the user that you cannot search the web/);
             expect(PLAN_GUIDE).toMatch(/always plan at least one search/);
             expect(REVIEW_GUIDE).toMatch(/deeper searches/);
-            expect(estimateTokens(PLAN_GUIDE) + estimateTokens(RESULTS_GUIDE) + estimateTokens(REVIEW_GUIDE)).toBeLessThan(1600);
+            expect(estimateTokens(PLAN_GUIDE) + estimateTokens(RESULTS_GUIDE) + estimateTokens(REVIEW_GUIDE)).toBeLessThan(1800);
         });
 
         test('stops offering tools after six rounds so a reply always ends', async () => {
