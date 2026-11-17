@@ -12,9 +12,9 @@ import {
     fitModel, rankCatalogue, memoryNeededMb, VERDICTS,
     GenerationQueue, extractText, estimateTokens, setFilesFetch, MAX_ATTACHMENT_BYTES,
     isPublicAddress, setRemoteTransport, MAX_REMOTE_BYTES, setSearchFetch,
-    setToolConnector, ToolSignInError, TOOL_HEALTH, seal, unseal, deviceGateway
+    setToolConnector, ToolSignInError, TOOL_HEALTH, TOOL_CATALOGUE, seal, unseal, deviceGateway
 } from '../../server/middleware/ai.middleware.js';
-import { Device, Setting, Download, PersonalModel, Chat, Prompt, Guide, GUIDE_STEPS, MANAGER_GUIDE_STEPS, deviceSchemas, modelSchemas, chatSchemas, promptSchemas, ToolServer, TOOL_HEALTH_STATES } from '../../server/models/ai.model.js';
+import { Device, Setting, Download, PersonalModel, Chat, Prompt, Guide, GUIDE_STEPS, MANAGER_GUIDE_STEPS, deviceSchemas, modelSchemas, chatSchemas, promptSchemas, ToolServer, TOOL_HEALTH_STATES, toolSchemas } from '../../server/models/ai.model.js';
 import { downloads, health, queue, COMPONENT_GUIDE, BASE_GUIDE, CLOSING_GUIDE, SKILLS, SEARCH_GUIDE, PLAN_GUIDE, RESULTS_GUIDE, REVIEW_GUIDE, TOUCH_GUIDE, writtenToolCalls } from '../../server/controllers/ai.controller.js';
 
 const MB = 1024 * 1024;
@@ -4595,6 +4595,23 @@ describe('Tool servers', () => {
         expect(unseal(sealed)).toEqual({ key: 'good-key' });
         expect(unseal(`${sealed.slice(0, -4)}AAAA`)).toBeNull();
         expect(seal({ key: 'good-key' })).not.toBe(sealed);
+    });
+
+    test('the list of online apps is served, and every entry is a named https address that can be added as it is', async () => {
+        const response = await client.get('/api/v1/tools/catalogue', any);
+        expect(response.status).toBe(200);
+        expect(response.data.apps).toEqual(TOOL_CATALOGUE);
+        expect(TOOL_CATALOGUE.length).toBeGreaterThanOrEqual(30);
+        expect(new Set(TOOL_CATALOGUE.map((entry) => entry.name)).size).toBe(TOOL_CATALOGUE.length);
+        expect(new Set(TOOL_CATALOGUE.map((entry) => entry.address)).size).toBe(TOOL_CATALOGUE.length);
+        for (const entry of TOOL_CATALOGUE) {
+            expect(toolSchemas.add.validate({ kind: 'remote', name: entry.name, address: entry.address }).error).toBeUndefined();
+            expect(['account', 'key', 'none']).toContain(entry.signIn);
+            expect(entry.does.length).toBeGreaterThan(10);
+            expect(entry.group.length).toBeGreaterThan(3);
+        }
+        signOut();
+        expect((await client.get('/api/v1/tools/catalogue', any)).status).toBe(401);
     });
 
     test('every health state has a label, and every state but healthy says what is needed', () => {
