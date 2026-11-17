@@ -11,9 +11,10 @@ import {
     parseNvidiaSmi, appleGpus, parseDisplayAdapters, detectHardware,
     fitModel, rankCatalogue, memoryNeededMb, VERDICTS,
     GenerationQueue, extractText, estimateTokens, setFilesFetch, MAX_ATTACHMENT_BYTES,
-    isPublicAddress, setRemoteTransport, MAX_REMOTE_BYTES, setSearchFetch
+    isPublicAddress, setRemoteTransport, MAX_REMOTE_BYTES, setSearchFetch,
+    setToolConnector, ToolSignInError, TOOL_HEALTH, seal, unseal, deviceGateway
 } from '../../server/middleware/ai.middleware.js';
-import { Device, Setting, Download, PersonalModel, Chat, Prompt, Guide, GUIDE_STEPS, MANAGER_GUIDE_STEPS, deviceSchemas, modelSchemas, chatSchemas, promptSchemas } from '../../server/models/ai.model.js';
+import { Device, Setting, Download, PersonalModel, Chat, Prompt, Guide, GUIDE_STEPS, MANAGER_GUIDE_STEPS, deviceSchemas, modelSchemas, chatSchemas, promptSchemas, ToolServer, TOOL_HEALTH_STATES } from '../../server/models/ai.model.js';
 import { downloads, health, queue, COMPONENT_GUIDE, BASE_GUIDE, CLOSING_GUIDE, SKILLS, SEARCH_GUIDE, PLAN_GUIDE, RESULTS_GUIDE, REVIEW_GUIDE, TOUCH_GUIDE, writtenToolCalls } from '../../server/controllers/ai.controller.js';
 
 const MB = 1024 * 1024;
@@ -4533,5 +4534,283 @@ describe('Linked devices', () => {
         } finally {
             process.env.LOCAL_DEVICE = 'true';
         }
+    });
+});
+
+describe('Tool servers', () => {
+    const any = { validateStatus: () => true };
+    const api = '/api/v1/tools/servers';
+    const TOOLS = [
+        { name: 'find_page', title: 'Find a page', description: 'Finds a page by words in it', annotations: { readOnlyHint: true }, inputSchema: { type: 'object', properties: { words: { type: 'string' } } } },
+        { name: 'write_page', description: 'Writes a page', inputSchema: { type: 'object' } }
+    ];
+    const hardware = { hostname: 'toolbox', platform: 'darwin', cpu: 'Test CPU', cpuThreads: 8, memoryMb: 16384, gpus: [], gpuMemoryMb: 0, diskFreeMb: 50000, diskTotalMb: 100000 };
+    const calls = [];
+    const open = [];
+    let finished = [];
+
+    // Stands in for the tool-server library: what an address does is read from its host name.
+    const connector = async (address, options) => {
+        const host = new URL(address).hostname;
+        calls.push({ host, headers: options.requestInit?.headers || null, keeper: Boolean(options.authProvider) });
+        if (host === 'down.example') throw new Error('connect failed');
+        if (host === 'inside.example') throw new OllamaError('REMOTE_BLOCKED');
+        if (host === 'keyed.example' && options.requestInit?.headers?.Authorization !== 'Bearer good-key') throw Object.assign(new Error('no'), { status: 401 });
+        if (host === 'account.example' && !(await options.authProvider?.tokens())) {
+            await options.authProvider?.redirectToAuthorization(new URL(`https://account.example/authorize?state=${await options.authProvider.state?.()}`));
+            throw new ToolSignInError('sign in');
+        }
+        return { listTools: async () => ({ tools: host === 'bare.example' ? [] : TOOLS }), close: async () => {} };
+    };
+    const finisher = async (address, keeper, params) => {
+        finished.push(Object.fromEntries(params));
+        if (params.get('code') !== 'good-code') throw new Error('bad code');
+        await keeper.saveTokens({ access_token: 'secret-access-token', token_type: 'Bearer' });
+    };
+    const add = (body) => client.post(api, { kind: 'remote', ...body }, any);
+    const signOut = () => {
+        client.clearCookies();
+        client.authenticatedAs = null;
+    };
+
+    beforeAll(async () => {
+        setToolConnector(connector, finisher);
+    });
+    afterAll(async () => {
+        setToolConnector();
+        for (const ws of open) ws.close();
+        await ToolServer.deleteMany({});
+    });
+    beforeEach(async () => {
+        calls.length = 0;
+        finished = [];
+        await ToolServer.deleteMany({});
+        signOut();
+        await testStartup.loginAsUser('user');
+    });
+
+    test('sealing keeps a value unreadable and gives it back whole, and a damaged seal gives nothing', () => {
+        const sealed = seal({ key: 'good-key' });
+        expect(sealed).not.toContain('good-key');
+        expect(unseal(sealed)).toEqual({ key: 'good-key' });
+        expect(unseal(`${sealed.slice(0, -4)}AAAA`)).toBeNull();
+        expect(seal({ key: 'good-key' })).not.toBe(sealed);
+    });
+
+    test('every health state has a label, and every state but healthy says what is needed', () => {
+        expect(Object.keys(TOOL_HEALTH).sort()).toEqual([...TOOL_HEALTH_STATES].sort());
+        for (const [state, entry] of Object.entries(TOOL_HEALTH)) {
+            expect(entry.label.length).toBeGreaterThan(0);
+            expect(entry.needs.length > 0).toBe(state !== 'healthy');
+        }
+    });
+
+    test('a remote server that answers is healthy and lists its tools, with read-only ones marked', async () => {
+        const response = await add({ name: 'Notes', address: 'https://open.example/mcp' });
+        expect(response.status).toBe(201);
+        const { server } = response.data;
+        expect(server.health.state).toBe('healthy');
+        expect(server.health.needs).toEqual([]);
+        expect(server.tools).toEqual([
+            { name: 'find_page', title: 'Find a page', description: 'Finds a page by words in it', readOnly: true },
+            { name: 'write_page', title: null, description: 'Writes a page', readOnly: false }
+        ]);
+        expect(server.signIn).toBe('none');
+        const listed = await client.get(api, any);
+        expect(listed.data.servers.map((one) => one.name)).toEqual(['Notes']);
+    });
+
+    test('a key is sent to the server, stored sealed, and never returned', async () => {
+        const response = await add({ name: 'Keyed', address: 'https://keyed.example/mcp', key: 'good-key' });
+        expect(response.data.server.health.state).toBe('healthy');
+        expect(response.data.server.signIn).toBe('key');
+        expect(calls[0].headers).toEqual({ Authorization: 'Bearer good-key' });
+        const stored = await ToolServer.findOne({ name: 'Keyed' }).select('+sealed');
+        expect(stored.sealed).not.toContain('good-key');
+        expect(JSON.stringify((await client.get(api, any)).data)).not.toContain('good-key');
+        expect(JSON.stringify(response.data)).not.toContain('good-key');
+    });
+
+    test('a wrong key is reported as refused, and replacing it makes the server healthy', async () => {
+        const response = await add({ name: 'Keyed', address: 'https://keyed.example/mcp', key: 'wrong' });
+        expect(response.data.server.health.state).toBe('refused');
+        const fixed = await client.patch(`${api}/${response.data.server.id}`, { key: 'good-key' }, any);
+        expect(fixed.data.server.health.state).toBe('healthy');
+    });
+
+    test('unreachable, blocked and empty servers are saved with a state that says what is needed', async () => {
+        const down = (await add({ name: 'Down', address: 'https://down.example/mcp' })).data.server;
+        const inside = (await add({ name: 'Inside', address: 'https://inside.example/mcp' })).data.server;
+        const bare = (await add({ name: 'Bare', address: 'https://bare.example/mcp' })).data.server;
+        expect([down.health.state, inside.health.state, bare.health.state]).toEqual(['unreachable', 'blocked', 'empty']);
+        for (const server of [down, inside, bare]) expect(server.health.needs.length).toBeGreaterThan(0);
+        expect(down.tools).toEqual([]);
+    });
+
+    test('an address that is not https, or has no name, is refused before anything is saved', async () => {
+        expect((await add({ name: 'Plain', address: 'http://open.example/mcp' })).status).toBe(400);
+        expect((await add({ address: 'https://open.example/mcp' })).status).toBe(400);
+        expect((await add({ name: 'Mixed', address: 'https://open.example/mcp', localId: 'abcdefgh' })).status).toBe(400);
+        expect(await ToolServer.countDocuments({})).toBe(0);
+    });
+
+    test('a server that wants an account says sign-in is needed, and signing in makes it healthy', async () => {
+        const added = (await add({ name: 'Account', address: 'https://account.example/mcp' })).data.server;
+        expect(added.health.state).toBe('signin');
+        expect(added.signIn).toBe('account');
+
+        const started = await client.post(`${api}/${added.id}/sign-in`, {}, any);
+        expect(started.status).toBe(200);
+        const state = new URL(started.data.url).searchParams.get('state');
+        expect(state.length).toBeGreaterThan(20);
+
+        signOut();
+        const back = await client.client.get(`/api/v1/tools/callback?code=good-code&state=${state}`, { maxRedirects: 0, validateStatus: () => true });
+        expect(back.status).toBe(302);
+        expect(back.headers.location).toBe(`${process.env.APP_URL}/tools?signin=done`);
+        expect(finished).toEqual([{ code: 'good-code', state }]);
+
+        await testStartup.loginAsUser('user');
+        const after = (await client.get(api, any)).data.servers[0];
+        expect(after.health.state).toBe('healthy');
+        expect(after.tools.length).toBe(2);
+        const stored = await ToolServer.findById(added.id).select('+sealed +signInState');
+        expect(stored.sealed).not.toContain('secret-access-token');
+        expect(unseal(stored.sealed).tokens.access_token).toBe('secret-access-token');
+        expect(stored.signInState).toBeNull();
+        expect(JSON.stringify(after)).not.toContain('secret-access-token');
+    });
+
+    test('a sign-in that comes back with the wrong state or a bad code changes nothing', async () => {
+        const added = (await add({ name: 'Account', address: 'https://account.example/mcp' })).data.server;
+        const started = await client.post(`${api}/${added.id}/sign-in`, {}, any);
+        const state = new URL(started.data.url).searchParams.get('state');
+        const options = { maxRedirects: 0, validateStatus: () => true };
+        const wrong = await client.client.get('/api/v1/tools/callback?code=good-code&state=someone-elses', options);
+        expect(wrong.headers.location).toBe(`${process.env.APP_URL}/tools?signin=failed`);
+        const bad = await client.client.get(`/api/v1/tools/callback?code=bad&state=${state}`, options);
+        expect(bad.headers.location).toBe(`${process.env.APP_URL}/tools?signin=failed`);
+        const again = await client.client.get(`/api/v1/tools/callback?code=good-code&state=${state}`, options);
+        expect(again.headers.location).toBe(`${process.env.APP_URL}/tools?signin=failed`);
+        expect((await client.get(api, any)).data.servers[0].health.state).toBe('signin');
+    });
+
+    test('a server with no sign-in to offer says so plainly', async () => {
+        const added = (await add({ name: 'Down', address: 'https://down.example/mcp' })).data.server;
+        const started = await client.post(`${api}/${added.id}/sign-in`, {}, any);
+        expect(started.status).toBe(422);
+        expect(started.data.action).toMatch(/key/);
+    });
+
+    test('checking again picks up a change and tells the person over the notification channel', async () => {
+        const added = (await add({ name: 'Notes', address: 'https://open.example/mcp' })).data.server;
+        await ToolServer.updateOne({ _id: added.id }, { address: 'https://down.example/mcp' });
+        const sent = [];
+        const service = getNotificationService();
+        const original = service.sendToUser;
+        service.sendToUser = (userId, message) => { sent.push(message); };
+        try {
+            const checked = await client.post(`${api}/${added.id}/check`, {}, any);
+            expect(checked.data.server.health.state).toBe('unreachable');
+            expect(checked.data.server.tools.length).toBe(2);
+            await client.post(`${api}/${added.id}/check`, {}, any);
+        } finally {
+            service.sendToUser = original;
+        }
+        expect(sent.filter((message) => message.type === 'tools:changed')).toEqual([{ type: 'tools:changed', data: { id: added.id, health: 'unreachable' } }]);
+    });
+
+    test('one person cannot see, check, change or remove the tool servers of another', async () => {
+        const added = (await add({ name: 'Mine', address: 'https://open.example/mcp' })).data.server;
+        signOut();
+        await testStartup.loginAsUser('creator');
+        expect((await client.get(api, any)).data.servers).toEqual([]);
+        expect((await client.post(`${api}/${added.id}/check`, {}, any)).status).toBe(404);
+        expect((await client.patch(`${api}/${added.id}`, { name: 'Theirs' }, any)).status).toBe(404);
+        expect((await client.post(`${api}/${added.id}/sign-in`, {}, any)).status).toBe(404);
+        expect((await client.delete(`${api}/${added.id}`, any)).status).toBe(404);
+        expect((await ToolServer.findById(added.id)).name).toBe('Mine');
+    });
+
+    test('renaming and removing work, the limit is twenty, and a signed-out visitor is turned away', async () => {
+        const added = (await add({ name: 'Notes', address: 'https://open.example/mcp' })).data.server;
+        const owner = (await ToolServer.findById(added.id)).owner;
+        expect((await client.patch(`${api}/${added.id}`, { name: 'Notebook' }, any)).data.server.name).toBe('Notebook');
+        expect((await client.delete(`${api}/${added.id}`, any)).status).toBe(200);
+        expect(await ToolServer.countDocuments({})).toBe(0);
+
+        await ToolServer.insertMany(Array.from({ length: 20 }, (unused, index) => ({ owner, name: `s${index}`, kind: 'remote', address: 'https://open.example/mcp' })));
+        expect((await add({ name: 'One more', address: 'https://open.example/mcp' })).status).toBe(422);
+
+        signOut();
+        expect((await client.get(api, any)).status).toBe(401);
+    });
+
+    describe('On a linked computer', () => {
+        const fakeApp = (deviceId, key, answer) => new Promise((resolve) => {
+            const ws = new WebSocket(`ws://localhost:${testStartup.port}/devices`);
+            const app = { ws, asked: [] };
+            open.push(ws);
+            ws.addEventListener('open', () => ws.send(JSON.stringify({ type: 'hello', deviceId, key })));
+            ws.addEventListener('message', (event) => {
+                const message = JSON.parse(event.data);
+                if (message.type === 'welcome') return resolve(app);
+                if (message.type !== 'tools') return undefined;
+                app.asked.push({ action: message.action, localId: message.localId });
+                const data = answer(message);
+                return data ? ws.send(JSON.stringify({ id: message.id, type: 'answer', data })) : undefined;
+            });
+        });
+        const link = async () => {
+            const response = await client.post('/api/v1/devices/link', { hostname: `toolbox-${Date.now()}`, hardware }, any);
+            expect(response.status).toBe(201);
+            return { id: response.data.device.id, key: response.data.key };
+        };
+        const addLocal = (device, localId = 'blender-1234') => client.post(api, { kind: 'local', name: 'Blender', device, localId }, any);
+
+        test('a local server on a computer that is not connected is saved as offline', async () => {
+            const { id } = await link();
+            const response = await addLocal(id);
+            expect(response.status).toBe(201);
+            expect(response.data.server.health.state).toBe('offline');
+            expect(response.data.server.kind).toBe('local');
+            expect(response.data.server.address).toBeNull();
+        });
+
+        test('a connected computer is asked, and what its desktop app reports is recorded', async () => {
+            const { id, key } = await link();
+            let reply = { state: 'healthy', tools: [{ name: 'make_cube', description: 'Adds a cube', readOnly: false }] };
+            const app = await fakeApp(id, key, () => reply);
+            const added = (await addLocal(id)).data.server;
+            expect(app.asked).toEqual([{ action: 'check', localId: 'blender-1234' }]);
+            expect(added.health.state).toBe('healthy');
+            expect(added.tools.map((tool) => tool.name)).toEqual(['make_cube']);
+
+            reply = { state: 'stopped', detail: 'The program uvx was not found.' };
+            const checked = (await client.post(`${api}/${added.id}/check`, {}, any)).data.server;
+            expect(checked.health.state).toBe('stopped');
+            expect(checked.health.detail).toBe('The program uvx was not found.');
+            expect(checked.tools.map((tool) => tool.name)).toEqual(['make_cube']);
+            expect((await addLocal(id)).status).toBe(409);
+        });
+
+        test('a desktop app too old to answer is reported as needing an update', async () => {
+            const { id, key } = await link();
+            await fakeApp(id, key, () => null);
+            const usual = deviceGateway.askMs;
+            deviceGateway.askMs = 200;
+            try {
+                expect((await addLocal(id)).data.server.health.state).toBe('outdated');
+            } finally {
+                deviceGateway.askMs = usual;
+            }
+        });
+
+        test('a computer that belongs to someone else cannot be used', async () => {
+            const { id } = await link();
+            signOut();
+            await testStartup.loginAsUser('creator');
+            expect((await addLocal(id)).status).toBe(404);
+        });
     });
 });
