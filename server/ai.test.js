@@ -4607,6 +4607,12 @@ describe('Tool servers', () => {
         for (const entry of TOOL_CATALOGUE) {
             expect(toolSchemas.add.validate({ kind: 'remote', name: entry.name, address: entry.address }).error).toBeUndefined();
             expect(['account', 'key', 'none']).toContain(entry.signIn);
+            expect(Boolean(entry.key)).toBe(entry.signIn === 'key');
+            if (entry.key) {
+                expect(entry.key.page).toMatch(/^https:\/\//);
+                expect(entry.key.steps.length).toBeGreaterThanOrEqual(3);
+                expect(entry.key.cost.length).toBeGreaterThan(3);
+            }
             expect(entry.does.length).toBeGreaterThan(10);
             expect(entry.group.length).toBeGreaterThan(3);
         }
