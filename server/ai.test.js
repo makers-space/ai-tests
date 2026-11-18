@@ -3034,7 +3034,8 @@ describe('Chat endpoints', () => {
         Editor: ['src', 'mode', 'language'],
         Input: ['label', 'placeholder', 'multiline', 'rows'],
         Select: ['label', 'placeholder', 'value'],
-        Switch: ['label', 'defaultChecked']
+        Switch: ['label', 'defaultChecked'],
+        Frame: ['height', 'title', 'template', 'name', 'file']
     };
     const BLOCK_NAMES = Object.keys(BLOCK_ATTRIBUTES);
 
@@ -3888,6 +3889,62 @@ describe('Chat endpoints', () => {
             await send(plain.id, { content: 'hello' });
             state.noTools = false;
             expect(state.toolsSeen).toEqual([null]);
+        });
+
+        test('a skill may ship files: they are listed, read by their path only, and handed to a model one at a time', async () => {
+            const hairline = SKILLS.find((skill) => skill.id === 'hairline-hairline-create');
+            const onDisk = (name) => fs.readFileSync(new URL(`../../server/instructions/library/hairline/hairline-hairline-create/${name}`, import.meta.url), 'utf8').replace(/\r\n/g, '\n');
+            const paths = hairline.files.map((entry) => entry.path);
+            expect(paths).toEqual(['bench.html', 'build.mjs', 'concepts.md', 'examples/riffle.js', 'examples/terrain.js', 'kernel.js', 'look.md', 'look.mjs', 'read.mjs', 'rules.md', 'source.md', 'validate.mjs']);
+            // The kit is its project's own, unchanged: the engine carries the mark its authors put on it.
+            expect(onDisk('kernel.js')).toMatch(/^\/\* hairline kernel sha256:[0-9a-f]{64} \*\//);
+            expect(SKILLS.filter((skill) => (skill.files || []).length > 0).map((skill) => skill.id)).toEqual(['hairline-hairline-create']);
+
+            // The page that shows a figure asks for the files by path.
+            expect((await get('/skills')).data.skills.find((skill) => skill.id === hairline.id).files).toEqual(paths);
+            const fileOf = (id, path) => client.get(`/api/v1/skills/${id}/file?path=${encodeURIComponent(path)}`, { validateStatus: () => true });
+            const bench = await fileOf(hairline.id, 'bench.html');
+            expect(bench.status).toBe(200);
+            expect(bench.data).toMatchObject({ success: true, skill: hairline.id, path: 'bench.html', text: onDisk('bench.html') });
+            expect(bench.data.text).toContain('<script id="hl-kernel">/*KERNEL*/</script>');
+            expect(bench.data.text).toContain('/*FIGURE*/');
+            expect((await fileOf(hairline.id, 'examples/terrain.js')).data.text).toBe(onDisk('examples/terrain.js'));
+            // Nothing but a listed file is ever read: no way up and out of the folder, and no other skill's page.
+            for (const outside of ['../hairline-hairline-create.md', '../../THIRD_PARTY.md', 'examples/../../hairline-hairline-adopt.md', 'nothing.js', '/etc/passwd', 'kernel.js/..']) {
+                expect((await fileOf(hairline.id, outside)).status, outside).toBe(404);
+            }
+            expect((await fileOf(hairline.id, 'a<b>.js')).status).toBe(400);
+            expect((await fileOf('engineering-grilling', 'kernel.js')).status).toBe(404);
+            expect((await fileOf('not-a-skill', 'kernel.js')).status).toBe(404);
+
+            // A model reads one file at a time, when the skill's own page sends it there.
+            const chat = await newChat({ model: 'qwen2.5-coder:7b', skills: ['components', hairline.id] });
+            state.chatCalls.length = 0;
+            state.toolPlan = [[['open_skill_file', { skill: hairline.id, file: 'rules.md' }], ['open_skill_file', { skill: 'Hairline Create', file: 'missing.md' }]]];
+            const { events: list } = await send(chat.id, { content: 'draw a figure' });
+            const reader = state.chatCalls[0].tools.find((tool) => tool.function.name === 'open_skill_file');
+            expect(reader.function.description).toContain(`\n- ${hairline.id}: ${paths.join(', ')}`);
+            expect(reader.function.parameters.properties.skill.enum).toEqual([hairline.id]);
+            // Room is kept for a file to be read without pushing the conversation out.
+            expect(state.chatCalls[0].options.num_ctx).toBeGreaterThanOrEqual(16384);
+            const answers = state.chatCalls[1].messages.filter((message) => message.role === 'tool');
+            expect(answers[0].content).toBe(onDisk('rules.md'));
+            expect(answers[1].content).toMatch(/^That skill has no file by that name\. Its files are: bench\.html, build\.mjs, /);
+            expect(list.at(-1).reply.steps.map(({ tool, input, failed }) => ({ tool, input, failed: failed || null }))).toEqual([
+                { tool: 'Skill file', input: 'rules.md (Hairline Create)', failed: null },
+                { tool: 'Skill file', input: 'missing.md (Hairline Create)', failed: 'failed' }
+            ]);
+
+            // A chat whose skills have no files is not offered the function, and neither is a model that cannot use tools.
+            state.chatCalls.length = 0;
+            const plain = await newChat({ model: 'qwen2.5-coder:7b', skills: ['components', 'engineering-grilling'] });
+            await send(plain.id, { content: 'hello' });
+            expect(state.chatCalls[0].tools.some((tool) => tool.function.name === 'open_skill_file')).toBe(false);
+
+            client.clearCookies();
+            client.authenticatedAs = null;
+            expect((await fileOf(hairline.id, 'bench.html')).status).toBe(401);
+            await testStartup.loginAsUser('user');
         });
 
         test('stops offering tools after six rounds so a reply always ends', async () => {
