@@ -1227,6 +1227,12 @@ describe('Model endpoints', () => {
             expect((await get('/catalogue?q=coder%20qwen3')).data.models.map((model) => model.tag)).toEqual(['qwen3-coder:30b']);
             expect((await get('/catalogue?q=nothing-like-this')).data.models).toEqual([]);
             expect((await get('/catalogue?page=0')).status).toBe(400);
+            expect((await get('/catalogue?size=10')).status).toBe(400);
+            const small = await get('/catalogue?size=12');
+            expect(small.status).toBe(200);
+            expect(small.data.size).toBe(12);
+            expect(small.data.models.length).toBeLessThanOrEqual(12);
+            expect((await get('/catalogue')).data.size).toBe(48);
         });
 
         test('says plainly when ollama.com cannot be reached or its page cannot be read', async () => {
