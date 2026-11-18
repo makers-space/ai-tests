@@ -3064,7 +3064,7 @@ describe('Chat endpoints', () => {
         Input: ['label', 'placeholder', 'multiline', 'rows'],
         Select: ['label', 'placeholder', 'value'],
         Switch: ['label', 'defaultChecked'],
-        Frame: ['height', 'title', 'template', 'name', 'file']
+        Frame: ['height', 'title', 'template', 'palette', 'name', 'file']
     };
     const BLOCK_NAMES = Object.keys(BLOCK_ATTRIBUTES);
 
@@ -4005,8 +4005,11 @@ describe('Chat endpoints', () => {
             expect(state.chatCalls[2].messages.at(-1)).toMatchObject({ role: 'tool', content: 'Built hairline-terrain.html and showed it to the user in the chat. You cannot see the page from here.' });
             expect(state.chatCalls[3].messages.at(-1).content).toMatch(/^Nothing was built\. A figure file ends with hairline\(/);
             const reply = list.at(-1).reply;
-            expect(reply.content).toContain(['```component', '<Frame template="hairline-hairline-create/bench.html" height="640px" title="Hairline terrain">', '<Part name="KERNEL" file="hairline-hairline-create/kernel.js" />', '<Part name="FIGURE">', terrain, '</Part>', '</Frame>', '```'].join('\n'));
+            expect(reply.content).toContain(['```component', '<Frame template="hairline-hairline-create/bench.html" height="640px" title="Hairline terrain" palette="ground:background, ink:text, muted:text 65%, line:border, hairline-plate:background, hairline-hi:text, hairline-edge:text 55%, hairline-mid:text 32%, hairline-lo:border">', '<Part name="KERNEL" file="hairline-hairline-create/kernel.js" />', '<Part name="FIGURE">', terrain, '</Part>', '</Frame>', '```'].join('\n'));
             expect(reply.content.match(/<Frame /g)).toHaveLength(1);
+            // While each tool runs the person is told what is being done, and told nothing stale once it is over.
+            const notes = list.filter((event) => event.type === 'note').map((event) => event.text);
+            expect(notes).toEqual(["Reading one of a skill's files…", '', 'Building the figure…', '', 'Building the figure…', '']);
             expect(reply.content.trim().endsWith('Here is the terrain.')).toBe(true);
             expect(reply.steps.map(({ tool, input, failed }) => ({ tool, input, failed: failed || null }))).toEqual([
                 { tool: 'Skill file', input: 'kernel.js (Hairline Create)', failed: null },
