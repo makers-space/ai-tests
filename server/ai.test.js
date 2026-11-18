@@ -722,7 +722,7 @@ const fakePull = (model) => {
     };
 };
 
-const fakeOllama = () => ({
+const fakeOllama = (host, signal) => ({
     version: async () => {
         if (!state.up) throw refused();
         return { version: '9.9.9-test' };
@@ -778,6 +778,12 @@ const fakeOllama = () => ({
             request = { ...request, messages: own ? [{ role: 'system', content: own }, ...request.messages.slice(1)] : request.messages.slice(1) };
         }
         state.chatCalls.push(request);
+        // A model still loading: Ollama has not answered, so only the request's own signal can end it.
+        while (state.loadHold && !signal?.aborted) await new Promise((resolve) => setTimeout(resolve, 10));
+        if (state.loadHold && signal?.aborted) {
+            state.loadAborted += 1;
+            throw Object.assign(new Error('This operation was aborted'), { name: 'AbortError' });
+        }
         if (state.chatError) throw Object.assign(new Error(state.chatError), { error: state.chatError });
         if (request.format) {
             const answer = (content) => {
@@ -2694,6 +2700,53 @@ describe('Chat endpoints', () => {
             client.clearCookies();
             client.authenticatedAs = null;
             expect((await get('/activity')).status).toBe(401);
+        });
+
+        test('Stop ends a reply at once while its model is still loading into memory', async () => {
+            const chat = await newChat({ model: 'qwen2.5-coder:7b' });
+            state.loadHold = true;
+            state.loadAborted = 0;
+            try {
+                const stream = await openStream(chat.id, { content: 'hello' });
+                await stream.until((event) => event.type === 'start');
+                for (let attempt = 0; attempt < 100 && state.chatCalls.length === 0; attempt++) await wait(15);
+                const asked = Date.now();
+                expect((await post(`/chats/${chat.id}/stop`, {})).data).toMatchObject({ stopped: true });
+                await stream.finished;
+                expect(Date.now() - asked).toBeLessThan(2000);
+                expect(state.loadAborted).toBe(1);
+                expect(stream.seen.at(-1).type).toBe('done');
+                expect(stream.seen.some((event) => event.type === 'error')).toBe(false);
+                for (let attempt = 0; attempt < 100; attempt++) {
+                    if ((await get('/activity')).data.replies.length === 0) break;
+                    await wait(15);
+                }
+                const kept = await Chat.findById(chat.id);
+                expect(kept.messages.map((message) => message.role)).toEqual(['user']);
+            } finally {
+                state.loadHold = false;
+            }
+        });
+
+        test('a chat sent to a computer is ended through its own request, before the computer has answered', async () => {
+            // The path real computers use: the Ollama library over the link to a desktop app. Here the link never answers.
+            const asked = [];
+            const link = (input, init = {}) => new Promise((resolve, reject) => {
+                asked.push(init.signal);
+                init.signal?.addEventListener('abort', () => reject(new DOMException('This operation was aborted', 'AbortError')), { once: true });
+            });
+            const halt = new AbortController();
+            const waiting = createOllamaClient('http://device.mollama', link).chat({ model: 'small:1b', messages: [{ role: 'user', content: 'hi' }], stream: true }, halt.signal);
+            let ended = null;
+            waiting.then(() => { ended = 'answered'; }, () => { ended = 'stopped'; });
+            await wait(50);
+            expect(ended).toBeNull();
+            expect(asked).toHaveLength(1);
+            expect(asked[0].aborted).toBe(false);
+            halt.abort();
+            await waiting.catch(() => {});
+            expect(ended).toBe('stopped');
+            expect(asked[0].aborted).toBe(true);
         });
 
         test('Stop ends generation and keeps what was written', async () => {
