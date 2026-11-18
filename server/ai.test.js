@@ -3024,7 +3024,7 @@ describe('Chat endpoints', () => {
         ProgressBar: ['value', 'max', 'label', 'showPercentage', 'color', 'size', 'striped', 'animated'],
         CircularProgress: ['size', 'color'],
         Data: ['src', 'variant', 'key', 'label', 'as', 'colors'],
-        Flow: ['height', 'id', 'label', 'color', 'shape', 'source', 'target'],
+        Flow: ['height', 'arrange', 'minimap', 'background', 'id', 'label', 'color', 'shape', 'size', 'weight', 'align', 'width', 'x', 'y', 'group', 'source', 'target', 'type', 'arrow', 'start', 'dashed', 'animated', 'labelsize', 'labelbg', 'from', 'to', 'bend', 'corner', 'collapsible', 'collapsed'],
         TreeView: ['label'],
         Image: ['src', 'alt', 'width', 'height'],
         Video: ['src', 'title'],
@@ -3076,7 +3076,9 @@ describe('Chat endpoints', () => {
             for (const value of ['solid', 'ghost', 'border-shadow']) expect(page('Button')).toContain(value);
             for (const value of ['grid', 'graph', 'dots', 'aurora', 'between', 'evenly', 'baseline', 'flex-column']) expect(page('Container')).toContain(value);
             expect(page('Badge')).not.toMatch(/Flow|TreeView|backgroundFade/);
-            expect(Math.max(...COMPONENT_PAGES.map((one) => estimateTokens(one.text)))).toBeLessThan(1700);
+            expect(Math.max(...COMPONENT_PAGES.map((one) => estimateTokens(one.text)))).toBeLessThan(2400);
+            // A diagram's page says what a box's text may hold and how the person can use it.
+            for (const part of ['<Group ', '&#10;', '| Gear | Ratio |', '~~~js', 'What the user can do']) expect(page('Flow')).toContain(part);
         });
 
         test('is sent with every chat and every model, with or without instructions', async () => {
