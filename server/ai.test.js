@@ -4554,6 +4554,7 @@ describe('Tool servers', () => {
         const host = new URL(address).hostname;
         calls.push({ host, headers: options.requestInit?.headers || null, keeper: Boolean(options.authProvider) });
         if (host === 'down.example') throw new Error('connect failed');
+        if (host === 'crowded.example') throw Object.assign(new Error('slow down'), { status: 429 });
         if (host === 'inside.example') throw new OllamaError('REMOTE_BLOCKED');
         if (host === 'keyed.example' && options.requestInit?.headers?.Authorization !== 'Bearer good-key') throw Object.assign(new Error('no'), { status: 401 });
         if (host === 'account.example' && !(await options.authProvider?.tokens())) {
@@ -4600,14 +4601,15 @@ describe('Tool servers', () => {
     test('the list of online apps is served, and every entry is a named https address that can be added as it is', async () => {
         const response = await client.get('/api/v1/tools/catalogue', any);
         expect(response.status).toBe(200);
-        expect(response.data.apps).toEqual(TOOL_CATALOGUE);
+        expect(response.data.apps).toEqual(TOOL_CATALOGUE.map((entry) => ({ ...entry, keyNeeded: entry.signIn === 'key' })));
         expect(TOOL_CATALOGUE.length).toBeGreaterThanOrEqual(30);
         expect(new Set(TOOL_CATALOGUE.map((entry) => entry.name)).size).toBe(TOOL_CATALOGUE.length);
         expect(new Set(TOOL_CATALOGUE.map((entry) => entry.address)).size).toBe(TOOL_CATALOGUE.length);
         for (const entry of TOOL_CATALOGUE) {
             expect(toolSchemas.add.validate({ kind: 'remote', name: entry.name, address: entry.address }).error).toBeUndefined();
             expect(['account', 'key', 'none']).toContain(entry.signIn);
-            expect(Boolean(entry.key)).toBe(entry.signIn === 'key');
+            if (entry.signIn === 'key') expect(Boolean(entry.key)).toBe(true);
+            if (entry.signIn === 'account') expect(entry.key).toBeNull();
             if (entry.key) {
                 expect(entry.key.page).toMatch(/^https:\/\//);
                 expect(entry.key.steps.length).toBeGreaterThanOrEqual(3);
@@ -4668,6 +4670,37 @@ describe('Tool servers', () => {
         expect([down.health.state, inside.health.state, bare.health.state]).toEqual(['unreachable', 'blocked', 'empty']);
         for (const server of [down, inside, bare]) expect(server.health.needs.length).toBeGreaterThan(0);
         expect(down.tools).toEqual([]);
+    });
+
+    test('on a hosted site an app that offers free keys needs one, and elsewhere it can be added without', async () => {
+        const exa = TOOL_CATALOGUE.find((entry) => entry.name === 'Exa');
+        const open = TOOL_CATALOGUE.find((entry) => entry.name === 'DeepWiki');
+        expect((await add({ name: exa.name, address: exa.address })).status).toBe(201);
+        await ToolServer.deleteMany({});
+
+        const usual = process.env.NODE_ENV;
+        process.env.NODE_ENV = 'production';
+        try {
+            const listed = (await client.get('/api/v1/tools/catalogue', any)).data.apps;
+            expect(listed.filter((entry) => entry.keyNeeded).map((entry) => entry.name).sort()).toEqual(['Context7', 'Exa', 'Firecrawl', 'GitHub', 'Hugging Face']);
+            const refused = await add({ name: exa.name, address: exa.address });
+            expect(refused.status).toBe(422);
+            expect(refused.data.action).toMatch(/free key/);
+            expect(await ToolServer.countDocuments({})).toBe(0);
+            expect((await add({ name: open.name, address: open.address })).status).toBe(201);
+            calls.length = 0;
+            expect((await add({ name: exa.name, address: exa.address, key: 'exa-key' })).status).toBe(201);
+            expect(calls[0].headers).toEqual({ 'x-api-key': 'exa-key' });
+        } finally {
+            process.env.NODE_ENV = usual;
+        }
+    });
+
+    test('a server that says it is taking too many requests is busy, not unreachable, and the way out is a key', async () => {
+        const crowded = (await add({ name: 'Crowded', address: 'https://crowded.example/mcp' })).data.server;
+        expect(crowded.health.state).toBe('busy');
+        expect(crowded.health.label).toBe('Busy right now');
+        expect(crowded.health.needs.join(' ')).toMatch(/your own key/);
     });
 
     test('an address that is not https, or has no name, is refused before anything is saved', async () => {
