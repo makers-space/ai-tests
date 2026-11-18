@@ -4035,9 +4035,10 @@ describe('Linked devices', () => {
     const open = [];
 
     // Stands in for the desktop app: connects, says hello, and answers what the server asks of it.
-    const fakeApp = (deviceId, key) => new Promise((resolve) => {
+    const fakeApp = (deviceId, key, { holdPull = false } = {}) => new Promise((resolve) => {
         const ws = new WebSocket(`ws://localhost:${testStartup.port}/devices`);
-        const app = { ws, welcomed: false, requests: [], closed: new Promise((done) => ws.addEventListener('close', done)) };
+        const held = [];
+        const app = { ws, welcomed: false, requests: [], closed: new Promise((done) => ws.addEventListener('close', done)), release: () => held.splice(0).forEach((answer) => answer()) };
         open.push(ws);
         const send = (message) => ws.send(JSON.stringify(message));
         ws.addEventListener('open', () => send({ type: 'hello', deviceId, key }));
@@ -4055,9 +4056,13 @@ describe('Linked devices', () => {
             app.requests.push(`${message.method} ${message.path}`);
             const body = message.path === '/api/version' ? { version: '9.9.9' } : message.path === '/api/tags' ? TAGS : message.path === '/api/ps' ? { models: [] } : null;
             if (!body) {
-                send({ id: message.id, type: 'head', status: 404, headers: { 'content-type': 'application/json' } });
-                send({ id: message.id, type: 'chunk', data: Buffer.from('{"error":"not found"}').toString('base64') });
-                return send({ id: message.id, type: 'end' });
+                const notFound = () => {
+                    send({ id: message.id, type: 'head', status: 404, headers: { 'content-type': 'application/json' } });
+                    send({ id: message.id, type: 'chunk', data: Buffer.from('{"error":"not found"}').toString('base64') });
+                    send({ id: message.id, type: 'end' });
+                };
+                if (holdPull && message.path === '/api/pull') return held.push(notFound);
+                return notFound();
             }
             const text = JSON.stringify(body);
             send({ id: message.id, type: 'head', status: 200, headers: { 'content-type': 'application/json' } });
@@ -4073,6 +4078,16 @@ describe('Linked devices', () => {
         return { id: response.data.device.id, key: response.data.key };
     };
     const listed = async () => (await client.get('/api/v1/devices')).data.devices;
+    test('the models on a linked computer are listed for the chat picker', async () => {
+        await testStartup.loginAsUser('user');
+        const { id, key } = await link('picker-computer');
+        await fakeApp(id, key);
+        const response = await client.client.get('/api/v1/models', through(id));
+        expect(response.status).toBe(200);
+        expect(response.data.ollamaAvailable).toBe(true);
+        expect(response.data.models.map((model) => model.name)).toEqual(['tiny:1b']);
+        expect(response.data.models[0].canChat).toBe(true);
+    });
     const until = async (check) => {
         for (let attempt = 0; attempt < 60; attempt += 1) {
             if (await check()) return true;
@@ -4259,7 +4274,7 @@ describe('Linked devices', () => {
         const model = 'shared-model:1b';
         await Download.deleteMany({ model });
         const { id, key } = await link('second-computer');
-        await fakeApp(id, key);
+        const app = await fakeApp(id, key, { holdPull: true });
 
         const onServer = await client.post('/api/v1/models/pull', { name: model });
         const onLinked = await client.client.post('/api/v1/models/pull', { name: model }, through(id));
@@ -4280,6 +4295,7 @@ describe('Linked devices', () => {
         await testStartup.loginAsUser('creator');
         const others = (await client.client.get('/api/v1/models/downloads', through(id))).data.downloads;
         expect(others.some((job) => job.id === onLinked.data.download.id)).toBe(false);
+        app.release();
         await downloads.settled(onServer.data.download.id).catch(() => {});
         await downloads.settled(onLinked.data.download.id).catch(() => {});
         await Download.deleteMany({ model });
