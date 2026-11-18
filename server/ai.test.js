@@ -4914,6 +4914,26 @@ describe('Online model providers', () => {
         if (key === 'odd-key-0000') return json({ error: { code: 400, message: 'Please pass a valid API key' } }, 400);
         if (key === 'poor-key-0000') return json({ error: { message: 'insufficient balance' } }, 402);
         if (key === 'slow-key-0000') return json({ error: { message: 'slow down' } }, 429);
+        if (url.host === 'api.anthropic.com') {
+            asked.at(-1).version = new Headers(init.headers || {}).get('anthropic-version');
+            if (key !== 'good-key-0000') return json({ type: 'error', error: { type: 'authentication_error', message: 'invalid x-api-key' } }, 401);
+            if (url.pathname === '/v1/models') return json({ data: [{ type: 'model', id: 'claude-large', display_name: 'Claude Large', max_input_tokens: 1000000, max_tokens: 128000, capabilities: { image_input: { supported: true } } }], has_more: false, first_id: 'claude-large', last_id: 'claude-large' });
+            if (url.pathname === '/v1/messages') {
+                const events = [
+                    ['message_start', { type: 'message_start', message: { id: 'msg_1', type: 'message', role: 'assistant', model: body.model, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 30, output_tokens: 1 } } }],
+                    ['content_block_start', { type: 'content_block_start', index: 0, content_block: { type: 'thinking', thinking: '', signature: '' } }],
+                    ['content_block_delta', { type: 'content_block_delta', index: 0, delta: { type: 'thinking_delta', thinking: 'Considering. ' } }],
+                    ['content_block_stop', { type: 'content_block_stop', index: 0 }],
+                    ['content_block_start', { type: 'content_block_start', index: 1, content_block: { type: 'text', text: '' } }],
+                    ['content_block_delta', { type: 'content_block_delta', index: 1, delta: { type: 'text_delta', text: 'Hello from ' } }],
+                    ['content_block_delta', { type: 'content_block_delta', index: 1, delta: { type: 'text_delta', text: 'Claude.' } }],
+                    ['content_block_stop', { type: 'content_block_stop', index: 1 }],
+                    ['message_delta', { type: 'message_delta', delta: { stop_reason: 'end_turn', stop_sequence: null }, usage: { output_tokens: 12 } }],
+                    ['message_stop', { type: 'message_stop' }]
+                ];
+                return new Response(events.map(([name, data]) => `event: ${name}\ndata: ${JSON.stringify(data)}\n\n`).join(''), { status: 200, headers: { 'Content-Type': 'text/event-stream' } });
+            }
+        }
         if (url.pathname.endsWith('/api/tags')) return json({ models: [{ name: 'kimi-k3', capabilities: ['completion', 'vision'] }, { name: 'embed-one', capabilities: ['embedding'] }] });
         if (url.pathname.endsWith('/models')) {
             return json({ data: key === 'none-key-0000' ? [] : [
@@ -5075,6 +5095,37 @@ describe('Online model providers', () => {
         expect(Object.keys(call.body).sort()).toEqual(['messages', 'model', 'stream', 'stream_options']);
         expect(call.body.options).toBeUndefined();
         expect(call.body.keep_alive).toBeUndefined();
+    });
+
+    test('Claude is reached through its own library: a dated request, its own request shape, and its thinking shown', async () => {
+        const { provider } = (await add('anthropic')).data;
+        expect(provider.health.state).toBe('healthy');
+        expect(provider.models).toEqual(['claude-large']);
+        expect(asked[0]).toMatchObject({ host: 'api.anthropic.com', path: '/v1/models', key: 'good-key-0000' });
+        expect(asked[0].version).toMatch(/^\d{4}-\d{2}-\d{2}$/);
+        expect((await Provider.findById(provider.id)).models[0]).toMatchObject({ contextLength: 1000000, maxOutput: 128000, vision: true });
+
+        const made = await client.post('/api/v1/chats', { model: 'claude-large', device: provider.id }, any);
+        asked.length = 0;
+        const sent = await client.client.post(`/api/v1/chats/${made.data.chat.id}/messages`, { content: 'Say hello' }, { responseType: 'text', validateStatus: () => true });
+        const events = String(sent.data).trim().split('\n').map((line) => JSON.parse(line));
+        expect(events.filter((event) => event.type === 'thinking').map((event) => event.text).join('')).toBe('Considering. ');
+        expect(events.filter((event) => event.type === 'token').map((event) => event.text).join('')).toBe('Hello from Claude.');
+        const done = events.find((event) => event.type === 'done');
+        expect(done.reply.stats).toMatchObject({ evalCount: 12, promptEvalCount: 30 });
+
+        const call = asked.find((one) => one.path === '/v1/messages');
+        expect(call.body.model).toBe('claude-large');
+        expect(call.body.max_tokens).toBe(64000);
+        expect(call.body.stream).toBe(true);
+        expect(typeof call.body.system).toBe('string');
+        expect(call.body.messages.every((message) => message.role !== 'system')).toBe(true);
+        expect(call.body.messages.at(-1)).toEqual({ role: 'user', content: 'Say hello' });
+        expect(call.body.temperature).toBeUndefined();
+
+        expect((await add('anthropic', 'bad-key-0000')).status).toBe(409);
+        await Provider.deleteMany({});
+        expect((await add('anthropic', 'bad-key-0000')).data.provider.health.state).toBe('refused');
     });
 
     test('a key that stops working mid-use ends the reply with a plain reason', async () => {
