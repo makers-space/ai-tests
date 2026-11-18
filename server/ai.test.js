@@ -4078,6 +4078,29 @@ describe('Linked devices', () => {
         return { id: response.data.device.id, key: response.data.key };
     };
     const listed = async () => (await client.get('/api/v1/devices')).data.devices;
+    test('a computer that reconnects while still online is not announced as a change', async () => {
+        await testStartup.loginAsUser('user');
+        const { id, key } = await link('reconnecting-computer');
+        const service = getNotificationService();
+        const sent = [];
+        const real = service.sendToUser.bind(service);
+        service.sendToUser = (userId, notification) => {
+            if (notification.type === 'device:changed' && notification.data?.deviceId === id) sent.push(notification.data.online);
+            return real(userId, notification);
+        };
+        const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+        try {
+            await fakeApp(id, key);
+            for (let attempt = 0; attempt < 50 && sent.length < 1; attempt++) await pause(10);
+            expect(sent).toEqual([true]);
+            await fakeApp(id, key);
+            await pause(150);
+            expect(sent).toEqual([true]);
+        } finally {
+            service.sendToUser = real;
+        }
+    });
+
     test('the models on a linked computer are listed for the chat picker', async () => {
         await testStartup.loginAsUser('user');
         const { id, key } = await link('picker-computer');
@@ -5103,6 +5126,11 @@ describe('Online model providers', () => {
         expect(models.models.map((model) => model.name)).toEqual(['big-one', 'small-one']);
         expect(models.models[0]).toMatchObject({ ready: true, canChat: true, contextLength: 200000, fit: { verdict: 'cloud', label: 'Online', fits: true } });
         expect(models.models[0].capabilities).toContain('vision');
+
+        // The app's watcher must not move a person off an online service: it counts as ready.
+        const status = (await client.client.get('/api/v1/setup/status', through(provider.id))).data;
+        expect(status.ready).toBe(provider.id);
+        expect(status.account.available).toBe(true);
     });
 
     test('a chat on an online model streams the reply, shows its thinking, counts its tokens and sends only the conversation', async () => {
