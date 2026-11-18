@@ -15,7 +15,11 @@ import {
     setToolConnector, ToolSignInError, TOOL_HEALTH, TOOL_CATALOGUE, TOOL_LOCAL_CATALOGUE, CLOUD_PROVIDERS, PROVIDER_HEALTH, setCloudFetch, ollamaOnlineNames, runsOnline, seal, unseal, deviceGateway, DeviceGateway, cloudTitle
 } from '../../server/middleware/ai.middleware.js';
 import { Device, Setting, Download, PersonalModel, Chat, Prompt, Guide, GUIDE_STEPS, MANAGER_GUIDE_STEPS, deviceSchemas, modelSchemas, chatSchemas, promptSchemas, ToolServer, TOOL_HEALTH_STATES, toolSchemas, Provider, PROVIDER_HEALTH_STATES, providerSchemas, Skill } from '../../server/models/ai.model.js';
-import { downloads, health, queue, COMPONENT_GUIDE, BASE_GUIDE, CLOSING_GUIDE, SKILLS, SEARCH_GUIDE, PLAN_GUIDE, RESULTS_GUIDE, REVIEW_GUIDE, TOUCH_GUIDE, writtenToolCalls, BUILTIN_TOOLS, waitingPermissions, todayLine, SKILL_SOURCES, MAX_CHAT_SKILLS, SUGGESTED_SKILLS } from '../../server/controllers/ai.controller.js';
+import { downloads, health, queue, SKILLS, TOUCH_GUIDE, writtenToolCalls, BUILTIN_TOOLS, waitingPermissions, todayLine, SKILL_SOURCES, MAX_CHAT_SKILLS, SUGGESTED_SKILLS } from '../../server/controllers/ai.controller.js';
+
+// What a chat is sent when only the default skill is on: the Components skill, today's date, and that skill's reminder.
+const COMPONENT_GUIDE = SKILLS.find((skill) => skill.id === 'components').text;
+const CLOSING_GUIDE = `REMEMBER\n${SKILLS.find((skill) => skill.id === 'components').remember}`;
 
 const MB = 1024 * 1024;
 
@@ -762,15 +766,15 @@ const fakeOllama = () => ({
         if (!state.up) throw refused();
         if (!state.models.some((existing) => existing.name === request.model)) throw notFound(request.model);
         const lead = request.messages[0];
-        if (lead?.role === 'system' && lead.content.startsWith(COMPONENT_GUIDE)) {
-            state.guidesSeen += 1;
-            let own = lead.content.slice(COMPONENT_GUIDE.length).replace(/^\n\n/, '');
-            own = own.split('\n\n').filter((part) => part !== todayLine()).join('\n\n');
-            if (own.endsWith(CLOSING_GUIDE)) own = own.slice(0, own.length - CLOSING_GUIDE.length).replace(/\n\n$/, '');
-            if (own.endsWith(SEARCH_GUIDE)) {
-                state.searchGuides += 1;
-                own = own.slice(0, own.length - SEARCH_GUIDE.length).replace(/\n\n$/, '');
+        // The default skill, the date line and the skill's reminder are taken off, so a test sees only what a chat adds.
+        if (lead?.role === 'system') {
+            let own = lead.content;
+            if (own.startsWith(COMPONENT_GUIDE)) {
+                state.guidesSeen += 1;
+                own = own.slice(COMPONENT_GUIDE.length).replace(/^\n\n/, '');
             }
+            if (own.endsWith(CLOSING_GUIDE)) own = own.slice(0, own.length - CLOSING_GUIDE.length).replace(/\n\n$/, '');
+            own = own.split('\n\n').filter((part) => part !== todayLine()).join('\n\n');
             request = { ...request, messages: own ? [{ role: 'system', content: own }, ...request.messages.slice(1)] : request.messages.slice(1) };
         }
         state.chatCalls.push(request);
@@ -2944,34 +2948,13 @@ describe('Chat endpoints', () => {
 
     describe('Built-in component guide', () => {
         test('explains the tag format, every component and its attributes', () => {
-            expect(COMPONENT_GUIDE.split('\n')[0]).toMatch(/Answer the user.s message directly in normal Markdown/);
             expect(COMPONENT_GUIDE).toMatch(/Most replies need none/);
-            expect(COMPONENT_GUIDE).toMatch(/Never talk about components/);
             expect(COMPONENT_GUIDE).toMatch(/Do not wrap ordinary text in a Card/);
             expect(COMPONENT_GUIDE).toMatch(/Do not make up rows/);
-            expect(COMPONENT_GUIDE).toMatch(/A code fence is only for code/);
             expect(COMPONENT_GUIDE).not.toContain(TOUCH_GUIDE);
             expect(TOUCH_GUIDE).toMatch(/For this one reply only/);
-            expect(COMPONENT_GUIDE).toMatch(/never repeat, summarise or explain it to the user/);
             expect(CLOSING_GUIDE).toMatch(/^REMEMBER\n/);
             expect(CLOSING_GUIDE).toMatch(/Never list, describe or explain components/);
-            expect(COMPONENT_GUIDE.startsWith(BASE_GUIDE)).toBe(true);
-            expect(PLAN_GUIDE).toMatch(/Start with a verb ending in -ing/);
-            expect(RESULTS_GUIDE).toMatch(/the source.s own words or your account of it/);
-            expect(RESULTS_GUIDE).toMatch(/never a bare list of links/);
-            expect(RESULTS_GUIDE).toMatch(/match the length to the question/);
-            expect(RESULTS_GUIDE).toMatch(/Do not add a list of sources or links at the end, unless the user asked/);
-            expect(RESULTS_GUIDE).toMatch(/never describe the search or your own reasoning/);
-            expect(PLAN_GUIDE).toMatch(/Never search for today's date, the time, how long until or since a date, a sum or a unit conversion/);
-            expect(RESULTS_GUIDE).toMatch(/no more than the content needs/);
-            expect(RESULTS_GUIDE).toMatch(/Then describe the work properly in your own words/);
-            expect(RESULTS_GUIDE).toMatch(/Never write a quotation, a wording or a figure from memory/);
-            expect(RESULTS_GUIDE).toMatch(/give the pages as links, say what each one is/);
-            expect(RESULTS_GUIDE).toMatch(/never say that nothing was found/);
-            expect(RESULTS_GUIDE).toMatch(/\[title\]\(address\)/);
-            expect(RESULTS_GUIDE).toMatch(/A whole published work[^.]*is not written out/);
-            expect(RESULTS_GUIDE).toMatch(/that it is copyrighted[^.]*give the direct source/);
-            expect(COMPONENT_GUIDE).toMatch(/Do not write out a whole copyrighted work/);
             for (const heading of ['VALUES', 'COMPONENTS', 'SHARED ATTRIBUTES', 'LAYOUT ATTRIBUTES (Container and Card)', 'TAGS THAT GO INSIDE OTHERS', 'FILES BY TYPE']) {
                 expect(COMPONENT_GUIDE).toContain(`\n${heading}\n|`);
             }
@@ -3273,12 +3256,10 @@ describe('Chat endpoints', () => {
     describe('Searching the web', () => {
         const withKey = async (work) => {
             process.env.TAVILY_API_KEY = 'tvly-test';
-            process.env.WEB_SEARCH_MODE = 'tools';
             try {
                 return await work();
             } finally {
                 process.env.TAVILY_API_KEY = '';
-                process.env.WEB_SEARCH_MODE = '';
             }
         };
 
@@ -3323,22 +3304,26 @@ describe('Chat endpoints', () => {
             const chat = await newChat({ model: 'qwen2.5-coder:7b' });
             await send(chat.id, { content: 'find a duck model' });
             expect(state.chatCalls[0].tools).toBeUndefined();
-            expect(state.searchGuides).toBe(0);
             expect(COMPONENT_GUIDE).not.toMatch(/web_search/);
             expect(state.chatCalls[0].options.num_ctx).toBe(8192);
             expect((await get('/models')).data.webSearch).toBe(false);
         });
 
-        test('with a search address, both tools are offered with more room to read and the instruction to search with every request', async () => {
+        test('with a search address, both tools are offered with more room to read, and nothing of Mollama\'s own tells the model how to use them', async () => {
             await withKey(async () => {
                 const chat = await newChat({ model: 'qwen2.5-coder:7b' });
                 await send(chat.id, { content: 'find a duck model' });
                 const request = state.chatCalls[0];
                 expect(request.tools.map((tool) => tool.function.name)).toEqual(['web_search', 'web_fetch']);
-                expect(state.searchGuides).toBe(1);
-                expect(SEARCH_GUIDE).toMatch(/web_search/);
-                expect(SEARCH_GUIDE).toMatch(/with every request/);
+                // Only the user's message is left once the default skill and the date are taken off: no search rules.
+                expect(request.messages.map((message) => message.role)).toEqual(['user']);
                 expect(request.options.num_ctx).toBe(16384);
+
+                // The guidance for searching is a skill the chat may turn on.
+                state.chatCalls.length = 0;
+                const guided = await newChat({ model: 'qwen2.5-coder:7b', skills: ['search-web-search'] });
+                await send(guided.id, { content: 'find a duck model' });
+                expect(state.chatCalls[0].messages[0].content).toMatch(/^SKILL: Web Search\n\nYou can search the web with web_search/);
                 expect((await get('/models')).data.webSearch).toBe(true);
             });
         });
@@ -3349,7 +3334,6 @@ describe('Chat endpoints', () => {
                 const chat = await newChat({ model: 'qwen2.5-coder:7b' });
                 await send(chat.id, { content: 'find a duck model' });
                 expect(state.chatCalls[0].tools).toBeUndefined();
-                expect(state.searchGuides).toBe(0);
             });
         });
 
@@ -3486,12 +3470,12 @@ describe('Chat endpoints', () => {
                 expect(SKILL_SOURCES[skill.source]).toBeTruthy();
                 if (skill.source === 'mollama') continue;
                 expect(skill.description.length).toBeGreaterThan(10);
-                expect(skill.credit).toMatch(/\((MIT|Apache-2\.0)\)$/);
+                expect(skill.credit).toMatch(/\((MIT|Apache-2\.0|MIT, Apache-2\.0)\)$/);
                 expect(skill.text.startsWith(`SKILL: ${skill.name}`)).toBe(true);
             }
             // The five skills Mollama wrote itself are gone; the one that draws its viewers stays.
             expect(skills.filter((skill) => skill.source === 'mollama').map((skill) => skill.id)).toEqual(['components']);
-            expect(sources.map((source) => source.id)).toEqual(['mollama', 'anthropic', 'engineering', 'marketing', 'medical', 'dex', 'context7', 'last30days', 'anatomy', 'hairline']);
+            expect(sources.map((source) => source.id)).toEqual(['mollama', 'anthropic', 'engineering', 'marketing', 'medical', 'dex', 'context7', 'search', 'last30days', 'anatomy', 'hairline']);
             expect(sources.reduce((sum, source) => sum + source.count, 0)).toBe(skills.length);
             expect(skills.every((skill) => skill.tokens > 0)).toBe(true);
 
@@ -3581,13 +3565,21 @@ describe('Chat endpoints', () => {
             }
         });
 
-        test('what is always sent can be read, and the skills suggested for small models are short and need nothing extra', async () => {
-            const { skills, always } = (await get('/skills')).data;
-            expect(always.map((guide) => guide.id)).toEqual(['base-assistant', 'base-tools', 'base-search-plan', 'base-search-results']);
-            expect((await get('/skills/base-assistant')).data.skill.text).toBe(BASE_GUIDE);
-            expect((await get('/skills/base-search-results')).data.skill.text).toBe(RESULTS_GUIDE);
-            expect(BASE_GUIDE).toMatch(/Match the answer to the question/);
-            expect(BASE_GUIDE).not.toMatch(/complete, satisfying answers/);
+        test('nothing of Mollama\'s own is sent or listed, and the skills suggested for small models are short and need nothing extra', async () => {
+            const listed = (await get('/skills')).data;
+            const { skills } = listed;
+            expect(listed.always).toBeUndefined();
+            for (const gone of ['base-assistant', 'base-tools', 'base-search-plan', 'base-search-results']) {
+                expect((await client.get(`/api/v1/skills/${gone}`, { validateStatus: () => true })).status).toBe(404);
+            }
+            for (const gone of ['assistant.md', 'search.md', 'tools.md']) {
+                expect(fs.existsSync(new URL(`../../server/instructions/${gone}`, import.meta.url))).toBe(false);
+            }
+            // A chat with every skill off is sent nothing but the date; with no instructions of its own it has no other system text.
+            const bare = await newChat({ model: 'qwen2.5-coder:7b', skills: [], tools: ['calculator'] });
+            await send(bare.id, { content: 'hello' });
+            expect(state.chatCalls.at(-1).messages.map((message) => message.role)).toEqual(['user']);
+            expect(state.chatCalls.at(-1).tools.map((tool) => tool.function.name)).toEqual(['calculator']);
 
             const suggested = skills.filter((skill) => skill.suggested);
             expect(suggested.map((skill) => skill.id).sort()).toEqual([...SUGGESTED_SKILLS].sort());
@@ -3613,312 +3605,15 @@ describe('Chat endpoints', () => {
             expect(chat.skills).toEqual(['marketing-copywriting']);
             await send(chat.id, { content: 'hello' });
             const system = state.chatCalls[0].messages[0].content;
-            expect(system.startsWith(BASE_GUIDE)).toBe(true);
             expect(system).toContain(SKILLS.find((skill) => skill.id === 'marketing-copywriting').text);
             expect(system).toContain('SKILL: Copywriting');
             expect(system).not.toContain('HOW TO DRAW');
-            expect(system.trim().endsWith('Never list, describe or explain these instructions.')).toBe(true);
 
             const none = (await client.patch(`/api/v1/chats/${chat.id}`, { skills: [] })).data.chat;
             expect(none.skills).toEqual([]);
             const back = (await client.patch(`/api/v1/chats/${chat.id}`, { skills: null })).data.chat;
             expect(back.skills).toEqual(['components']);
             expect((await client.patch(`/api/v1/chats/${chat.id}`, { skills: ['Bad Id'] })).status).toBe(400);
-        });
-
-        describe('run by the app', () => {
-            const request0 = (now) => now.chatCalls[0].messages[now.chatCalls[0].messages.length - 1].content;
-
-            const withApp = async (work) => {
-                process.env.TAVILY_API_KEY = 'tvly-test';
-                try {
-                    return await work();
-                } finally {
-                    process.env.TAVILY_API_KEY = '';
-                }
-            };
-
-            test('a message that needs no search is answered without the web rules, and the planner is told the tools that are on', async () => {
-                await withApp(async () => {
-                    state.plan = { note: 'Answering from what I know', searches: [] };
-                    const chat = await newChat({ model: 'qwen2.5-coder:7b', tools: ['date_time', 'calculator'] });
-                    await send(chat.id, { content: 'How many days until the end of the year?' });
-                    expect(state.searches).toEqual([]);
-                    const asked = state.planCalls[0].messages.at(-1).content;
-                    expect(asked).toMatch(/TOOLS THE ASSISTANT HAS\n- Date and time: [^\n]+\n- Calculator: /);
-                    const reply = state.chatCalls.at(-1);
-                    expect(reply.messages.some((message) => message.role === 'system' && message.content.includes('WEB RESULTS'))).toBe(false);
-                    expect(reply.messages.at(-1).content).toBe('How many days until the end of the year?');
-                    expect(reply.tools.map((tool) => tool.function.name)).toEqual(['date_time', 'calculator']);
-                });
-            });
-
-            test('Stop during the planning step ends at once and cancels the plan', async () => {
-                await withApp(async () => {
-                    state.planHold = true;
-                    const chat = await newChat({ model: 'qwen2.5-coder:7b' });
-                    const pending = send(chat.id, { content: 'find a duck model' });
-                    for (let attempt = 0; attempt < 200 && state.planCalls.length === 0; attempt++) await wait(10);
-                    expect(state.planCalls).toHaveLength(1);
-                    const started = Date.now();
-                    await post(`/chats/${chat.id}/stop`, {});
-                    await pending;
-                    expect(Date.now() - started).toBeLessThan(1500);
-                    expect(state.planAborted).toBe(1);
-                    expect(state.chatCalls).toHaveLength(0);
-                    state.planHold = false;
-                });
-            });
-
-            test('the model plans, the app searches and reads, and only files that load are offered', async () => {
-                await withApp(async () => {
-                    state.plan = { note: '  Looking for a duck   model file.  ', searches: [{ query: 'duck 3d model', fileTypes: ['.GLB'] }] };
-                    state.chatReply = 'Here it is.\n\n```component\n<Model3D src="https://models.example/files/duck.glb" />\n<Image src="https://invented.example/duck.png" />\n<PdfViewer src="https://models.example/duck" />\n```';
-                    const chat = await newChat({ model: 'qwen2.5-coder:7b' });
-                    const { events: list } = await send(chat.id, { content: 'find a duck model, like https://given.example/a.glb' });
-
-                    expect(state.planCalls).toHaveLength(1);
-                    expect(state.planCalls[0]).toMatchObject({ stream: true, format: { type: 'object' } });
-                    // The planner is told today's date, and the rules for web results are not in its prompt yet.
-                    expect(state.planCalls[0].messages.at(-1).role).toBe('user');
-                    expect(state.planCalls[0].messages.at(-1).content).toMatch(/fileTypes[\s\S]*TODAY\nToday is [A-Z][a-z]+,? \d{1,2} [A-Z][a-z]+ \d{4} \(UTC\)\.\n\nTHE USER'S MESSAGE\n/);
-                    expect(state.planCalls[0].messages.some((message) => message.role === 'system' && message.content.includes('WEB RESULTS'))).toBe(false);
-                    expect(state.searches).toEqual(['duck 3d model']);
-                    expect(state.planCalls[0].format.required).toEqual(['note', 'searches']);
-                    expect(list.find((event) => event.type === 'note')).toEqual({ type: 'note', text: 'Looking for a duck model file.' });
-                    expect(list.find((event) => event.type === 'start')).toMatchObject({ loaded: expect.any(Boolean) });
-                    expect(list.filter((event) => event.type === 'tool').map((event) => event.tool)).toEqual(['web_search', 'web_fetch', 'web_fetch', 'web_fetch']);
-                    expect(request0(state).indexOf('Files found')).toBeLessThan(request0(state).indexOf('Pages (web pages'));
-
-                    expect(state.chatCalls).toHaveLength(1);
-                    const request = state.chatCalls[0];
-                    expect(request.tools).toBeUndefined();
-                    expect(request.options.num_ctx).toBe(16384);
-                    expect(request.options.num_predict).toBe(16384);
-                    expect(state.planCalls[0].options.num_ctx).toBe(16384);
-                    expect(request.messages[0].content).toMatch(/WEB RESULTS/);
-                    const asked = request.messages[request.messages.length - 1].content;
-                    expect(asked).toMatch(/^WEB RESULTS/);
-                    expect(asked).toContain('- https://models.example/files/duck.glb (glb)');
-                    expect(asked).not.toContain('missing.glb');
-                    expect(asked).toContain('- https://models.example/hidden/files/duck.glb (glb)');
-                    expect(asked).not.toContain('page.glb');
-                    expect(asked.endsWith('find a duck model, like https://given.example/a.glb')).toBe(true);
-
-                    const done = list[list.length - 1];
-                    expect(state.reviewCalls).toHaveLength(0);
-                    expect(done.reply.unverified).toEqual(['https://invented.example/duck.png', 'https://models.example/duck']);
-                    const saved = (await get(`/chats/${chat.id}`)).data.chat.messages;
-                    expect(saved[0].content).toBe('find a duck model, like https://given.example/a.glb');
-                    expect(saved[1].unverified).toEqual(['https://invented.example/duck.png', 'https://models.example/duck']);
-                    expect(saved[1].steps).toHaveLength(4);
-                });
-            });
-
-            test('an address the user gave is never marked, and nothing is searched when the plan is empty', async () => {
-                await withApp(async () => {
-                    state.chatReply = '```component\n<Model3D src="https://given.example/a.glb" />\n```';
-                    const chat = await newChat({ model: 'qwen2.5-coder:7b' });
-                    const { events: list } = await send(chat.id, { content: 'show https://given.example/a.glb' });
-                    expect(state.searches).toEqual([]);
-                    expect(state.chatCalls[0].messages[state.chatCalls[0].messages.length - 1].content).toBe('show https://given.example/a.glb');
-                    expect(list[list.length - 1].reply.unverified).toEqual([]);
-                    expect(list[list.length - 1].reply.steps).toEqual([]);
-                });
-            });
-
-            test('when the first search finds no file, the app searches once more by file type, and small images are not offered', async () => {
-                await withApp(async () => {
-                    state.plan = { searches: [{ query: 'tiny icons', fileTypes: ['png'] }] };
-                    const chat = await newChat({ model: 'qwen2.5-coder:7b' });
-                    const { events: list } = await send(chat.id, { content: 'find icons' });
-                    expect(state.searches).toEqual(['tiny icons', 'tiny icons filetype:png']);
-                    expect(request0(state)).toContain('- none');
-                    expect(list[list.length - 1].reply.steps.filter((step) => step.tool === 'web_search')).toHaveLength(2);
-                });
-            });
-
-            test('a GitHub page for a file is offered as its raw file', async () => {
-                await withApp(async () => {
-                    state.plan = { searches: [{ query: 'github table', fileTypes: ['csv'] }] };
-                    const chat = await newChat({ model: 'qwen2.5-coder:7b' });
-                    await send(chat.id, { content: 'find a table' });
-                    expect(request0(state)).toContain('- https://raw.githubusercontent.com/owner/repo/main/data.csv (csv)');
-                });
-            });
-
-            test('when the search service is limiting requests the app says so and stops searching', async () => {
-                await withApp(async () => {
-                    state.enginesLimited = true;
-                    state.plan = { searches: [{ query: 'duck', fileTypes: ['glb'] }, { query: 'goose', fileTypes: ['glb'] }] };
-                    const chat = await newChat({ model: 'qwen2.5-coder:7b' });
-                    const { events: list } = await send(chat.id, { content: 'find birds' });
-                    expect(list.filter((event) => event.type === 'toolFailed').map((event) => event.failed)).toEqual(['limited']);
-                    expect(state.searchUrls).toHaveLength(1);
-                    expect(request0(state)).toContain('SEARCH: duck\nThe search service is limiting requests right now, so this search could not be run.');
-                    expect(list[list.length - 1]).toMatchObject({ type: 'done', reply: { error: null } });
-                });
-            });
-
-            test('results that share fewer than two words with the search are dropped as unrelated', async () => {
-                await withApp(async () => {
-                    state.junkResults = true;
-                    state.plan = { searches: [{ query: 'free duck 3d model', fileTypes: [] }] };
-                    const chat = await newChat({ model: 'qwen2.5-coder:7b' });
-                    await send(chat.id, { content: 'find a duck' });
-                    expect(request0(state)).toContain('https://railway.example/duck');
-                    expect(request0(state)).not.toContain('games.example');
-                    expect(state.fetches).toEqual(['https://railway.example/duck']);
-                });
-            });
-
-            test('with a search key the app asks the search service with that key, and a spent allowance is reported as limited', async () => {
-                process.env.TAVILY_API_KEY = 'tvly-test';
-                try {
-                    expect((await get('/models')).data.webSearch).toBe(true);
-                    state.plan = { searches: [{ query: 'duck 3d model', fileTypes: ['glb'] }] };
-                    const chat = await newChat({ model: 'qwen2.5-coder:7b' });
-                    await send(chat.id, { content: 'find a duck model' });
-                    expect(state.searchUrls).toEqual(['https://api.tavily.com/search']);
-                    expect(state.searchRequests[0]).toMatchObject({ method: 'POST', key: 'Bearer tvly-test', body: { query: 'duck 3d model', max_results: 8, search_depth: 'basic' } });
-                    expect(request0(state)).toContain('- https://models.example/files/duck.glb (glb)');
-
-                    state.searchFails = true;
-                    state.searchStatus = 432;
-                    const second = await send(chat.id, { content: 'again' });
-                    expect(second.events.find((event) => event.type === 'toolFailed').failed).toBe('limited');
-                } finally {
-                    process.env.TAVILY_API_KEY = '';
-                }
-            });
-
-            test('when a search finds nothing, the model is asked for deeper searches and pages, and the app stops once they find something', async () => {
-                await withApp(async () => {
-                    state.plan = { searches: [{ query: 'duck 3d model', fileTypes: ['pdf'] }] };
-                    state.reviews = [{
-                        enough: false,
-                        searches: [{ query: 'mallard glb github', fileTypes: ['glb'] }, { query: 'Duck 3D Model', fileTypes: ['glb'] }],
-                        pages: [
-                            { url: 'https://other.example/4', fileTypes: ['csv'] },
-                            { url: 'https://other.example/1', fileTypes: ['csv'] },
-                            { url: 'https://never-found.example/x', fileTypes: ['glb'] }
-                        ]
-                    }, { enough: true, searches: [], pages: [] }];
-                    const chat = await newChat({ model: 'qwen2.5-coder:7b' });
-                    const { events: list } = await send(chat.id, { content: 'find a duck model and a table' });
-
-                    expect(state.reviewCalls).toHaveLength(1);
-                    expect(state.reviewCalls[0].format.properties.enough).toEqual({ type: 'boolean' });
-                    expect(state.reviewCalls[0].messages.at(-1).content).toMatch(/\n\nTHE USER'S MESSAGE\nfind a duck model and a table\n\nFOUND SO FAR\n\nSEARCH: duck 3d model/);
-                    expect(state.reviewCalls[0].messages.at(-1).content).toContain('SEARCHES ALREADY RUN\n- duck 3d model\n\nWORDS ALREADY SEARCHED\nduck, 3d, model');
-                    expect(state.searches).toEqual(['duck 3d model', 'duck 3d model filetype:pdf', 'mallard glb github']);
-                    expect(state.fetches).toContain('https://other.example/4');
-                    expect(state.fetches.filter((address) => address === 'https://other.example/1')).toHaveLength(1);
-                    expect(state.fetches.some((address) => address.includes('never-found'))).toBe(false);
-                    expect(request0(state)).toContain('PAGE: https://other.example/4\nFiles found on this page (csv; each one was loaded successfully; use these in src):\n- https://raw.githubusercontent.com/owner/repo/main/data.csv (csv)');
-                    expect(list[list.length - 1]).toMatchObject({ type: 'done', reply: { error: null } });
-                });
-            });
-
-            test('the search stops when two rounds in a row find nothing new, and a review that cannot be read ends it', async () => {
-                await withApp(async () => {
-                    state.plan = { searches: [{ query: 'duck', fileTypes: ['pdf'] }] };
-                    state.reviews = [1, 2, 3, 4].map((round) => ({ enough: false, searches: [{ query: `alpha${round} beta${round}`, fileTypes: ['pdf'] }], pages: [] }));
-                    const chat = await newChat({ model: 'qwen2.5-coder:7b' });
-                    await send(chat.id, { content: 'find a duck model' });
-                    expect(state.reviewCalls).toHaveLength(2);
-                    expect(state.searches).toEqual(['duck', 'duck filetype:pdf', 'alpha1 beta1', 'alpha1 beta1 filetype:pdf', 'alpha2 beta2', 'alpha2 beta2 filetype:pdf']);
-
-                    state.reviews = ['not json'];
-                    await send(chat.id, { content: 'again' });
-                    expect(state.reviewCalls).toHaveLength(3);
-                    expect(state.searches.slice(6)).toEqual(['duck', 'duck filetype:pdf']);
-                });
-            });
-
-            test('a deeper search must use new words: rewordings of earlier searches are not run', async () => {
-                await withApp(async () => {
-                    state.plan = { searches: [{ query: 'NASA Curiosity rover 3D model glb', fileTypes: ['pdf'] }] };
-                    state.reviews = [{
-                        enough: false,
-                        searches: [
-                            { query: 'Curiosity rover 3D model NASA glb download', fileTypes: ['glb'] },
-                            { query: "NASA's official 3D model of the Curiosity rover", fileTypes: ['glb'] },
-                            { query: 'Curiosity rover 3D model Sketchfab', fileTypes: ['glb'] },
-                            { query: 'Mars Science Laboratory MSL spacecraft mesh', fileTypes: ['pdf'] }
-                        ],
-                        pages: []
-                    }];
-                    const chat = await newChat({ model: 'qwen2.5-coder:7b' });
-                    await send(chat.id, { content: 'find the rover' });
-                    expect(state.searches.filter((query) => !query.includes('filetype:'))).toEqual(['NASA Curiosity rover 3D model glb', 'Mars Science Laboratory MSL spacecraft mesh']);
-                    expect(state.reviewCalls[1].messages.at(-1).content).toContain('- Mars Science Laboratory MSL spacecraft mesh');
-                });
-            });
-
-            test('a chat with web search switched off is answered without searching', async () => {
-                await withApp(async () => {
-                    state.plan = { searches: [{ query: 'duck facts', fileTypes: [] }] };
-                    expect((await get('/skills')).data.webSearch).toBe(true);
-                    state.up = false;
-                    expect((await get('/models')).data).toMatchObject({ ollamaAvailable: false, webSearch: true });
-                    state.up = true;
-                    const chat = await newChat({ model: 'qwen2.5-coder:7b', webSearch: false });
-                    expect(chat.webSearch).toBe(false);
-                    await send(chat.id, { content: 'search the web for ducks' });
-                    expect(state.searches).toEqual([]);
-                    expect(state.planCalls).toHaveLength(0);
-                    expect(state.chatCalls).toHaveLength(1);
-
-                    expect((await client.patch(`/api/v1/chats/${chat.id}`, { webSearch: true })).data.chat.webSearch).toBe(true);
-                    await send(chat.id, { content: 'search the web for ducks' });
-                    expect(state.searches).toEqual(['duck facts']);
-                });
-            });
-
-            test('a question that needs facts gets the text of the best page', async () => {
-                await withApp(async () => {
-                    state.plan = { searches: [{ query: 'duck facts', fileTypes: [] }, { query: '', fileTypes: [] }] };
-                    const chat = await newChat({ model: 'qwen2.5-coder:7b' });
-                    await send(chat.id, { content: 'tell me about ducks' });
-                    const asked = state.chatCalls[0].messages[state.chatCalls[0].messages.length - 1].content;
-                    expect(state.fetches[0]).toBe('https://models.example/duck');
-                    expect(state.fetches.length).toBe(3);
-                    expect(asked).toContain('Text of https://models.example/duck:\nDownload the duck below.');
-                    const saved = (await get(`/chats/${chat.id}`)).data.chat.messages.pop().content;
-                    expect(saved).toMatch(/\n\nSources:\n- \[Duck model\]\(https:\/\/models\.example\/duck\)\n- \[Other 1\]\(https:\/\/other\.example\/1\)\n- \[Other 2\]\(https:\/\/other\.example\/2\)$/);
-
-                    state.chatReply = 'It is on [this page](https://models.example/duck).';
-                    await send(chat.id, { content: 'and where is that?' });
-                    expect((await get(`/chats/${chat.id}`)).data.chat.messages.pop().content).toBe('It is on [this page](https://models.example/duck).');
-                    expect(asked).not.toContain('Files found');
-                });
-            });
-
-            test('a plan that cannot be read or a search that fails still ends in a reply', async () => {
-                await withApp(async () => {
-                    state.plan = 'not json';
-                    const chat = await newChat({ model: 'qwen2.5-coder:7b' });
-                    const first = await send(chat.id, { content: 'find a duck model' });
-                    expect(first.events[first.events.length - 1]).toMatchObject({ type: 'done', reply: { content: 'A short answer', error: null } });
-
-                    state.plan = { searches: [{ query: 'duck', fileTypes: ['glb'] }] };
-                    state.searchFails = true;
-                    state.searchStatus = 403;
-                    const second = await send(chat.id, { content: 'try again' });
-                    expect(second.events.find((event) => event.type === 'toolFailed').failed).toBe('refused');
-                    expect(second.events[second.events.length - 1]).toMatchObject({ type: 'done', reply: { error: null } });
-                });
-            });
-        });
-
-        test('the plan and results instructions are short and say what the app does', () => {
-            expect(PLAN_GUIDE).toMatch(/at most 8/);
-            expect(RESULTS_GUIDE).toMatch(/Never put a page address in src/);
-            expect(RESULTS_GUIDE).toMatch(/Never tell the user that you cannot search the web/);
-            expect(PLAN_GUIDE).toMatch(/always plan at least one search/);
-            expect(REVIEW_GUIDE).toMatch(/deeper searches/);
-            expect(estimateTokens(PLAN_GUIDE) + estimateTokens(RESULTS_GUIDE) + estimateTokens(REVIEW_GUIDE)).toBeLessThan(1950);
         });
 
         test('stops offering tools after six rounds so a reply always ends', async () => {
@@ -5532,7 +5227,7 @@ describe('Tools in chats', () => {
         state.toolPlan = [[['calculator', { expression: '6 * 7' }]]];
         const events = await send(chat.id, 'what is six times seven');
         expect(state.chatCalls[0].tools.map((tool) => tool.function.name)).toEqual(['date_time', 'calculator']);
-        expect(state.chatCalls[0].messages[0].content).toContain('You have tools for this chat');
+        expect(JSON.stringify(state.chatCalls[0].messages)).not.toContain('You have tools for this chat');
         expect(events.find((event) => event.type === 'tool')).toMatchObject({ tool: 'Calculator', input: '{"expression":"6 * 7"}' });
         expect(toolTurns(state.chatCalls[1])).toEqual([{ role: 'tool', tool_name: 'calculator', content: '42' }]);
         const done = events.find((event) => event.type === 'done');
@@ -5543,7 +5238,6 @@ describe('Tools in chats', () => {
         const plain = await newChat();
         await send(plain.id);
         expect(state.chatCalls[0].tools).toBeUndefined();
-        expect(state.chatCalls[0].messages[0].content).not.toContain('You have tools for this chat');
 
         resetState();
         state.noTools = true;
