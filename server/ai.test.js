@@ -873,7 +873,9 @@ describe('Fit rules', () => {
         const ranked = rankCatalogue(catalogue, laptop);
         expect(ranked.slice(0, 3).map((model) => model.pick)).toEqual(['fast', 'balanced', 'best']);
         expect(new Set(ranked.slice(0, 3).map((model) => model.tag)).size).toBe(3);
-        expect(ranked.slice(3).every((model) => model.pick === null)).toBe(true);
+        expect([null, 'code', 'reasoning']).toContain(ranked[3].pick);
+        expect(new Set(ranked.slice(0, 4).map((model) => model.tag)).size).toBe(4);
+        expect(ranked.slice(4).every((model) => model.pick === null)).toBe(true);
         expect(ranked.find((model) => model.pick === 'best').fit.fits).toBe(true);
     });
 
@@ -1231,7 +1233,9 @@ describe('Model endpoints', () => {
             const small = await get('/catalogue?size=12');
             expect(small.status).toBe(200);
             expect(small.data.size).toBe(12);
-            expect(small.data.models.length).toBeLessThanOrEqual(12);
+            expect(small.data.models.filter((model) => !model.pick).length).toBeLessThanOrEqual(12);
+            expect(small.data.models.filter((model) => model.pick).length).toBeLessThanOrEqual(4);
+            expect(small.data.paged).toBe(small.data.total - small.data.models.filter((model) => model.pick).length);
             expect((await get('/catalogue')).data.size).toBe(48);
         });
 
