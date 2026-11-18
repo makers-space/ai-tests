@@ -14,8 +14,8 @@ import {
     isPublicAddress, setRemoteTransport, MAX_REMOTE_BYTES, setSearchFetch,
     setToolConnector, ToolSignInError, TOOL_HEALTH, TOOL_CATALOGUE, TOOL_LOCAL_CATALOGUE, CLOUD_PROVIDERS, PROVIDER_HEALTH, setCloudFetch, ollamaOnlineNames, runsOnline, seal, unseal, deviceGateway, DeviceGateway, cloudTitle
 } from '../../server/middleware/ai.middleware.js';
-import { Device, Setting, Download, PersonalModel, Chat, Prompt, Guide, GUIDE_STEPS, MANAGER_GUIDE_STEPS, deviceSchemas, modelSchemas, chatSchemas, promptSchemas, ToolServer, TOOL_HEALTH_STATES, toolSchemas, Provider, PROVIDER_HEALTH_STATES, providerSchemas } from '../../server/models/ai.model.js';
-import { downloads, health, queue, COMPONENT_GUIDE, BASE_GUIDE, CLOSING_GUIDE, SKILLS, SEARCH_GUIDE, PLAN_GUIDE, RESULTS_GUIDE, REVIEW_GUIDE, TOUCH_GUIDE, writtenToolCalls, BUILTIN_TOOLS, waitingPermissions, todayLine, SKILL_SOURCES, MAX_CHAT_SKILLS } from '../../server/controllers/ai.controller.js';
+import { Device, Setting, Download, PersonalModel, Chat, Prompt, Guide, GUIDE_STEPS, MANAGER_GUIDE_STEPS, deviceSchemas, modelSchemas, chatSchemas, promptSchemas, ToolServer, TOOL_HEALTH_STATES, toolSchemas, Provider, PROVIDER_HEALTH_STATES, providerSchemas, Skill } from '../../server/models/ai.model.js';
+import { downloads, health, queue, COMPONENT_GUIDE, BASE_GUIDE, CLOSING_GUIDE, SKILLS, SEARCH_GUIDE, PLAN_GUIDE, RESULTS_GUIDE, REVIEW_GUIDE, TOUCH_GUIDE, writtenToolCalls, BUILTIN_TOOLS, waitingPermissions, todayLine, SKILL_SOURCES, MAX_CHAT_SKILLS, SUGGESTED_SKILLS } from '../../server/controllers/ai.controller.js';
 
 const MB = 1024 * 1024;
 
@@ -3508,6 +3508,98 @@ describe('Chat endpoints', () => {
             expect(chat.skills).toHaveLength(MAX_CHAT_SKILLS);
         });
 
+        test('a person adds a skill by its address, reads it, uses it in a chat and removes it; nobody else can', async () => {
+            const any = { validateStatus: () => true };
+            const asked = [];
+            const file = (text) => ({ status: 200, headers: { 'content-type': 'text/plain' }, stream: Readable.from([Buffer.from(text)]) });
+            const pages = {
+                'https://raw.githubusercontent.com/someone/skills/main/skills/plain-talk/SKILL.md': '---\nname: plain-talk\ndescription: >\n  Answers in short plain sentences,\n  one idea at a time.\n---\n\n# Plain talk\n\nUse short sentences. One idea in each.',
+                'https://raw.githubusercontent.com/someone/skills/main/web/SKILL.md': '<!DOCTYPE html><html><body>Not a skill</body></html>',
+                'https://raw.githubusercontent.com/someone/skills/main/big/SKILL.md': `---\nname: big\ndescription: Too big\n---\n${'x'.repeat(130 * 1024)}`
+            };
+            const transportBefore = setRemoteTransport({
+                lookup: async (host) => [{ address: host === 'intranet.example' ? '10.0.0.5' : '93.184.216.34', family: 4 }],
+                request: async (url) => {
+                    asked.push(url.href);
+                    return pages[url.href] ? file(pages[url.href]) : { status: 404, headers: {}, stream: Readable.from([]) };
+                }
+            });
+            try {
+                await testStartup.loginAsUser('user');
+                const address = 'https://github.com/someone/skills/tree/main/skills/plain-talk';
+                const added = await client.post('/api/v1/skills', { address }, any);
+                expect(added.status).toBe(201);
+                expect(asked).toEqual(['https://raw.githubusercontent.com/someone/skills/main/skills/plain-talk/SKILL.md']);
+                const skill = added.data.skill;
+                expect(skill).toMatchObject({ name: 'Plain talk', description: 'Answers in short plain sentences, one idea at a time.', source: 'mine', credit: address, needs: [] });
+                expect(skill.id).toMatch(/^mine-[0-9a-f]{24}$/);
+                expect(skill.text).toBeUndefined();
+
+                const listed = (await get('/skills')).data;
+                expect(listed.skills.find((one) => one.id === skill.id)).toMatchObject({ name: 'Plain talk', source: 'mine' });
+                expect(listed.sources.find((source) => source.id === 'mine')).toMatchObject({ name: 'My skills', count: 1 });
+                const read = (await get(`/skills/${skill.id}`)).data.skill;
+                expect(read.text).toBe('SKILL: Plain talk\n\n# Plain talk\n\nUse short sentences. One idea in each.');
+
+                // Adding the same address again reads it afresh; it does not make a second copy.
+                pages['https://raw.githubusercontent.com/someone/skills/main/skills/plain-talk/SKILL.md'] += '\nNo filler words.';
+                const again = await client.post('/api/v1/skills', { address }, any);
+                expect(again.status).toBe(200);
+                expect(again.data.skill.id).toBe(skill.id);
+                expect((await get(`/skills/${skill.id}`)).data.skill.text).toMatch(/No filler words\.$/);
+
+                const chat = await newChat({ model: 'qwen2.5-coder:7b', skills: [skill.id] });
+                expect(chat.skills).toEqual([skill.id]);
+                await send(chat.id, { content: 'hello' });
+                expect(state.chatCalls.at(-1).messages[0].content).toContain('SKILL: Plain talk\n\n# Plain talk');
+
+                // What is not a skill file, too large, missing, or not a public secure address is refused.
+                expect((await client.post('/api/v1/skills', { address: 'https://github.com/someone/skills/tree/main/web' }, any)).status).toBe(422);
+                expect((await client.post('/api/v1/skills', { address: 'https://github.com/someone/skills/tree/main/big' }, any)).status).toBe(422);
+                expect((await client.post('/api/v1/skills', { address: 'https://github.com/someone/skills/tree/main/gone' }, any)).status).toBe(404);
+                expect((await client.post('/api/v1/skills', { address: 'https://intranet.example/SKILL.md' }, any)).status).toBe(400);
+                expect((await client.post('/api/v1/skills', { address: 'http://example.com/SKILL.md' }, any)).status).toBe(400);
+                expect((await get('/skills')).data.skills.filter((one) => one.source === 'mine')).toHaveLength(1);
+
+                // It belongs to the person who added it.
+                await testStartup.loginAsUser('creator');
+                expect((await get('/skills')).data.skills.some((one) => one.id === skill.id)).toBe(false);
+                expect((await client.get(`/api/v1/skills/${skill.id}`, any)).status).toBe(404);
+                expect((await client.delete(`/api/v1/skills/${skill.id}`, any)).status).toBe(404);
+                const theirs = await newChat({ model: 'qwen2.5-coder:7b', skills: [skill.id] });
+                expect(theirs.skills).toEqual([]);
+
+                await testStartup.loginAsUser('user');
+                expect((await client.delete(`/api/v1/skills/${skill.id}`, any)).status).toBe(200);
+                expect((await get('/skills')).data.skills.some((one) => one.id === skill.id)).toBe(false);
+                state.chatCalls.length = 0;
+                await send(chat.id, { content: 'hello again' });
+                expect(state.chatCalls.at(-1).messages.some((message) => message.role === 'system' && message.content.includes('Plain talk'))).toBe(false);
+            } finally {
+                setRemoteTransport(transportBefore);
+                await Skill.deleteMany({});
+            }
+        });
+
+        test('what is always sent can be read, and the skills suggested for small models are short and need nothing extra', async () => {
+            const { skills, always } = (await get('/skills')).data;
+            expect(always.map((guide) => guide.id)).toEqual(['base-assistant', 'base-tools', 'base-search-plan', 'base-search-results']);
+            expect((await get('/skills/base-assistant')).data.skill.text).toBe(BASE_GUIDE);
+            expect((await get('/skills/base-search-results')).data.skill.text).toBe(RESULTS_GUIDE);
+            expect(BASE_GUIDE).toMatch(/Match the answer to the question/);
+            expect(BASE_GUIDE).not.toMatch(/complete, satisfying answers/);
+
+            const suggested = skills.filter((skill) => skill.suggested);
+            expect(suggested.map((skill) => skill.id).sort()).toEqual([...SUGGESTED_SKILLS].sort());
+            for (const skill of suggested) {
+                expect(skill.needs).toEqual([]);
+                expect(skill.tokens).toBeLessThan(1600);
+            }
+            const whole = (await get('/skills/engineering-grilling')).data.skill;
+            expect(whole.text.startsWith('SKILL: Grilling')).toBe(true);
+            expect((await client.get('/api/v1/skills/no-such-skill', { validateStatus: () => true })).status).toBe(404);
+        });
+
         test('skills are listed, and a chat sends only the ones it has turned on', async () => {
             expect((await get('/skills')).data.webSearch).toBe(false);
             const listed = (await get('/skills')).data.skills;
@@ -4736,6 +4828,7 @@ describe('Tool servers', () => {
             await options.authProvider?.redirectToAuthorization(new URL(`https://account.example/authorize?state=${await options.authProvider.state?.()}`));
             throw new ToolSignInError('sign in');
         }
+        if (host === 'odd.example') return { listTools: async () => ({ tools: [{ name: 'fine', title: { en: 'Not text' }, description: 42, inputSchema: { type: 'object', big: 'x'.repeat(30000) } }, { title: 'No name' }, null, { name: 'listed', inputSchema: ['not', 'an', 'object'] }] }), close: async () => {} };
         return { listTools: async () => ({ tools: host === 'bare.example' ? [] : TOOLS }), close: async () => {} };
     };
     const finisher = async (address, keeper, params) => {
@@ -4771,6 +4864,20 @@ describe('Tool servers', () => {
         expect(unseal(sealed)).toEqual({ key: 'good-key' });
         expect(unseal(`${sealed.slice(0, -4)}AAAA`)).toBeNull();
         expect(seal({ key: 'good-key' })).not.toBe(sealed);
+    });
+
+    test('an app that lists its tools oddly is still added and checked, with only what can be kept', async () => {
+        await testStartup.loginAsUser('user');
+        const added = await add({ name: 'Odd app', address: 'https://odd.example/mcp' });
+        expect(added.status).toBe(201);
+        expect(added.data.server.health.state).toBe('healthy');
+        expect(added.data.server.tools.map((tool) => tool.name)).toEqual(['fine', 'listed']);
+        const checked = await client.post(`${api}/${added.data.server.id}/check`, {}, any);
+        expect(checked.status).toBe(200);
+        const stored = await ToolServer.findById(added.data.server.id);
+        expect(stored.tools[0].toObject()).toMatchObject({ name: 'fine', title: null, description: '', input: { type: 'object' } });
+        expect(stored.tools[1].input).toBeNull();
+        await client.delete(`${api}/${added.data.server.id}`, any);
     });
 
     test('the list of online apps is served, and every entry is a named https address that can be added as it is', async () => {
