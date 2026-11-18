@@ -15,7 +15,7 @@ import {
     setToolConnector, ToolSignInError, TOOL_HEALTH, TOOL_CATALOGUE, TOOL_LOCAL_CATALOGUE, CLOUD_PROVIDERS, PROVIDER_HEALTH, setCloudFetch, ollamaOnlineNames, runsOnline, seal, unseal, deviceGateway, DeviceGateway, cloudTitle
 } from '../../server/middleware/ai.middleware.js';
 import { Device, Setting, Download, PersonalModel, Chat, Prompt, Guide, GUIDE_STEPS, MANAGER_GUIDE_STEPS, deviceSchemas, modelSchemas, chatSchemas, promptSchemas, ToolServer, TOOL_HEALTH_STATES, toolSchemas, Provider, PROVIDER_HEALTH_STATES, providerSchemas } from '../../server/models/ai.model.js';
-import { downloads, health, queue, COMPONENT_GUIDE, BASE_GUIDE, CLOSING_GUIDE, SKILLS, SEARCH_GUIDE, PLAN_GUIDE, RESULTS_GUIDE, REVIEW_GUIDE, TOUCH_GUIDE, writtenToolCalls, BUILTIN_TOOLS, waitingPermissions } from '../../server/controllers/ai.controller.js';
+import { downloads, health, queue, COMPONENT_GUIDE, BASE_GUIDE, CLOSING_GUIDE, SKILLS, SEARCH_GUIDE, PLAN_GUIDE, RESULTS_GUIDE, REVIEW_GUIDE, TOUCH_GUIDE, writtenToolCalls, BUILTIN_TOOLS, waitingPermissions, todayLine } from '../../server/controllers/ai.controller.js';
 
 const MB = 1024 * 1024;
 
@@ -76,7 +76,7 @@ const simpleOllama = ({ up = true, models = ['small:1b', 'medium:7b'] } = {}) =>
     },
     list: async () => {
         if (!up) throw connectionRefusedError();
-        return { models: models.map((name) => ({ name })) };
+        return { models: models.map((model) => (typeof model === 'string' ? { name: model } : model)) };
     }
 });
 
@@ -263,7 +263,7 @@ describe('Device, settings and setup endpoints', () => {
             expect(device.hardware.memoryMb).toBeGreaterThan(256);
             expect(typeof device.hardware.hasGpu).toBe('boolean');
             expect(device.edited).toBe(false);
-            expect(device.ollama).toEqual({ available: true, version: '9.9.9-test', modelCount: 2 });
+            expect(device.ollama).toEqual({ available: true, version: '9.9.9-test', modelCount: 2, chatCount: 2 });
         });
 
         test('gives manage rights to admin and owner', async () => {
@@ -281,7 +281,18 @@ describe('Device, settings and setup endpoints', () => {
             const response = await client.get('/api/v1/devices');
 
             expect(response.status).toBe(200);
-            expect(response.data.devices[0].ollama).toEqual({ available: false, version: null, modelCount: 0 });
+            expect(response.data.devices[0].ollama).toEqual({ available: false, version: null, modelCount: 0, chatCount: 0 });
+        });
+
+        test('models that only make embeddings are counted, but not as models that can chat', async () => {
+            setOllamaClientFactory(simpleOllama({ models: [{ name: 'bge-large:335m', details: { family: 'bert' } }, { name: 'mxbai-embed-large:335m', details: { family: 'bert' } }] }));
+            await testStartup.loginAsUser('user');
+            const response = await client.get('/api/v1/devices');
+            expect(response.data.devices[0].ollama).toMatchObject({ available: true, modelCount: 2, chatCount: 0 });
+
+            setOllamaClientFactory(simpleOllama({ models: ['mxbai-embed-large:335m', 'nomic-embed-text:latest', 'small:1b'] }));
+            const mixed = await client.get('/api/v1/devices');
+            expect(mixed.data.devices[0].ollama).toMatchObject({ modelCount: 3, chatCount: 1 });
         });
 
         test('is never cached', async () => {
@@ -754,6 +765,7 @@ const fakeOllama = () => ({
         if (lead?.role === 'system' && lead.content.startsWith(COMPONENT_GUIDE)) {
             state.guidesSeen += 1;
             let own = lead.content.slice(COMPONENT_GUIDE.length).replace(/^\n\n/, '');
+            own = own.split('\n\n').filter((part) => part !== todayLine()).join('\n\n');
             if (own.endsWith(CLOSING_GUIDE)) own = own.slice(0, own.length - CLOSING_GUIDE.length).replace(/\n\n$/, '');
             if (own.endsWith(SEARCH_GUIDE)) {
                 state.searchGuides += 1;
@@ -2946,7 +2958,11 @@ describe('Chat endpoints', () => {
             expect(COMPONENT_GUIDE.startsWith(BASE_GUIDE)).toBe(true);
             expect(PLAN_GUIDE).toMatch(/Start with a verb ending in -ing/);
             expect(RESULTS_GUIDE).toMatch(/the source.s own words or your account of it/);
-            expect(RESULTS_GUIDE).toMatch(/Write a full, descriptive answer, never a bare list of links/);
+            expect(RESULTS_GUIDE).toMatch(/never a bare list of links/);
+            expect(RESULTS_GUIDE).toMatch(/match the length to the question/);
+            expect(RESULTS_GUIDE).toMatch(/Do not add a list of sources or links at the end, unless the user asked/);
+            expect(RESULTS_GUIDE).toMatch(/never describe the search or your own reasoning/);
+            expect(PLAN_GUIDE).toMatch(/Never search for today's date, the time, how long until or since a date, a sum or a unit conversion/);
             expect(RESULTS_GUIDE).toMatch(/no more than the content needs/);
             expect(RESULTS_GUIDE).toMatch(/Then describe the work properly in your own words/);
             expect(RESULTS_GUIDE).toMatch(/Never write a quotation, a wording or a figure from memory/);
@@ -3497,6 +3513,21 @@ describe('Chat endpoints', () => {
                 }
             };
 
+            test('a message that needs no search is answered without the web rules, and the planner is told the tools that are on', async () => {
+                await withApp(async () => {
+                    state.plan = { note: 'Answering from what I know', searches: [] };
+                    const chat = await newChat({ model: 'qwen2.5-coder:7b', tools: ['date_time', 'calculator'] });
+                    await send(chat.id, { content: 'How many days until the end of the year?' });
+                    expect(state.searches).toEqual([]);
+                    const asked = state.planCalls[0].messages.at(-1).content;
+                    expect(asked).toMatch(/TOOLS THE ASSISTANT HAS\n- Date and time: [^\n]+\n- Calculator: /);
+                    const reply = state.chatCalls.at(-1);
+                    expect(reply.messages.some((message) => message.role === 'system' && message.content.includes('WEB RESULTS'))).toBe(false);
+                    expect(reply.messages.at(-1).content).toBe('How many days until the end of the year?');
+                    expect(reply.tools.map((tool) => tool.function.name)).toEqual(['date_time', 'calculator']);
+                });
+            });
+
             test('Stop during the planning step ends at once and cancels the plan', async () => {
                 await withApp(async () => {
                     state.planHold = true;
@@ -3523,8 +3554,10 @@ describe('Chat endpoints', () => {
 
                     expect(state.planCalls).toHaveLength(1);
                     expect(state.planCalls[0]).toMatchObject({ stream: true, format: { type: 'object' } });
-                    expect(state.planCalls[0].messages.map((message) => message.role)).toEqual(['system', 'user']);
-                    expect(state.planCalls[0].messages[1].content).toMatch(/fileTypes[\s\S]*THE USER'S MESSAGE\n/);
+                    // The planner is told today's date, and the rules for web results are not in its prompt yet.
+                    expect(state.planCalls[0].messages.at(-1).role).toBe('user');
+                    expect(state.planCalls[0].messages.at(-1).content).toMatch(/fileTypes[\s\S]*TODAY\nToday is [A-Z][a-z]+,? \d{1,2} [A-Z][a-z]+ \d{4} \(UTC\)\.\n\nTHE USER'S MESSAGE\n/);
+                    expect(state.planCalls[0].messages.some((message) => message.role === 'system' && message.content.includes('WEB RESULTS'))).toBe(false);
                     expect(state.searches).toEqual(['duck 3d model']);
                     expect(state.planCalls[0].format.required).toEqual(['note', 'searches']);
                     expect(list.find((event) => event.type === 'note')).toEqual({ type: 'note', text: 'Looking for a duck model file.' });
@@ -3651,8 +3684,8 @@ describe('Chat endpoints', () => {
 
                     expect(state.reviewCalls).toHaveLength(1);
                     expect(state.reviewCalls[0].format.properties.enough).toEqual({ type: 'boolean' });
-                    expect(state.reviewCalls[0].messages[1].content).toMatch(/\n\nTHE USER'S MESSAGE\nfind a duck model and a table\n\nFOUND SO FAR\n\nSEARCH: duck 3d model/);
-                    expect(state.reviewCalls[0].messages[1].content).toContain('SEARCHES ALREADY RUN\n- duck 3d model\n\nWORDS ALREADY SEARCHED\nduck, 3d, model');
+                    expect(state.reviewCalls[0].messages.at(-1).content).toMatch(/\n\nTHE USER'S MESSAGE\nfind a duck model and a table\n\nFOUND SO FAR\n\nSEARCH: duck 3d model/);
+                    expect(state.reviewCalls[0].messages.at(-1).content).toContain('SEARCHES ALREADY RUN\n- duck 3d model\n\nWORDS ALREADY SEARCHED\nduck, 3d, model');
                     expect(state.searches).toEqual(['duck 3d model', 'duck 3d model filetype:pdf', 'mallard glb github']);
                     expect(state.fetches).toContain('https://other.example/4');
                     expect(state.fetches.filter((address) => address === 'https://other.example/1')).toHaveLength(1);
@@ -3694,7 +3727,7 @@ describe('Chat endpoints', () => {
                     const chat = await newChat({ model: 'qwen2.5-coder:7b' });
                     await send(chat.id, { content: 'find the rover' });
                     expect(state.searches.filter((query) => !query.includes('filetype:'))).toEqual(['NASA Curiosity rover 3D model glb', 'Mars Science Laboratory MSL spacecraft mesh']);
-                    expect(state.reviewCalls[1].messages[1].content).toContain('- Mars Science Laboratory MSL spacecraft mesh');
+                    expect(state.reviewCalls[1].messages.at(-1).content).toContain('- Mars Science Laboratory MSL spacecraft mesh');
                 });
             });
 
