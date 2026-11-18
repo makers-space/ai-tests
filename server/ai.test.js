@@ -12,7 +12,7 @@ import {
     fitModel, rankCatalogue, memoryNeededMb, VERDICTS,
     GenerationQueue, extractText, estimateTokens, setFilesFetch, MAX_ATTACHMENT_BYTES,
     isPublicAddress, setRemoteTransport, MAX_REMOTE_BYTES, setSearchFetch,
-    setToolConnector, ToolSignInError, TOOL_HEALTH, TOOL_CATALOGUE, seal, unseal, deviceGateway
+    setToolConnector, ToolSignInError, TOOL_HEALTH, TOOL_CATALOGUE, TOOL_LOCAL_CATALOGUE, seal, unseal, deviceGateway
 } from '../../server/middleware/ai.middleware.js';
 import { Device, Setting, Download, PersonalModel, Chat, Prompt, Guide, GUIDE_STEPS, MANAGER_GUIDE_STEPS, deviceSchemas, modelSchemas, chatSchemas, promptSchemas, ToolServer, TOOL_HEALTH_STATES, toolSchemas } from '../../server/models/ai.model.js';
 import { downloads, health, queue, COMPONENT_GUIDE, BASE_GUIDE, CLOSING_GUIDE, SKILLS, SEARCH_GUIDE, PLAN_GUIDE, RESULTS_GUIDE, REVIEW_GUIDE, TOUCH_GUIDE, writtenToolCalls } from '../../server/controllers/ai.controller.js';
@@ -4620,6 +4620,22 @@ describe('Tool servers', () => {
         }
         signOut();
         expect((await client.get('/api/v1/tools/catalogue', any)).status).toBe(401);
+    });
+
+    test('the suggested local apps are served, each with what starts it and what it needs first', async () => {
+        const response = await client.get('/api/v1/tools/catalogue', any);
+        expect(response.data.localApps).toEqual(TOOL_LOCAL_CATALOGUE);
+        expect(TOOL_LOCAL_CATALOGUE.length).toBeGreaterThanOrEqual(12);
+        expect(new Set(TOOL_LOCAL_CATALOGUE.map((entry) => entry.name)).size).toBe(TOOL_LOCAL_CATALOGUE.length);
+        for (const entry of TOOL_LOCAL_CATALOGUE) {
+            expect(entry.command).toMatch(/^[a-z]+$/);
+            expect(entry.args).not.toMatch(/[;&|`$]/);
+            expect(['maker', 'standard', 'community']).toContain(entry.by);
+            expect(entry.needs.length).toBeGreaterThan(0);
+            expect(entry.does.length).toBeGreaterThan(10);
+            if (entry.by === 'community') expect(entry.caution).toMatch(/community/);
+            if (entry.args.includes('<')) expect(entry.needs.join(' ')).toMatch(/Replace </);
+        }
     });
 
     test('every health state has a label, and every state but healthy says what is needed', () => {
