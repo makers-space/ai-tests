@@ -15,7 +15,7 @@ import {
     setToolConnector, ToolSignInError, TOOL_HEALTH, TOOL_CATALOGUE, TOOL_LOCAL_CATALOGUE, CLOUD_PROVIDERS, PROVIDER_HEALTH, setCloudFetch, ollamaOnlineNames, runsOnline, seal, unseal, deviceGateway
 } from '../../server/middleware/ai.middleware.js';
 import { Device, Setting, Download, PersonalModel, Chat, Prompt, Guide, GUIDE_STEPS, MANAGER_GUIDE_STEPS, deviceSchemas, modelSchemas, chatSchemas, promptSchemas, ToolServer, TOOL_HEALTH_STATES, toolSchemas, Provider, PROVIDER_HEALTH_STATES, providerSchemas } from '../../server/models/ai.model.js';
-import { downloads, health, queue, COMPONENT_GUIDE, BASE_GUIDE, CLOSING_GUIDE, SKILLS, SEARCH_GUIDE, PLAN_GUIDE, RESULTS_GUIDE, REVIEW_GUIDE, TOUCH_GUIDE, writtenToolCalls } from '../../server/controllers/ai.controller.js';
+import { downloads, health, queue, COMPONENT_GUIDE, BASE_GUIDE, CLOSING_GUIDE, SKILLS, SEARCH_GUIDE, PLAN_GUIDE, RESULTS_GUIDE, REVIEW_GUIDE, TOUCH_GUIDE, writtenToolCalls, BUILTIN_TOOLS, waitingPermissions } from '../../server/controllers/ai.controller.js';
 
 const MB = 1024 * 1024;
 
@@ -5169,5 +5169,186 @@ describe('Online model providers', () => {
         expect(await Provider.countDocuments({})).toBe(0);
         signOut();
         expect((await client.get(api, any)).status).toBe(401);
+    });
+});
+
+describe('Tools in chats', () => {
+    const any = { validateStatus: () => true };
+    const post = (path, body, config) => client.post(`/api/v1${path}`, body, { validateStatus: () => true, ...config });
+    const called = [];
+    const signOut = () => {
+        client.clearCookies();
+        client.authenticatedAs = null;
+    };
+    const SERVER_TOOLS = [
+        { name: 'find_page', title: 'Find a page', description: 'Finds a page', annotations: { readOnlyHint: true }, inputSchema: { type: 'object', properties: { words: { type: 'string' } } } },
+        { name: 'write_page', description: 'Writes a page', inputSchema: { type: 'object', properties: { text: { type: 'string' } } } }
+    ];
+    const connector = async () => ({
+        listTools: async () => ({ tools: SERVER_TOOLS }),
+        callTool: async (params) => {
+            called.push(params);
+            if (params.arguments?.words === 'broken') return { isError: true, content: [{ type: 'text', text: 'No page has those words.' }] };
+            return { content: [{ type: 'text', text: params.name === 'find_page' ? 'Found: the launch plan.' : 'Saved.' }] };
+        },
+        close: async () => {}
+    });
+    const newChat = async (body = {}) => (await post('/chats', { model: 'qwen2.5-coder:7b', ...body })).data.chat;
+    const send = async (chatId, content = 'do it') => {
+        const response = await post(`/chats/${chatId}/messages`, { content }, { responseType: 'text', transformResponse: [(data) => data] });
+        return String(response.data).trim().split('\n').map((line) => JSON.parse(line));
+    };
+    const until = async (check) => {
+        for (let attempt = 0; attempt < 100; attempt += 1) {
+            if (await check()) return true;
+            await new Promise((resolve) => setTimeout(resolve, 30));
+        }
+        return false;
+    };
+    const addServer = async () => (await post('/tools/servers', { kind: 'remote', name: 'Notes', address: 'https://notes.example/mcp' })).data.server;
+    const toolTurns = (request) => request.messages.filter((message) => message.role === 'tool');
+
+    beforeAll(() => {
+        setOllamaClientFactory(fakeOllama);
+        setToolConnector(connector);
+    });
+    afterAll(async () => {
+        setToolConnector();
+        await ToolServer.deleteMany({});
+    });
+    beforeEach(async () => {
+        resetState();
+        called.length = 0;
+        await ToolServer.deleteMany({});
+        signOut();
+        await testStartup.loginAsUser('user');
+    });
+
+    test('the built-in tools work on their own: sums are exact, nothing but sums is run, and a bad time zone is said plainly', async () => {
+        const tool = (id) => BUILTIN_TOOLS.find((one) => one.id === id);
+        expect(await tool('calculator').run({ expression: '(12.5 * 4) / 5 ^ 2' })).toBe('2');
+        expect(await tool('calculator').run({ expression: '1,000 + 1' })).toBe('1001');
+        expect(await tool('calculator').run({ expression: 'process.exit()' })).toMatch(/not an arithmetic expression/);
+        expect(await tool('calculator').run({ expression: '1/0' })).toMatch(/not a finite number/);
+        expect(await tool('date_time').run({ timezone: 'Europe/London' })).toMatch(/\d{4}/);
+        expect(await tool('date_time').run({ timezone: 'Nowhere/Place' })).toMatch(/not one I know/);
+        expect(await tool('read_web_page').run({ url: 'http://plain.example' })).toMatch(/https/);
+    });
+
+    test('what a chat can switch on is listed, and the choice is kept with the chat', async () => {
+        const server = await addServer();
+        const listed = (await client.get('/api/v1/skills', any)).data.tools;
+        expect(listed.filter((tool) => tool.kind === 'builtin').map((tool) => tool.id)).toEqual(['date_time', 'calculator', 'read_web_page']);
+        expect(listed.find((tool) => tool.id === server.id)).toMatchObject({ name: 'Notes', kind: 'remote', ready: true, count: 2 });
+
+        const chat = await newChat({ tools: ['calculator', server.id] });
+        expect(chat.tools).toEqual(['calculator', server.id]);
+        const changed = await client.patch(`/api/v1/chats/${chat.id}`, { tools: [] }, any);
+        expect(changed.data.chat.tools).toEqual([]);
+        expect((await post('/chats', { tools: ['Not Valid!'] })).status).toBe(400);
+    });
+
+    test('a switched-on built-in tool is offered, run when called, and its answer reaches the model', async () => {
+        const chat = await newChat({ tools: ['calculator', 'date_time'] });
+        state.toolPlan = [[['calculator', { expression: '6 * 7' }]]];
+        const events = await send(chat.id, 'what is six times seven');
+        expect(state.chatCalls[0].tools.map((tool) => tool.function.name)).toEqual(['date_time', 'calculator']);
+        expect(state.chatCalls[0].messages[0].content).toContain('You have tools for this chat');
+        expect(events.find((event) => event.type === 'tool')).toMatchObject({ tool: 'Calculator', input: '{"expression":"6 * 7"}' });
+        expect(toolTurns(state.chatCalls[1])).toEqual([{ role: 'tool', tool_name: 'calculator', content: '42' }]);
+        const done = events.find((event) => event.type === 'done');
+        expect(done.reply.steps).toEqual([expect.objectContaining({ tool: 'Calculator', failed: null })]);
+    });
+
+    test('no tools are offered when none are switched on, or when the model cannot use them', async () => {
+        const plain = await newChat();
+        await send(plain.id);
+        expect(state.chatCalls[0].tools).toBeUndefined();
+        expect(state.chatCalls[0].messages[0].content).not.toContain('You have tools for this chat');
+
+        resetState();
+        state.noTools = true;
+        const chat = await newChat({ tools: ['calculator'] });
+        await send(chat.id);
+        expect(state.chatCalls[0].tools).toBeUndefined();
+    });
+
+    test('a tool from a tool server is offered under its own name, called on that server, and a failure is passed on plainly', async () => {
+        const server = await addServer();
+        const chat = await newChat({ tools: [server.id] });
+        state.toolPlan = [[['notes_find_page', { words: 'launch' }]], [['notes_find_page', '{"words":"broken"}']]];
+        const events = await send(chat.id, 'find the launch plan');
+        expect(state.chatCalls[0].tools.map((tool) => tool.function.name)).toEqual(['notes_find_page', 'notes_write_page']);
+        expect(called).toEqual([{ name: 'find_page', arguments: { words: 'launch' } }, { name: 'find_page', arguments: { words: 'broken' } }]);
+        expect(events.filter((event) => event.type === 'tool').map((event) => event.tool)).toEqual(['Notes: Find a page', 'Notes: Find a page']);
+        expect(toolTurns(state.chatCalls[1])[0].content).toBe('Found: the launch plan.');
+        expect(toolTurns(state.chatCalls[2])[1].content).toBe('No page has those words.');
+        expect(events.filter((event) => event.type === 'toolFailed').map((event) => event.failed)).toEqual(['failed']);
+        expect(events.some((event) => event.type === 'permission')).toBe(false);
+    });
+
+    test('a tool that changes something waits for the person: allowed once it runs, refused it does not, and always stops the asking', async () => {
+        const server = await addServer();
+        const chat = await newChat({ tools: [server.id] });
+        const turn = async (answer) => {
+            state.toolPlan = [[['notes_write_page', { text: 'hello' }]]];
+            state.chatCalls = [];
+            const pending = send(chat.id, 'save this');
+            let asked = false;
+            if (answer) {
+                asked = await until(() => waitingPermissions().some((waiting) => waiting.chatId === chat.id));
+                if (asked) expect((await post(`/chats/${chat.id}/permission`, { id: waitingPermissions().find((waiting) => waiting.chatId === chat.id).id, answer })).status).toBe(200);
+            }
+            return { events: await pending, asked };
+        };
+
+        const once = await turn('once');
+        expect(once.asked).toBe(true);
+        expect(once.events.find((event) => event.type === 'permission')).toMatchObject({ tool: 'Notes: write_page', input: '{"text":"hello"}' });
+        expect(called).toEqual([{ name: 'write_page', arguments: { text: 'hello' } }]);
+
+        called.length = 0;
+        const refused = await turn('no');
+        expect(called).toEqual([]);
+        expect(toolTurns(state.chatCalls[1])[0].content).toMatch(/did not allow/);
+        expect(refused.events.find((event) => event.type === 'toolFailed')).toMatchObject({ failed: 'refused' });
+
+        await turn('always');
+        expect(called.length).toBe(1);
+        const after = await turn(null);
+        expect(after.events.some((event) => event.type === 'permission')).toBe(false);
+        expect(called.length).toBe(2);
+        expect(waitingPermissions()).toEqual([]);
+    });
+
+    test('only the person whose chat it is can answer, and a question that is not waiting cannot be answered', async () => {
+        const server = await addServer();
+        const chat = await newChat({ tools: [server.id] });
+        state.toolPlan = [[['notes_write_page', { text: 'hello' }]]];
+        const pending = send(chat.id, 'save this');
+        expect(await until(() => waitingPermissions().length > 0)).toBe(true);
+        const { id } = waitingPermissions()[0];
+        expect((await post(`/chats/${chat.id}/permission`, { id: 'abcdef123456', answer: 'once' })).status).toBe(404);
+        expect((await post(`/chats/${chat.id}/permission`, { id, answer: 'maybe' })).status).toBe(400);
+        expect((await post(`/chats/${chat.id}/permission`, { id, answer: 'no' })).status).toBe(200);
+        await pending;
+        expect((await post(`/chats/${chat.id}/permission`, { id, answer: 'once' })).status).toBe(404);
+        expect(called).toEqual([]);
+    });
+
+    test('a tool server that is not ready, or belongs to someone else, gives a chat no tools', async () => {
+        const server = await addServer();
+        await ToolServer.updateOne({ _id: server.id }, { health: 'unreachable' });
+        const chat = await newChat({ tools: [server.id] });
+        await send(chat.id);
+        expect(state.chatCalls[0].tools).toBeUndefined();
+
+        await ToolServer.updateOne({ _id: server.id }, { health: 'healthy' });
+        signOut();
+        await testStartup.loginAsUser('creator');
+        resetState();
+        const theirs = await newChat({ tools: [server.id, 'calculator'] });
+        await send(theirs.id);
+        expect(state.chatCalls[0].tools.map((tool) => tool.function.name)).toEqual(['calculator']);
     });
 });
