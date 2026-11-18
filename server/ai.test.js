@@ -722,6 +722,7 @@ const fakePull = (model) => {
     };
 };
 
+const EVERY_CHAT_TOOLS = ['find_skill', 'date_time', 'calculator', 'read_web_page'];
 const fakeOllama = (host, signal) => ({
     version: async () => {
         if (!state.up) throw refused();
@@ -777,12 +778,13 @@ const fakeOllama = (host, signal) => ({
             own = own.split('\n\n').filter((part) => part !== todayLine()).join('\n\n');
             request = { ...request, messages: own ? [{ role: 'system', content: own }, ...request.messages.slice(1)] : request.messages.slice(1) };
         }
-        // The function that searches the skill library is offered with every chat; like the default skill it is taken
-        // off here, so a test sees only the tools a chat adds. What was really offered is kept in state.toolsSeen.
+        // The search of the skill library and the built-in tools are offered with every chat; like the default skill
+        // they are taken off here, so a test sees only the tools a chat adds. What was really offered is kept in
+        // state.toolsSeen.
         const offered = request.tools || null;
         (state.toolsSeen ||= []).push(offered);
-        if (offered?.some((tool) => tool.function?.name === 'find_skill')) {
-            const rest = offered.filter((tool) => tool.function?.name !== 'find_skill');
+        if (offered?.some((tool) => EVERY_CHAT_TOOLS.includes(tool.function?.name))) {
+            const rest = offered.filter((tool) => !EVERY_CHAT_TOOLS.includes(tool.function?.name));
             request = { ...request, tools: rest.length > 0 ? rest : undefined };
         }
         state.chatCalls.push(request);
@@ -3395,6 +3397,21 @@ describe('Chat endpoints', () => {
             });
         });
 
+        test('with web search on, its page reader stands in for the built-in one, so only one of the two is offered', async () => {
+            await withKey(async () => {
+                state.toolsSeen = [];
+                const chat = await newChat({ model: 'qwen2.5-coder:7b' });
+                await send(chat.id, { content: 'find a duck model' });
+                expect(state.toolsSeen[0].map((tool) => tool.function.name)).toEqual(['web_search', 'web_fetch', 'find_skill', 'date_time', 'calculator']);
+
+                // Switched off for the chat, the search tools go and the built-in reader is back.
+                state.toolsSeen = [];
+                const quiet = await newChat({ model: 'qwen2.5-coder:7b', webSearch: false });
+                await send(quiet.id, { content: 'find a duck model' });
+                expect(state.toolsSeen[0].map((tool) => tool.function.name)).toEqual(['find_skill', 'date_time', 'calculator', 'read_web_page']);
+            });
+        });
+
         test('a model that cannot use tools is not offered them', async () => {
             await withKey(async () => {
                 state.noTools = true;
@@ -3648,10 +3665,11 @@ describe('Chat endpoints', () => {
                 expect(fs.existsSync(new URL(`../../server/instructions/${gone}`, import.meta.url))).toBe(false);
             }
             // A chat with every skill off is sent nothing but the date; with no instructions of its own it has no other system text.
-            const bare = await newChat({ model: 'qwen2.5-coder:7b', skills: [], tools: ['calculator'] });
+            state.toolsSeen = [];
+            const bare = await newChat({ model: 'qwen2.5-coder:7b', skills: [], tools: [] });
             await send(bare.id, { content: 'hello' });
             expect(state.chatCalls.at(-1).messages.map((message) => message.role)).toEqual(['user']);
-            expect(state.chatCalls.at(-1).tools.map((tool) => tool.function.name)).toEqual(['calculator']);
+            expect(state.toolsSeen.at(-1).map((tool) => tool.function.name)).toEqual(['find_skill', 'date_time', 'calculator', 'read_web_page']);
 
             const suggested = skills.filter((skill) => skill.suggested);
             expect(suggested.map((skill) => skill.id).sort()).toEqual([...SUGGESTED_SKILLS].sort());
@@ -5247,9 +5265,9 @@ describe('Online model providers', () => {
         expect(call.body.model).toBe('big-one');
         expect(call.body.stream).toBe(true);
         expect(call.body.messages.at(-1)).toEqual({ role: 'user', content: 'Say hello' });
-        // Besides the conversation, the one function every chat is offered: the search of the skill library.
+        // Besides the conversation, the functions every chat is offered: the search of the skill library and the built-in tools.
         expect(Object.keys(call.body).sort()).toEqual(['messages', 'model', 'stream', 'stream_options', 'tools']);
-        expect(call.body.tools.map((tool) => tool.function.name)).toEqual(['find_skill']);
+        expect(call.body.tools.map((tool) => tool.function.name)).toEqual(['find_skill', 'date_time', 'calculator', 'read_web_page']);
         expect(call.body.options).toBeUndefined();
         expect(call.body.keep_alive).toBeUndefined();
     });
@@ -5395,11 +5413,13 @@ describe('Tools in chats', () => {
         expect((await post('/chats', { tools: ['Not Valid!'] })).status).toBe(400);
     });
 
-    test('a switched-on built-in tool is offered, run when called, and its answer reaches the model', async () => {
-        const chat = await newChat({ tools: ['calculator', 'date_time'] });
+    test('the built-in tools are always offered, run when called, and their answers reach the model', async () => {
+        // Nothing is switched on for this chat: the built-in tools need no switch.
+        const chat = await newChat();
+        state.toolsSeen = [];
         state.toolPlan = [[['calculator', { expression: '6 * 7' }]]];
         const events = await send(chat.id, 'what is six times seven');
-        expect(state.chatCalls[0].tools.map((tool) => tool.function.name)).toEqual(['date_time', 'calculator']);
+        expect(state.toolsSeen[0].map((tool) => tool.function.name)).toEqual(['find_skill', 'date_time', 'calculator', 'read_web_page']);
         expect(JSON.stringify(state.chatCalls[0].messages)).not.toContain('You have tools for this chat');
         expect(events.find((event) => event.type === 'tool')).toMatchObject({ tool: 'Calculator', input: '{"expression":"6 * 7"}' });
         expect(toolTurns(state.chatCalls[1])).toEqual([{ role: 'tool', tool_name: 'calculator', content: '42' }]);
@@ -5407,16 +5427,17 @@ describe('Tools in chats', () => {
         expect(done.reply.steps).toEqual([expect.objectContaining({ tool: 'Calculator', failed: null })]);
     });
 
-    test('no tools are offered when none are switched on, or when the model cannot use them', async () => {
+    test('a chat adds no tools of its own unless a connected one is switched on, and a model that cannot use tools is offered none at all', async () => {
         const plain = await newChat();
         await send(plain.id);
         expect(state.chatCalls[0].tools).toBeUndefined();
 
         resetState();
         state.noTools = true;
+        state.toolsSeen = [];
         const chat = await newChat({ tools: ['calculator'] });
         await send(chat.id);
-        expect(state.chatCalls[0].tools).toBeUndefined();
+        expect(state.toolsSeen).toEqual([null]);
     });
 
     test('a tool from a tool server is offered under its own name, called on that server, and a failure is passed on plainly', async () => {
@@ -5495,6 +5516,6 @@ describe('Tools in chats', () => {
         resetState();
         const theirs = await newChat({ tools: [server.id, 'calculator'] });
         await send(theirs.id);
-        expect(state.chatCalls[0].tools.map((tool) => tool.function.name)).toEqual(['calculator']);
+        expect(state.chatCalls[0].tools).toBeUndefined();
     });
 });
