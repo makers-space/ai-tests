@@ -12,7 +12,7 @@ import {
     fitModel, rankCatalogue, memoryNeededMb, VERDICTS,
     GenerationQueue, extractText, estimateTokens, setFilesFetch, MAX_ATTACHMENT_BYTES,
     isPublicAddress, setRemoteTransport, MAX_REMOTE_BYTES, setSearchFetch,
-    setToolConnector, ToolSignInError, TOOL_HEALTH, TOOL_CATALOGUE, TOOL_LOCAL_CATALOGUE, CLOUD_PROVIDERS, PROVIDER_HEALTH, setCloudFetch, ollamaOnlineNames, runsOnline, seal, unseal, deviceGateway
+    setToolConnector, ToolSignInError, TOOL_HEALTH, TOOL_CATALOGUE, TOOL_LOCAL_CATALOGUE, CLOUD_PROVIDERS, PROVIDER_HEALTH, setCloudFetch, ollamaOnlineNames, runsOnline, seal, unseal, deviceGateway, DeviceGateway, cloudTitle
 } from '../../server/middleware/ai.middleware.js';
 import { Device, Setting, Download, PersonalModel, Chat, Prompt, Guide, GUIDE_STEPS, MANAGER_GUIDE_STEPS, deviceSchemas, modelSchemas, chatSchemas, promptSchemas, ToolServer, TOOL_HEALTH_STATES, toolSchemas, Provider, PROVIDER_HEALTH_STATES, providerSchemas } from '../../server/models/ai.model.js';
 import { downloads, health, queue, COMPONENT_GUIDE, BASE_GUIDE, CLOSING_GUIDE, SKILLS, SEARCH_GUIDE, PLAN_GUIDE, RESULTS_GUIDE, REVIEW_GUIDE, TOUCH_GUIDE, writtenToolCalls, BUILTIN_TOOLS, waitingPermissions } from '../../server/controllers/ai.controller.js';
@@ -2599,6 +2599,10 @@ describe('Chat endpoints', () => {
 
                 sent.length = 0;
                 await post('/models/load', { name: 'qwen2.5-coder:7b' });
+                await wait(60);
+                expect(sent.some((note) => note.type === 'models:changed')).toBe(false);
+                await testStartup.loginAsUser('admin');
+                await post('/models/unload', { name: 'qwen2.5-coder:7b' });
                 await settled(1);
                 expect(sent.some((note) => note.type === 'models:changed')).toBe(true);
             } finally {
@@ -4078,6 +4082,48 @@ describe('Linked devices', () => {
         return { id: response.data.device.id, key: response.data.key };
     };
     const listed = async () => (await client.get('/api/v1/devices')).data.devices;
+    test('a hello that cannot be checked just now asks the app to try again instead of forgetting its link', async () => {
+        const gateway = new DeviceGateway();
+        const closed = [];
+        const answer = async (verify) => {
+            let handler = null;
+            const ws = { once: (event, fn) => { handler = fn; }, close: (code) => closed.push(code), on: () => {}, send: () => {} };
+            gateway.handleConnection(ws, verify);
+            await handler(JSON.stringify({ type: 'hello', deviceId: 'x', key: 'y' }));
+        };
+        await answer(async () => { throw new Error('database did not answer'); });
+        await answer(async () => null);
+        expect(closed).toEqual([1011, 1008]);
+    });
+
+    test('online model names are made readable when the service gives none', () => {
+        expect(cloudTitle('claude-sonnet-4-5-20250929')).toBe('Claude Sonnet 4.5');
+        expect(cloudTitle('models/gemini-2.5-pro')).toBe('Gemini 2.5 Pro');
+        expect(cloudTitle('gpt-oss:120b-cloud')).toBe('GPT OSS 120B');
+        expect(cloudTitle('grok-4-latest')).toBe('Grok 4');
+    });
+
+    test('a computer is shown by a readable name until the person names it', async () => {
+        await testStartup.loginAsUser('admin');
+        const named = async (id) => (await listed()).find((device) => device.id === id).name;
+        const first = await client.post('/api/v1/devices/link', { hostname: 'Davids-MacBook-Pro.local', hardware });
+        expect(first.data.device.name).toBe("David's MacBook Pro");
+        expect(await named(first.data.device.id)).toBe("David's MacBook Pro");
+
+        // The desktop app sends the computer's own name, which takes the place of the network name.
+        const again = await client.post('/api/v1/devices/link', { hostname: 'Davids-MacBook-Pro.local', name: 'Studio Mac', hardware });
+        expect(again.data.device.id).toBe(first.data.device.id);
+        expect(await named(first.data.device.id)).toBe('Studio Mac');
+
+        // A name the person chose is never replaced.
+        await client.put(`/api/v1/devices/${first.data.device.id}`, { name: 'My desk' });
+        await client.post('/api/v1/devices/link', { hostname: 'Davids-MacBook-Pro.local', name: 'Studio Mac', hardware });
+        expect(await named(first.data.device.id)).toBe('My desk');
+
+        const plain = await client.post('/api/v1/devices/link', { hostname: 'zero-pc', hardware });
+        expect(plain.data.device.name).toBe('zero-pc');
+    });
+
     test('a computer that reconnects while still online is not announced as a change', async () => {
         await testStartup.loginAsUser('user');
         const { id, key } = await link('reconnecting-computer');
@@ -4110,6 +4156,7 @@ describe('Linked devices', () => {
         expect(response.data.ollamaAvailable).toBe(true);
         expect(response.data.models.map((model) => model.name)).toEqual(['tiny:1b']);
         expect(response.data.models[0].canChat).toBe(true);
+        expect(response.data.device).toBe(id);
     });
     const until = async (check) => {
         for (let attempt = 0; attempt < 60; attempt += 1) {
@@ -4546,13 +4593,16 @@ describe('Linked devices', () => {
         expect(preflight.headers.get('access-control-allow-headers').toLowerCase()).toContain('x-mollama-device');
     });
 
-    test('a production server leaves its own computer out unless asked to include it', async () => {
+    test('no server counts as a computer unless the setting is exactly true, in development or production', async () => {
         await testStartup.loginAsUser('admin');
         const kinds = async () => (await listed()).map((device) => device.kind);
         const before = { local: process.env.LOCAL_DEVICE, mode: process.env.NODE_ENV };
         try {
+            process.env.NODE_ENV = 'development';
             delete process.env.LOCAL_DEVICE;
-            expect(await kinds()).toContain('local');
+            expect(await kinds()).not.toContain('local');
+            process.env.LOCAL_DEVICE = '';
+            expect(await kinds()).not.toContain('local');
             process.env.NODE_ENV = 'production';
             expect(await kinds()).not.toContain('local');
             process.env.LOCAL_DEVICE = 'true';
@@ -5123,6 +5173,8 @@ describe('Online model providers', () => {
 
         const models = (await client.client.get('/api/v1/models', through(provider.id))).data;
         expect(models.online).toBe(true);
+        expect(models.device).toBe(provider.id);
+        expect(models.models.map((model) => model.displayName)).toEqual(['Big One', 'Small One']);
         expect(models.models.map((model) => model.name)).toEqual(['big-one', 'small-one']);
         expect(models.models[0]).toMatchObject({ ready: true, canChat: true, contextLength: 200000, fit: { verdict: 'cloud', label: 'Online', fits: true } });
         expect(models.models[0].capabilities).toContain('vision');
