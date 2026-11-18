@@ -12,9 +12,9 @@ import {
     fitModel, rankCatalogue, memoryNeededMb, VERDICTS,
     GenerationQueue, extractText, estimateTokens, setFilesFetch, MAX_ATTACHMENT_BYTES,
     isPublicAddress, setRemoteTransport, MAX_REMOTE_BYTES, setSearchFetch,
-    setToolConnector, ToolSignInError, TOOL_HEALTH, TOOL_CATALOGUE, TOOL_LOCAL_CATALOGUE, seal, unseal, deviceGateway
+    setToolConnector, ToolSignInError, TOOL_HEALTH, TOOL_CATALOGUE, TOOL_LOCAL_CATALOGUE, CLOUD_PROVIDERS, PROVIDER_HEALTH, setCloudFetch, seal, unseal, deviceGateway
 } from '../../server/middleware/ai.middleware.js';
-import { Device, Setting, Download, PersonalModel, Chat, Prompt, Guide, GUIDE_STEPS, MANAGER_GUIDE_STEPS, deviceSchemas, modelSchemas, chatSchemas, promptSchemas, ToolServer, TOOL_HEALTH_STATES, toolSchemas } from '../../server/models/ai.model.js';
+import { Device, Setting, Download, PersonalModel, Chat, Prompt, Guide, GUIDE_STEPS, MANAGER_GUIDE_STEPS, deviceSchemas, modelSchemas, chatSchemas, promptSchemas, ToolServer, TOOL_HEALTH_STATES, toolSchemas, Provider, PROVIDER_HEALTH_STATES, providerSchemas } from '../../server/models/ai.model.js';
 import { downloads, health, queue, COMPONENT_GUIDE, BASE_GUIDE, CLOSING_GUIDE, SKILLS, SEARCH_GUIDE, PLAN_GUIDE, RESULTS_GUIDE, REVIEW_GUIDE, TOUCH_GUIDE, writtenToolCalls } from '../../server/controllers/ai.controller.js';
 
 const MB = 1024 * 1024;
@@ -4884,5 +4884,211 @@ describe('Tool servers', () => {
             await testStartup.loginAsUser('creator');
             expect((await addLocal(id)).status).toBe(404);
         });
+    });
+});
+
+describe('Online model providers', () => {
+    const any = { validateStatus: () => true };
+    const api = '/api/v1/providers';
+    const asked = [];
+    const through = (id) => ({ headers: { 'X-Mollama-Device': id }, validateStatus: () => true });
+    const signOut = () => {
+        client.clearCookies();
+        client.authenticatedAs = null;
+    };
+    const json = (body, status = 200) => new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } });
+    const stream = (events) => new Response(new ReadableStream({
+        start(controller) {
+            for (const event of events) controller.enqueue(new TextEncoder().encode(`data: ${typeof event === 'string' ? event : JSON.stringify(event)}\n\n`));
+            controller.close();
+        }
+    }), { status: 200, headers: { 'Content-Type': 'text/event-stream' } });
+
+    // Stands in for every online service: what a key does is read from the key itself.
+    const service = async (address, init = {}) => {
+        const url = new URL(String(address));
+        const key = new Headers(init.headers || {}).get('authorization')?.replace('Bearer ', '') || '';
+        const body = init.body ? JSON.parse(init.body) : null;
+        asked.push({ host: url.host, path: url.pathname, key, body });
+        if (key === 'bad-key-0000') return json({ error: { message: 'invalid key' } }, 401);
+        if (key === 'odd-key-0000') return json({ error: { code: 400, message: 'Please pass a valid API key' } }, 400);
+        if (key === 'poor-key-0000') return json({ error: { message: 'insufficient balance' } }, 402);
+        if (key === 'slow-key-0000') return json({ error: { message: 'slow down' } }, 429);
+        if (url.pathname.endsWith('/api/tags')) return json({ models: [{ name: 'kimi-k3', capabilities: ['completion', 'vision'] }, { name: 'embed-one', capabilities: ['embedding'] }] });
+        if (url.pathname.endsWith('/models')) {
+            return json({ data: key === 'none-key-0000' ? [] : [
+                { id: 'big-one', context_length: 200000, supports_image_in: true },
+                { id: 'models/small-one' },
+                { id: 'text-embedding-3' },
+                { id: 'whisper-9' }
+            ] });
+        }
+        if (url.pathname.endsWith('/chat/completions')) {
+            if (!body.stream) return json({ choices: [{ message: { content: 'A short summary.' } }], usage: { prompt_tokens: 9, completion_tokens: 4 } });
+            return stream([
+                { choices: [{ delta: { reasoning_content: 'Let me think. ' } }] },
+                { choices: [{ delta: { content: 'Hello ' } }] },
+                { choices: [{ delta: { content: [{ type: 'text', text: 'from online.' }] } }] },
+                { choices: [], usage: { prompt_tokens: 21, completion_tokens: 7 } },
+                '[DONE]'
+            ]);
+        }
+        return json({ error: { message: 'no such path' } }, 404);
+    };
+    const add = (kind, key = 'good-key-0000') => client.post(api, { kind, key }, any);
+
+    beforeAll(() => setCloudFetch(service));
+    afterAll(async () => {
+        setCloudFetch();
+        await Provider.deleteMany({});
+    });
+    beforeEach(async () => {
+        asked.length = 0;
+        await Provider.deleteMany({});
+        signOut();
+        await testStartup.loginAsUser('user');
+    });
+
+    test('every suggested service has a secure address, a key page and steps, and every state says what is needed', () => {
+        expect(CLOUD_PROVIDERS.length).toBeGreaterThanOrEqual(10);
+        expect(CLOUD_PROVIDERS[0].id).toBe('ollama');
+        expect(new Set(CLOUD_PROVIDERS.map((entry) => entry.id)).size).toBe(CLOUD_PROVIDERS.length);
+        for (const entry of CLOUD_PROVIDERS) {
+            expect(entry.base).toMatch(/^https:\/\/[^/]+/);
+            expect(entry.base.endsWith('/')).toBe(false);
+            expect(entry.key.page).toMatch(/^https:\/\//);
+            expect(entry.key.steps.length).toBe(3);
+            expect(providerSchemas.add.validate({ kind: entry.id, key: 'good-key-0000' }).error).toBeUndefined();
+        }
+        expect(Object.keys(PROVIDER_HEALTH).sort()).toEqual([...PROVIDER_HEALTH_STATES].sort());
+        for (const [state, entry] of Object.entries(PROVIDER_HEALTH)) expect(entry.needs.length > 0).toBe(state !== 'healthy');
+        for (const code of ['KEY_REFUSED', 'OUT_OF_CREDIT', 'PROVIDER_BUSY', 'PROVIDER_DOWN']) expect(new OllamaError(code).code).toBe(code);
+    });
+
+    test('adding a service with a working key lists its chat models, and the key is sealed and never returned', async () => {
+        const response = await add('openai');
+        expect(response.status).toBe(201);
+        const { provider } = response.data;
+        expect(provider.health.state).toBe('healthy');
+        expect(provider.models).toEqual(['big-one', 'small-one']);
+        expect(asked[0]).toMatchObject({ host: 'api.openai.com', path: '/v1/models', key: 'good-key-0000' });
+        const stored = await Provider.findById(provider.id).select('+sealed');
+        expect(stored.sealed).not.toContain('good-key-0000');
+        expect(unseal(stored.sealed)).toEqual({ key: 'good-key-0000' });
+        const listed = await client.get(api, any);
+        expect(JSON.stringify(listed.data)).not.toContain('good-key-0000');
+        expect(JSON.stringify(response.data)).not.toContain('good-key-0000');
+        expect(listed.data.providers.map((one) => one.name)).toEqual(['OpenAI']);
+        expect(listed.data.suggested.map((one) => one.id)).toEqual(CLOUD_PROVIDERS.map((one) => one.id));
+        expect(listed.data.suggested[0].base).toBeUndefined();
+    });
+
+    test('Ollama online is asked the way Ollama is asked, and models that only make embeddings are left out', async () => {
+        const { provider } = (await add('ollama')).data;
+        expect(provider.health.state).toBe('healthy');
+        expect(provider.models).toEqual(['kimi-k3']);
+        expect(asked.map((one) => `${one.host}${one.path}`)).toEqual(['ollama.com/api/me', 'ollama.com/api/tags']);
+        expect(asked.every((one) => one.key === 'good-key-0000')).toBe(true);
+    });
+
+    test('a service that lists its models to anyone is still asked to prove the key, and one that answers a bad key oddly is understood', async () => {
+        expect((await add('ollama', 'bad-key-0000')).data.provider.health.state).toBe('refused');
+        expect((await add('openrouter', 'bad-key-0000')).data.provider.health.state).toBe('refused');
+        expect(asked.some((one) => one.host === 'openrouter.ai' && one.path === '/api/v1/key')).toBe(true);
+        expect((await add('google', 'odd-key-0000')).data.provider.health.state).toBe('refused');
+    });
+
+    test('a refused key, an empty account, no credit and a busy service are told apart, and a new key puts it right', async () => {
+        const refused = (await add('openai', 'bad-key-0000')).data.provider;
+        const credit = (await add('deepseek', 'poor-key-0000')).data.provider;
+        const busy = (await add('groq', 'slow-key-0000')).data.provider;
+        const empty = (await add('mistral', 'none-key-0000')).data.provider;
+        expect([refused.health.state, credit.health.state, busy.health.state, empty.health.state]).toEqual(['refused', 'credit', 'busy', 'empty']);
+        for (const one of [refused, credit, busy, empty]) expect(one.health.needs.length).toBeGreaterThan(0);
+        const fixed = await client.patch(`${api}/${refused.id}`, { key: 'good-key-0000' }, any);
+        expect(fixed.data.provider.health.state).toBe('healthy');
+        expect((await client.post(`${api}/${credit.id}/check`, {}, any)).data.provider.health.state).toBe('credit');
+    });
+
+    test('an unknown service, a second copy of the same one and a key that is too short are refused', async () => {
+        expect((await add('nowhere')).status).toBe(404);
+        expect((await add('openai')).status).toBe(201);
+        expect((await add('openai')).status).toBe(409);
+        expect((await client.post(api, { kind: 'groq', key: 'x' }, any)).status).toBe(400);
+        expect((await client.post(api, { kind: 'groq' }, any)).status).toBe(400);
+    });
+
+    test('a connected service appears among the computers only when asked for, with its models ready to chat', async () => {
+        const { provider } = (await add('moonshot')).data;
+        const plain = (await client.get('/api/v1/devices', any)).data.devices;
+        expect(plain.some((device) => device.kind === 'cloud')).toBe(false);
+        const withOnline = (await client.get('/api/v1/devices?with=online', any)).data.devices;
+        const entry = withOnline.find((device) => device.id === provider.id);
+        expect(entry).toMatchObject({ kind: 'cloud', name: 'Moonshot (online)', online: true, paused: false, ollama: { available: true, modelCount: 2 } });
+
+        const models = (await client.client.get('/api/v1/models', through(provider.id))).data;
+        expect(models.online).toBe(true);
+        expect(models.models.map((model) => model.name)).toEqual(['big-one', 'small-one']);
+        expect(models.models[0]).toMatchObject({ ready: true, canChat: true, contextLength: 200000, fit: { verdict: 'cloud', label: 'Online', fits: true } });
+        expect(models.models[0].capabilities).toContain('vision');
+    });
+
+    test('a chat on an online model streams the reply, shows its thinking, counts its tokens and sends only the conversation', async () => {
+        const { provider } = (await add('moonshot')).data;
+        const made = await client.post('/api/v1/chats', { model: 'big-one', device: provider.id }, any);
+        expect(made.status).toBe(201);
+        expect(made.data.chat.device).toBe(provider.id);
+        asked.length = 0;
+        const sent = await client.client.post(`/api/v1/chats/${made.data.chat.id}/messages`, { content: 'Say hello' }, { responseType: 'text', validateStatus: () => true });
+        expect(sent.status).toBe(200);
+        const events = String(sent.data).trim().split('\n').map((line) => JSON.parse(line));
+        expect(events.filter((event) => event.type === 'thinking').map((event) => event.text).join('')).toBe('Let me think. ');
+        expect(events.filter((event) => event.type === 'token').map((event) => event.text).join('')).toBe('Hello from online.');
+        const done = events.find((event) => event.type === 'done');
+        expect(done.reply.content).toBe('Hello from online.');
+        expect(done.reply.stats.evalCount).toBe(7);
+        expect(done.reply.stats.promptEvalCount).toBe(21);
+
+        const call = asked.find((one) => one.path.endsWith('/chat/completions'));
+        expect(call).toMatchObject({ host: 'api.moonshot.ai', key: 'good-key-0000' });
+        expect(call.body.model).toBe('big-one');
+        expect(call.body.stream).toBe(true);
+        expect(call.body.messages.at(-1)).toEqual({ role: 'user', content: 'Say hello' });
+        expect(Object.keys(call.body).sort()).toEqual(['messages', 'model', 'stream', 'stream_options']);
+        expect(call.body.options).toBeUndefined();
+        expect(call.body.keep_alive).toBeUndefined();
+    });
+
+    test('a key that stops working mid-use ends the reply with a plain reason', async () => {
+        const { provider } = (await add('openai')).data;
+        const made = await client.post('/api/v1/chats', { model: 'big-one', device: provider.id }, any);
+        await Provider.updateOne({ _id: provider.id }, { sealed: seal({ key: 'bad-key-0000' }) });
+        const sent = await client.client.post(`/api/v1/chats/${made.data.chat.id}/messages`, { content: 'Hello?' }, { responseType: 'text', validateStatus: () => true });
+        const events = String(sent.data).trim().split('\n').map((line) => JSON.parse(line));
+        const failed = events.find((event) => event.type === 'error');
+        expect(failed.code).toBe('KEY_REFUSED');
+        expect(failed.message).toMatch(/did not accept your key/);
+    });
+
+    test('one person cannot see, use, check, change or remove a service another person connected', async () => {
+        const { provider } = (await add('openai')).data;
+        signOut();
+        await testStartup.loginAsUser('creator');
+        expect((await client.get(api, any)).data.providers).toEqual([]);
+        expect((await client.get('/api/v1/devices?with=online', any)).data.devices.some((device) => device.id === provider.id)).toBe(false);
+        expect((await client.post(`${api}/${provider.id}/check`, {}, any)).status).toBe(404);
+        expect((await client.patch(`${api}/${provider.id}`, { key: 'good-key-0000' }, any)).status).toBe(404);
+        expect((await client.delete(`${api}/${provider.id}`, any)).status).toBe(404);
+        const models = (await client.client.get('/api/v1/models', through(provider.id))).data;
+        expect(models.online).toBeUndefined();
+        expect((await Provider.findById(provider.id)).name).toBe('OpenAI');
+    });
+
+    test('removing a service works, and a signed-out visitor is turned away', async () => {
+        const { provider } = (await add('groq')).data;
+        expect((await client.delete(`${api}/${provider.id}`, any)).status).toBe(200);
+        expect(await Provider.countDocuments({})).toBe(0);
+        signOut();
+        expect((await client.get(api, any)).status).toBe(401);
     });
 });
