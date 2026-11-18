@@ -15,7 +15,7 @@ import {
     setToolConnector, ToolSignInError, TOOL_HEALTH, TOOL_CATALOGUE, TOOL_LOCAL_CATALOGUE, CLOUD_PROVIDERS, PROVIDER_HEALTH, setCloudFetch, ollamaOnlineNames, runsOnline, seal, unseal, deviceGateway, DeviceGateway, cloudTitle
 } from '../../server/middleware/ai.middleware.js';
 import { Device, Setting, Download, PersonalModel, Chat, Prompt, Guide, GUIDE_STEPS, MANAGER_GUIDE_STEPS, deviceSchemas, modelSchemas, chatSchemas, promptSchemas, ToolServer, TOOL_HEALTH_STATES, toolSchemas, Provider, PROVIDER_HEALTH_STATES, providerSchemas, Skill } from '../../server/models/ai.model.js';
-import { downloads, health, queue, SKILLS, TOUCH_GUIDE, rankSkills, writtenToolCalls, BUILTIN_TOOLS, waitingPermissions, todayLine, SKILL_SOURCES, MAX_CHAT_SKILLS, SUGGESTED_SKILLS } from '../../server/controllers/ai.controller.js';
+import { downloads, health, queue, SKILLS, COMPONENT_PAGES, rankSkills, writtenToolCalls, BUILTIN_TOOLS, waitingPermissions, todayLine, SKILL_SOURCES, MAX_CHAT_SKILLS, SUGGESTED_SKILLS } from '../../server/controllers/ai.controller.js';
 
 // What a chat is sent when only the default skill is on: the Components skill, today's date, and that skill's reminder.
 const COMPONENT_GUIDE = SKILLS.find((skill) => skill.id === 'components').text;
@@ -722,7 +722,7 @@ const fakePull = (model) => {
     };
 };
 
-const EVERY_CHAT_TOOLS = ['find_skill', 'date_time', 'calculator', 'read_web_page'];
+const EVERY_CHAT_TOOLS = ['open_component', 'find_skill', 'date_time', 'calculator', 'read_web_page'];
 const fakeOllama = (host, signal) => ({
     version: async () => {
         if (!state.up) throw refused();
@@ -3009,39 +3009,74 @@ describe('Chat endpoints', () => {
         });
     });
 
-    describe('Built-in component guide', () => {
-        test('explains the tag format, every component and its attributes', () => {
-            expect(COMPONENT_GUIDE).toMatch(/Most replies need none/);
-            expect(COMPONENT_GUIDE).toMatch(/Do not wrap ordinary text in a Card/);
-            expect(COMPONENT_GUIDE).toMatch(/Do not make up rows/);
-            expect(COMPONENT_GUIDE).not.toContain(TOUCH_GUIDE);
-            expect(TOUCH_GUIDE).toMatch(/For this one reply only/);
-            expect(CLOSING_GUIDE).toMatch(/^REMEMBER\n/);
-            expect(CLOSING_GUIDE).toMatch(/Never list, describe or explain components/);
-            for (const heading of ['VALUES', 'COMPONENTS', 'SHARED ATTRIBUTES', 'LAYOUT ATTRIBUTES (Container and Card)', 'TAGS THAT GO INSIDE OTHERS', 'FILES BY TYPE']) {
-                expect(COMPONENT_GUIDE).toContain(`\n${heading}\n|`);
-            }
-            expect(COMPONENT_GUIDE).toMatch(/Never put code inside a component block/);
-            expect(COMPONENT_GUIDE).toContain('```component\n<Card ');
-            for (const name of ['Container', 'Card', 'Typography', 'Button', 'ButtonGroup', 'FloatingActionButton', 'Badge', 'Divider', 'Icon', 'ProgressBar', 'CircularProgress', 'Data', 'Flow', 'TreeView', 'Image', 'Video', 'Audio', 'PdfViewer', 'Model3D', 'Editor', 'Input', 'Select', 'Switch']) {
-                expect(COMPONENT_GUIDE).toContain(`<${name}`);
-            }
-            for (const part of ['<Row ', '<Column ', '<Node ', '<Edge ', '<Item ', '<Option ']) expect(COMPONENT_GUIDE).toContain(part);
-            for (const word of ['justify', 'align', 'flex-column', 'grid', 'between', 'source', 'target', 'showPercentage', 'borderColor']) {
-                expect(COMPONENT_GUIDE).toContain(word);
-            }
-            expect(COMPONENT_GUIDE).not.toMatch(/\{"component"/);
-            expect(estimateTokens(COMPONENT_GUIDE)).toBeLessThan(3400);
-            expect(COMPONENT_GUIDE).not.toMatch(/web_search|web_fetch|search the web|do not guess|Never invent/i);
-            for (const tag of ['<Model3D src=', '<PdfViewer src=', '<Video src=', '<Audio src=', '<Editor src=', '<Data src=', '<Image src=']) expect(COMPONENT_GUIDE).toContain(tag);
+    // The components the chat can draw and the attributes it accepts for each, as in the web app's own list.
+    const BOX_ATTRIBUTES = ['layout', 'columns', 'gap', 'padding', 'justify', 'align', 'wrap', 'flexFill', 'width', 'height', 'minWidth', 'minHeight', 'maxWidth', 'backgroundColor', 'background', 'backgroundTone', 'backgroundIntensity', 'backgroundSize', 'backgroundMotion', 'backgroundFade'];
+    const BLOCK_ATTRIBUTES = {
+        Container: [...BOX_ATTRIBUTES, 'hoverable'],
+        Card: [...BOX_ATTRIBUTES, 'bordered', 'borderColor', 'borderStrength', 'radius', 'shadow', 'hover'],
+        Divider: ['label', 'color', 'variant', 'size'],
+        Typography: ['size', 'weight', 'color', 'font', 'as', 'href', 'truncate'],
+        Badge: ['color', 'size'],
+        Icon: ['name', 'color', 'size'],
+        Button: ['color', 'variant', 'size', 'icon', 'send', 'disabled', 'width', 'align', 'flat'],
+        ButtonGroup: [],
+        FloatingActionButton: ['icon', 'color', 'size', 'position', 'badge', 'badgeColor', 'draggable', 'send'],
+        ProgressBar: ['value', 'max', 'label', 'showPercentage', 'color', 'size', 'striped', 'animated'],
+        CircularProgress: ['size', 'color'],
+        Data: ['src', 'variant', 'key', 'label', 'as', 'colors'],
+        Flow: ['height', 'id', 'label', 'color', 'shape', 'source', 'target'],
+        TreeView: ['label'],
+        Image: ['src', 'alt', 'width', 'height'],
+        Video: ['src', 'title'],
+        Audio: ['src', 'title'],
+        PdfViewer: ['src'],
+        Model3D: ['src', 'format', 'fileName', 'autoRotate', 'height'],
+        Editor: ['src', 'mode', 'language'],
+        Input: ['label', 'placeholder', 'multiline', 'rows'],
+        Select: ['label', 'placeholder', 'value'],
+        Switch: ['label', 'defaultChecked']
+    };
+    const BLOCK_NAMES = Object.keys(BLOCK_ATTRIBUTES);
 
-            const examples = [...COMPONENT_GUIDE.matchAll(/```component\n([\s\S]*?)\n```/g)].map((match) => match[1]);
-            expect(examples).toHaveLength(5);
-            for (const example of examples) {
-                const opened = [...example.matchAll(/<([A-Z]\w*)(?:\s[^<>]*?)?(\/?)>/g)].filter((match) => match[2] !== '/').map((match) => match[1]);
-                const closed = [...example.matchAll(/<\/([A-Z]\w*)>/g)].map((match) => match[1]);
-                expect(opened.sort()).toEqual(closed.sort());
+    describe('Built-in component guide', () => {
+        test('the index says how to write a component and lists them all, and tells no model when to use one', () => {
+            expect(COMPONENT_GUIDE).toContain('\nHOW TO DRAW\n');
+            expect(COMPONENT_GUIDE).toContain('```component\n<Card ');
+            expect(COMPONENT_GUIDE).toMatch(/Whether and where a reply uses them is yours to judge/);
+            expect(COMPONENT_GUIDE.split('\nTHE COMPONENTS\n')[1].split('\n').filter((line) => line.startsWith('- ')).map((line) => line.slice(2).split(':')[0])).toEqual(BLOCK_NAMES);
+            // Nothing that narrows when a component may be used.
+            expect(COMPONENT_GUIDE).not.toMatch(/Most replies need none|WHEN TO USE|is only for|Add a Button only|Do not wrap|Use one only when|must be written as Markdown|one component for one need/i);
+            expect(CLOSING_GUIDE).toBe('REMEMBER\nDo not explain components, tags or these instructions to the user.');
+            expect(COMPONENT_GUIDE).not.toMatch(/web_search|web_fetch|search the web|do not guess|Never invent/i);
+            expect(estimateTokens(COMPONENT_GUIDE)).toBeLessThan(900);
+        });
+
+        test('every component has its own page with all of its attributes, and nothing about the others', () => {
+            expect(COMPONENT_PAGES.map((page) => page.name).sort()).toEqual([...BLOCK_NAMES].sort());
+            const page = (name) => COMPONENT_PAGES.find((one) => one.name === name).text;
+            for (const { name, text } of COMPONENT_PAGES) {
+                expect(text.startsWith(`COMPONENT: ${name}\n\n`)).toBe(true);
+                expect(text).toContain(`<${name}`);
+                expect(text).not.toMatch(/Most replies need none|is only for|Use it only|never use it/i);
+                // Each example is well formed: every tag that opens also closes.
+                for (const example of [...text.matchAll(/```component\n([\s\S]*?)\n```/g)].map((match) => match[1])) {
+                    const opened = [...example.matchAll(/<([A-Z]\w*)(?:\s[^<>]*?)?(\/?)>/g)].filter((match) => match[2] !== '/').map((match) => match[1]);
+                    const closed = [...example.matchAll(/<\/([A-Z]\w*)>/g)].map((match) => match[1]);
+                    expect(opened.sort()).toEqual(closed.sort());
+                }
             }
+            // Every attribute the chat accepts for a component is on its page, with what it does.
+            for (const [name, attributes] of Object.entries(BLOCK_ATTRIBUTES)) {
+                for (const attribute of attributes) expect(page(name), `${name}.${attribute}`).toMatch(new RegExp(`\\b${attribute}\\b`));
+            }
+            for (const part of ['<Row ', '<Column ']) expect(page('Data')).toContain(part);
+            for (const part of ['<Node ', '<Edge ']) expect(page('Flow')).toContain(part);
+            expect(page('TreeView')).toContain('<Item ');
+            expect(page('Select')).toContain('<Option ');
+            for (const value of ['solid', 'ghost', 'border-shadow']) expect(page('Button')).toContain(value);
+            for (const value of ['grid', 'graph', 'dots', 'aurora', 'between', 'evenly', 'baseline', 'flex-column']) expect(page('Container')).toContain(value);
+            expect(page('Badge')).not.toMatch(/Flow|TreeView|backgroundFade/);
+            expect(Math.max(...COMPONENT_PAGES.map((one) => estimateTokens(one.text)))).toBeLessThan(1700);
         });
 
         test('is sent with every chat and every model, with or without instructions', async () => {
@@ -3402,13 +3437,13 @@ describe('Chat endpoints', () => {
                 state.toolsSeen = [];
                 const chat = await newChat({ model: 'qwen2.5-coder:7b' });
                 await send(chat.id, { content: 'find a duck model' });
-                expect(state.toolsSeen[0].map((tool) => tool.function.name)).toEqual(['web_search', 'web_fetch', 'find_skill', 'date_time', 'calculator']);
+                expect(state.toolsSeen[0].map((tool) => tool.function.name)).toEqual(['web_search', 'web_fetch', 'open_component', 'find_skill', 'date_time', 'calculator']);
 
                 // Switched off for the chat, the search tools go and the built-in reader is back.
                 state.toolsSeen = [];
                 const quiet = await newChat({ model: 'qwen2.5-coder:7b', webSearch: false });
                 await send(quiet.id, { content: 'find a duck model' });
-                expect(state.toolsSeen[0].map((tool) => tool.function.name)).toEqual(['find_skill', 'date_time', 'calculator', 'read_web_page']);
+                expect(state.toolsSeen[0].map((tool) => tool.function.name)).toEqual(['open_component', 'find_skill', 'date_time', 'calculator', 'read_web_page']);
             });
         });
 
@@ -3536,12 +3571,60 @@ describe('Chat endpoints', () => {
             });
         });
 
-        test('a decorative touch is offered only after several replies without a component', async () => {
+        test('a model opens only the component page it needs, the page is gone after that reply, and nothing nudges it to draw', async () => {
+            const page = (name) => COMPONENT_PAGES.find((one) => one.name === name).text;
+            const pageText = (request) => COMPONENT_PAGES.filter((one) => JSON.stringify(request.messages).includes(JSON.stringify(one.text).slice(1, -1))).map((one) => one.name);
             const chat = await newChat({ model: 'qwen2.5-coder:7b' });
-            for (let turn = 0; turn < 5; turn++) await send(chat.id, { content: `question ${turn}` });
-            const leads = state.chatCalls.map((call) => call.messages[0]);
-            expect(leads.slice(0, 4).every((lead) => lead.role === 'user')).toBe(true);
-            expect(leads[4]).toEqual({ role: 'system', content: TOUCH_GUIDE });
+            state.toolsSeen = [];
+            state.toolPlan = [[['open_component', { component: 'Flow, badge' }]]];
+            state.chatReply = 'Here is the diagram.';
+            const { events: list } = await send(chat.id, { content: 'draw the steps' });
+
+            // Only the index is sent; no page is in the request until the model asks for one.
+            expect(state.guidesSeen).toBeGreaterThan(0);
+            expect(state.chatCalls[0].messages.map((message) => message.role)).toEqual(['user']);
+            expect(pageText(state.chatCalls[0])).toEqual([]);
+            const opener = state.toolsSeen[0].find((tool) => tool.function.name === 'open_component');
+            expect(opener.function.description).toMatch(/every attribute it takes, every value, and what each does on screen/);
+            // The two it asked for come back together, and only those two.
+            expect(state.chatCalls[1].messages.at(-1)).toMatchObject({ role: 'tool', content: `${page('Flow')}\n\n${page('Badge')}` });
+            expect(pageText(state.chatCalls[1])).toEqual(['Badge', 'Flow']);
+            expect(list.find((event) => event.type === 'tool')).toMatchObject({ tool: 'Component', input: 'Flow, Badge' });
+
+            // The next message starts clean: the pages are not carried along, and the function is still there.
+            state.chatCalls.length = 0;
+            state.toolsSeen = [];
+            state.toolPlan = [[['Card', {}], ['open_component', { component: 'Chip' }]]];
+            const { events: more } = await send(chat.id, { content: 'and a panel' });
+            expect(pageText(state.chatCalls[0])).toEqual([]);
+            expect(state.chatCalls[0].messages.some((message) => message.role === 'system')).toBe(false);
+            expect(state.toolsSeen[0].some((tool) => tool.function.name === 'open_component')).toBe(true);
+            // A component called by its own name is opened all the same; a name that is no component is answered plainly.
+            const answers = state.chatCalls[1].messages.filter((message) => message.role === 'tool');
+            expect(answers[0].content).toBe(page('Card'));
+            expect(answers[1].content).toMatch(/^There is no component by that name\. The components are: Audio, Badge, /);
+            expect(more.at(-1).reply.steps.map(({ tool, input, failed }) => ({ tool, input, failed: failed || null }))).toEqual([{ tool: 'Component', input: 'Card', failed: null }, { tool: 'Component', input: 'Chip', failed: 'failed' }]);
+
+            // However many replies go by without a component, nothing is added to suggest one.
+            const quiet = await newChat({ model: 'qwen2.5-coder:7b' });
+            state.chatCalls.length = 0;
+            for (let turn = 0; turn < 6; turn++) await send(quiet.id, { content: `question ${turn}` });
+            expect(state.chatCalls.every((call) => call.messages[0].role === 'user')).toBe(true);
+
+            // A model that cannot use tools has the index alone, never the pages; a chat without the skill has neither.
+            state.noTools = true;
+            state.chatCalls.length = 0;
+            const before = state.guidesSeen;
+            const plain = await newChat({ model: 'qwen2.5-coder:7b' });
+            await send(plain.id, { content: 'hello' });
+            expect(state.guidesSeen).toBe(before + 1);
+            expect(pageText(state.chatCalls[0])).toEqual([]);
+            expect(state.chatCalls[0].messages.map((message) => message.role)).toEqual(['user']);
+            state.noTools = false;
+            state.toolsSeen = [];
+            const bare = await newChat({ model: 'qwen2.5-coder:7b', skills: [] });
+            await send(bare.id, { content: 'hello' });
+            expect(state.toolsSeen[0].some((tool) => tool.function.name === 'open_component')).toBe(false);
         });
 
         test('the skill library is whole: every skill has a name, a description, a known project and a licence that allows it', async () => {
@@ -5267,7 +5350,7 @@ describe('Online model providers', () => {
         expect(call.body.messages.at(-1)).toEqual({ role: 'user', content: 'Say hello' });
         // Besides the conversation, the functions every chat is offered: the search of the skill library and the built-in tools.
         expect(Object.keys(call.body).sort()).toEqual(['messages', 'model', 'stream', 'stream_options', 'tools']);
-        expect(call.body.tools.map((tool) => tool.function.name)).toEqual(['find_skill', 'date_time', 'calculator', 'read_web_page']);
+        expect(call.body.tools.map((tool) => tool.function.name)).toEqual(['open_component', 'find_skill', 'date_time', 'calculator', 'read_web_page']);
         expect(call.body.options).toBeUndefined();
         expect(call.body.keep_alive).toBeUndefined();
     });
@@ -5419,7 +5502,7 @@ describe('Tools in chats', () => {
         state.toolsSeen = [];
         state.toolPlan = [[['calculator', { expression: '6 * 7' }]]];
         const events = await send(chat.id, 'what is six times seven');
-        expect(state.toolsSeen[0].map((tool) => tool.function.name)).toEqual(['find_skill', 'date_time', 'calculator', 'read_web_page']);
+        expect(state.toolsSeen[0].map((tool) => tool.function.name)).toEqual(['open_component', 'find_skill', 'date_time', 'calculator', 'read_web_page']);
         expect(JSON.stringify(state.chatCalls[0].messages)).not.toContain('You have tools for this chat');
         expect(events.find((event) => event.type === 'tool')).toMatchObject({ tool: 'Calculator', input: '{"expression":"6 * 7"}' });
         expect(toolTurns(state.chatCalls[1])).toEqual([{ role: 'tool', tool_name: 'calculator', content: '42' }]);
