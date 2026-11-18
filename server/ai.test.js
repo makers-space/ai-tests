@@ -2759,6 +2759,35 @@ describe('Chat endpoints', () => {
             expect(asked[0].aborted).toBe(true);
         });
 
+        test('Stop does not wait for a tool that is still running', async () => {
+            process.env.TAVILY_API_KEY = 'tvly-test';
+            {
+                // A search that never comes back: only Stop can end this reply.
+                const usual = setSearchFetch(() => new Promise(() => {}));
+                try {
+                    state.toolPlan = [[['web_search', { query: 'duck 3d model' }]]];
+                    const chat = await newChat({ model: 'qwen2.5-coder:7b' });
+                    const stream = await openStream(chat.id, { content: 'find a duck model' });
+                    await stream.until((event) => event.type === 'tool');
+                    const asked = Date.now();
+                    expect((await post(`/chats/${chat.id}/stop`, {})).data).toMatchObject({ stopped: true });
+                    await stream.finished;
+                    expect(Date.now() - asked).toBeLessThan(2000);
+                    expect(stream.seen.at(-1).type).toBe('done');
+                    // The model is not asked again once the reply was stopped.
+                    expect(state.chatCalls).toHaveLength(1);
+                    for (let attempt = 0; attempt < 100; attempt++) {
+                        if ((await get('/activity')).data.replies.length === 0) break;
+                        await wait(15);
+                    }
+                    expect((await get('/activity')).data.replies).toEqual([]);
+                } finally {
+                    setSearchFetch(usual);
+                    process.env.TAVILY_API_KEY = '';
+                }
+            }
+        });
+
         test('Stop ends generation and keeps what was written', async () => {
             const chat = await newChat({ model: 'qwen2.5-coder:7b' });
             state.chatReply = 'One two three four';
@@ -3945,6 +3974,55 @@ describe('Chat endpoints', () => {
             client.authenticatedAs = null;
             expect((await fileOf(hairline.id, 'bench.html')).status).toBe(401);
             await testStartup.loginAsUser('user');
+        });
+
+        test('what a skill does with a command, Mollama does itself: the Hairline build shows the figure in the chat', async () => {
+            const onDisk = (name) => fs.readFileSync(new URL(`../../server/instructions/library/hairline/hairline-hairline-create/${name}`, import.meta.url), 'utf8').replace(/\r\n/g, '\n');
+            const terrain = onDisk('examples/terrain.js').trim();
+            const chat = await newChat({ model: 'qwen2.5-coder:7b', skills: ['components', 'hairline-hairline-create'] });
+            state.chatCalls.length = 0;
+            state.toolPlan = [
+                [['open_skill_file', { skill: 'hairline-hairline-create', file: 'kernel.js', until: 'var HL' }]],
+                [['hairline_build', { code: terrain }]],
+                [['hairline_build', { code: 'const x = 1;' }]]
+            ];
+            state.chatReply = 'Here is the terrain.';
+            const { events: list } = await send(chat.id, { content: 'draw the terrain' });
+
+            // The function stands in for the skill's own build command, and says so.
+            const builder = state.chatCalls[0].tools.find((tool) => tool.function.name === 'hairline_build');
+            expect(builder.function.description).toMatch(/^Does what `node build\.mjs <name>\.js` does in the Hairline skill, without Node/);
+            expect(Object.keys(builder.function.parameters.properties)).toEqual(['code']);
+
+            // A file can be read only as far as the instructions ask: here the engine's index, not the code under it.
+            const head = state.chatCalls[1].messages.at(-1).content;
+            expect(head).toMatch(/^\/\* hairline kernel sha256:/);
+            expect(head).toContain('Cam(azDeg, k, S)');
+            expect(head).not.toContain('var HL');
+            expect(head.length).toBeLessThan(onDisk('kernel.js').length / 2);
+
+            // The figure is put on the skill's own page and shown in the reply; a file that is not a figure builds nothing.
+            expect(state.chatCalls[2].messages.at(-1)).toMatchObject({ role: 'tool', content: 'Built hairline-terrain.html and showed it to the user in the chat. You cannot see the page from here.' });
+            expect(state.chatCalls[3].messages.at(-1).content).toMatch(/^Nothing was built\. A figure file ends with hairline\(/);
+            const reply = list.at(-1).reply;
+            expect(reply.content).toContain(['```component', '<Frame template="hairline-hairline-create/bench.html" height="640px" title="Hairline terrain">', '<Part name="KERNEL" file="hairline-hairline-create/kernel.js" />', '<Part name="FIGURE">', terrain, '</Part>', '</Frame>', '```'].join('\n'));
+            expect(reply.content.match(/<Frame /g)).toHaveLength(1);
+            expect(reply.content.trim().endsWith('Here is the terrain.')).toBe(true);
+            expect(reply.steps.map(({ tool, input, failed }) => ({ tool, input, failed: failed || null }))).toEqual([
+                { tool: 'Skill file', input: 'kernel.js (Hairline Create)', failed: null },
+                { tool: 'Hairline build', input: 'Hairline Create', failed: null },
+                { tool: 'Hairline build', input: 'Hairline Create', failed: 'failed' }
+            ]);
+
+            // What the reply read through its tools is not counted as part of the chat afterwards.
+            const after = (await get(`/chats/${chat.id}`)).data.chat.context;
+            expect(after.usedTokens).toBeLessThan(estimateTokens(onDisk('kernel.js')));
+
+            // A chat without the skill has no such function.
+            state.chatCalls.length = 0;
+            const plain = await newChat({ model: 'qwen2.5-coder:7b' });
+            await send(plain.id, { content: 'hello' });
+            expect(state.chatCalls[0].tools).toBeUndefined();
         });
 
         test('stops offering tools after six rounds so a reply always ends', async () => {
@@ -5412,6 +5490,10 @@ describe('Online model providers', () => {
         expect(call.body.tools.map((tool) => tool.function.name)).toEqual(['open_component', 'find_skill', 'date_time', 'calculator', 'read_web_page']);
         expect(call.body.options).toBeUndefined();
         expect(call.body.keep_alive).toBeUndefined();
+
+        // An online model is measured against what its own service says it reads, not the limit kept for a computer's memory.
+        expect(done.context.capacityTokens).toBeGreaterThan(32768);
+        expect(done.context.percent).toBeLessThan(5);
     });
 
     test('Claude is reached through its own library: a dated request, its own request shape, and its thinking shown', async () => {
