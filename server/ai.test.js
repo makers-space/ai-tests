@@ -3078,7 +3078,18 @@ describe('Chat endpoints', () => {
             expect(COMPONENT_GUIDE).not.toMatch(/Most replies need none|WHEN TO USE|is only for|Add a Button only|Do not wrap|Use one only when|must be written as Markdown|one component for one need/i);
             expect(CLOSING_GUIDE).toBe('REMEMBER\nDo not explain components, tags or these instructions to the user.');
             expect(COMPONENT_GUIDE).not.toMatch(/web_search|web_fetch|search the web|do not guess|Never invent/i);
-            expect(estimateTokens(COMPONENT_GUIDE)).toBeLessThan(900);
+            // The index names every attribute a component takes, so a model that has not read a page still cannot invent one.
+            const lineOf = (name) => COMPONENT_GUIDE.split('\n').find((line) => line.startsWith(`- ${name}: `));
+            expect(lineOf('FloatingActionButton')).toContain('Attributes: icon*, send, position, ');
+            expect(lineOf('ProgressBar')).toContain('Attributes: value*, max, label, showPercentage, ');
+            expect(lineOf('Flow')).toContain('Node tags (id*, label, ');
+            expect(lineOf('Flow')).toContain('Edge tags (source*, target*, ');
+            expect(lineOf('Flow')).toContain('Group tags');
+            expect(lineOf('Divider').endsWith('Holds nothing: write it as one tag ending in />.')).toBe(true);
+            expect(COMPONENT_GUIDE).toContain('These are all the components there are.');
+            expect(COMPONENT_GUIDE).toContain('`<Grid>`, `<Description>`');
+            for (const attribute of BOX_ATTRIBUTES) expect(COMPONENT_GUIDE, attribute).toContain(attribute);
+            expect(estimateTokens(COMPONENT_GUIDE)).toBeLessThan(1600);
         });
 
         test('every component has its own page with all of its attributes, and nothing about the others', () => {
