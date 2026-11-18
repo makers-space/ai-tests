@@ -3372,11 +3372,17 @@ describe('Chat endpoints', () => {
                 expect(request.messages.map((message) => message.role)).toEqual(['user']);
                 expect(request.options.num_ctx).toBe(16384);
 
-                // The guidance for searching is a skill the chat may turn on.
+                // The guidance for searching is a skill the chat may turn on. A model that can use tools is handed its name
+                // and description, not its text, and a call to web_search is never mistaken for opening it.
                 state.chatCalls.length = 0;
+                state.toolPlan = [[search]];
                 const guided = await newChat({ model: 'qwen2.5-coder:7b', skills: ['search-web-search'] });
-                await send(guided.id, { content: 'find a duck model' });
-                expect(state.chatCalls[0].messages[0].content).toMatch(/^SKILL: Web Search\n\nYou can search the web with web_search/);
+                const { events: steps } = await send(guided.id, { content: 'find a duck model' });
+                expect(state.chatCalls[0].messages.map((message) => message.role)).toEqual(['user']);
+                const opener = state.chatCalls[0].tools.find((tool) => tool.function.name === 'open_skill');
+                expect(opener.function.description).toMatch(/\n- Web Search: When to search the web/);
+                expect(opener.function.parameters.properties.skill.enum).toEqual(['Web Search']);
+                expect(steps.filter((event) => event.type === 'tool').map((event) => event.tool)).toEqual(['web_search']);
                 expect((await get('/models')).data.webSearch).toBe(true);
             });
         });
@@ -3532,11 +3538,11 @@ describe('Chat endpoints', () => {
             expect(sources.reduce((sum, source) => sum + source.count, 0)).toBe(skills.length);
             expect(skills.every((skill) => skill.tokens > 0)).toBe(true);
 
-            // A skill written for an agent with a shell tells the model what it cannot do here; a plain one does not.
-            const agent = SKILLS.find((skill) => skill.needs.includes('commands'));
-            const plain = SKILLS.find((skill) => skill.source !== 'mollama' && skill.needs.length === 0);
-            expect(agent.text).toMatch(/Never pretend to have run a command or read a file/);
-            expect(plain.text).not.toMatch(/Never pretend to have run a command/);
+            // Nothing of Mollama's own is put in front of a library skill: its text is its name and the author's page.
+            for (const skill of SKILLS.filter((one) => one.source !== 'mollama')) {
+                expect(skill.text.startsWith(`SKILL: ${skill.name}\n\n`)).toBe(true);
+                expect(skill.text).not.toMatch(/written for an agent that can run commands|Never pretend to have run a command/);
+            }
 
             // A chat holds only a few skills at once.
             expect(maxSkills).toBe(MAX_CHAT_SKILLS);
@@ -3588,6 +3594,11 @@ describe('Chat endpoints', () => {
                 const chat = await newChat({ model: 'qwen2.5-coder:7b', skills: [skill.id] });
                 expect(chat.skills).toEqual([skill.id]);
                 await send(chat.id, { content: 'hello' });
+                expect(state.chatCalls.at(-1).tools.find((tool) => tool.function.name === 'open_skill').function.description).toContain('- Plain talk: Answers in short plain sentences, one idea at a time.');
+                state.noTools = true;
+                const plainChat = await newChat({ model: 'qwen2.5-coder:7b', skills: [skill.id] });
+                await send(plainChat.id, { content: 'hello' });
+                state.noTools = false;
                 expect(state.chatCalls.at(-1).messages[0].content).toContain('SKILL: Plain talk\n\n# Plain talk');
 
                 // What is not a skill file, too large, missing, or not a public secure address is refused.
@@ -3654,9 +3665,13 @@ describe('Chat endpoints', () => {
             expect(listed.find((skill) => skill.id === 'marketing-copywriting')).toMatchObject({ name: 'Copywriting', source: 'marketing', credit: 'coreyhaines31/marketingskills (MIT)', default: false });
             expect(listed[0].text).toBeUndefined();
 
+            // A model that cannot use tools is sent each skill in full.
+            state.noTools = true;
             const chat = await newChat({ model: 'qwen2.5-coder:7b', skills: ['marketing-copywriting', 'not-a-skill'] });
             expect(chat.skills).toEqual(['marketing-copywriting']);
             await send(chat.id, { content: 'hello' });
+            state.noTools = false;
+            expect(state.chatCalls[0].tools).toBeUndefined();
             const system = state.chatCalls[0].messages[0].content;
             expect(system).toContain(SKILLS.find((skill) => skill.id === 'marketing-copywriting').text);
             expect(system).toContain('SKILL: Copywriting');
@@ -3667,6 +3682,53 @@ describe('Chat endpoints', () => {
             const back = (await client.patch(`/api/v1/chats/${chat.id}`, { skills: null })).data.chat;
             expect(back.skills).toEqual(['components']);
             expect((await client.patch(`/api/v1/chats/${chat.id}`, { skills: ['Bad Id'] })).status).toBe(400);
+        });
+
+        test('a model that can use tools is handed each skill by name, opens one when it fits, and keeps what it opened', async () => {
+            const copy = SKILLS.find((skill) => skill.id === 'marketing-copywriting');
+            const grill = SKILLS.find((skill) => skill.id === 'engineering-grilling');
+            const chat = await newChat({ model: 'qwen2.5-coder:7b', skills: ['components', 'marketing-copywriting', 'engineering-grilling'] });
+            state.toolPlan = [[['open_skill', { skill: 'copywriting' }]]];
+            state.chatReply = 'Here is the headline.';
+            const { events: list } = await send(chat.id, { content: 'write a headline' });
+
+            // Mollama's own skill is sent in full; the others only by name and description, inside one function.
+            const first = state.chatCalls[0];
+            expect(state.guidesSeen).toBeGreaterThan(0);
+            expect(first.messages.map((message) => message.role)).toEqual(['user']);
+            const opener = (request) => request.tools.find((tool) => tool.function.name === 'open_skill');
+            expect(opener(first).function.description).toContain(`- Copywriting: ${copy.description}`);
+            expect(opener(first).function.description).toContain(`- Grilling: ${grill.description}`);
+            expect([...opener(first).function.parameters.properties.skill.enum].sort()).toEqual(['Copywriting', 'Grilling']);
+            // Room is kept for the largest skill that may be opened.
+            expect(first.options.num_ctx).toBeGreaterThanOrEqual(8192);
+
+            // The skill's own page comes back as the answer, and the chat shows the step.
+            expect(state.chatCalls[1].messages.at(-1)).toMatchObject({ role: 'tool', content: copy.text });
+            expect(list.find((event) => event.type === 'tool')).toMatchObject({ tool: 'Skill', input: 'Copywriting' });
+            expect(list.at(-1).reply.steps.map(({ tool, input, failed }) => ({ tool, input, failed: failed || null }))).toEqual([{ tool: 'Skill', input: 'Copywriting', failed: null }]);
+            expect(list.at(-1).reply.content).toBe('Here is the headline.');
+
+            // From then on that skill is sent in full and is no longer on the list.
+            state.chatCalls.length = 0;
+            await send(chat.id, { content: 'another one' });
+            expect(state.chatCalls[0].messages[0].content).toContain(copy.text);
+            expect(opener(state.chatCalls[0]).function.parameters.properties.skill.enum).toEqual(['Grilling']);
+
+            // A skill called by its own name is opened all the same; a name that is no skill is answered plainly.
+            state.chatCalls.length = 0;
+            state.toolPlan = [[['Grilling', {}], ['open_skill', { skill: 'nothing here' }]]];
+            const { events: more } = await send(chat.id, { content: 'grill me' });
+            const answers = state.chatCalls[1].messages.filter((message) => message.role === 'tool');
+            expect(answers[0].content).toBe(grill.text);
+            expect(answers[1].content).toMatch(/^There is no skill by that name in this chat\. The skills are: Grilling\.$/);
+            expect(more.at(-1).reply.steps.map(({ tool, input, failed }) => ({ tool, input, failed: failed || null }))).toEqual([{ tool: 'Skill', input: 'Grilling', failed: null }, { tool: 'Skill', input: 'nothing here', failed: 'failed' }]);
+
+            // With every skill opened there is nothing left to list, so the function is gone.
+            state.chatCalls.length = 0;
+            await send(chat.id, { content: 'thanks' });
+            expect(state.chatCalls[0].tools).toBeUndefined();
+            expect(state.chatCalls[0].messages[0].content).toContain(grill.text);
         });
 
         test('stops offering tools after six rounds so a reply always ends', async () => {
