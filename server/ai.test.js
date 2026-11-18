@@ -15,7 +15,7 @@ import {
     setToolConnector, ToolSignInError, TOOL_HEALTH, TOOL_CATALOGUE, TOOL_LOCAL_CATALOGUE, CLOUD_PROVIDERS, PROVIDER_HEALTH, setCloudFetch, ollamaOnlineNames, runsOnline, seal, unseal, deviceGateway, DeviceGateway, cloudTitle
 } from '../../server/middleware/ai.middleware.js';
 import { Device, Setting, Download, PersonalModel, Chat, Prompt, Guide, GUIDE_STEPS, MANAGER_GUIDE_STEPS, deviceSchemas, modelSchemas, chatSchemas, promptSchemas, ToolServer, TOOL_HEALTH_STATES, toolSchemas, Provider, PROVIDER_HEALTH_STATES, providerSchemas, Skill } from '../../server/models/ai.model.js';
-import { downloads, health, queue, SKILLS, TOUCH_GUIDE, writtenToolCalls, BUILTIN_TOOLS, waitingPermissions, todayLine, SKILL_SOURCES, MAX_CHAT_SKILLS, SUGGESTED_SKILLS } from '../../server/controllers/ai.controller.js';
+import { downloads, health, queue, SKILLS, TOUCH_GUIDE, rankSkills, writtenToolCalls, BUILTIN_TOOLS, waitingPermissions, todayLine, SKILL_SOURCES, MAX_CHAT_SKILLS, SUGGESTED_SKILLS } from '../../server/controllers/ai.controller.js';
 
 // What a chat is sent when only the default skill is on: the Components skill, today's date, and that skill's reminder.
 const COMPONENT_GUIDE = SKILLS.find((skill) => skill.id === 'components').text;
@@ -777,6 +777,14 @@ const fakeOllama = (host, signal) => ({
             own = own.split('\n\n').filter((part) => part !== todayLine()).join('\n\n');
             request = { ...request, messages: own ? [{ role: 'system', content: own }, ...request.messages.slice(1)] : request.messages.slice(1) };
         }
+        // The function that searches the skill library is offered with every chat; like the default skill it is taken
+        // off here, so a test sees only the tools a chat adds. What was really offered is kept in state.toolsSeen.
+        const offered = request.tools || null;
+        (state.toolsSeen ||= []).push(offered);
+        if (offered?.some((tool) => tool.function?.name === 'find_skill')) {
+            const rest = offered.filter((tool) => tool.function?.name !== 'find_skill');
+            request = { ...request, tools: rest.length > 0 ? rest : undefined };
+        }
         state.chatCalls.push(request);
         // A model still loading: Ollama has not answered, so only the request's own signal can end it.
         while (state.loadHold && !signal?.aborted) await new Promise((resolve) => setTimeout(resolve, 10));
@@ -812,7 +820,7 @@ const fakeOllama = (host, signal) => ({
             return answer(typeof state.plan === 'string' ? state.plan : JSON.stringify(state.plan));
         }
         if (request.stream === false) return { message: { role: 'assistant', content: state.chatReply }, done: true };
-        if (request.tools && state.toolPlan.length > 0) {
+        if (offered && state.toolPlan.length > 0) {
             const calls = state.toolPlan.shift().map(([name, args]) => ({ function: { name, arguments: args } }));
             if (state.toolsAsText) {
                 const text = calls.map((call) => JSON.stringify({ name: call.function.name, arguments: call.function.arguments })).join('\n');
@@ -3731,6 +3739,54 @@ describe('Chat endpoints', () => {
             expect(state.chatCalls[0].messages[0].content).toContain(grill.text);
         });
 
+        test('a model can look in the skill library for a skill that is not on, and is told it cannot turn one on', async () => {
+            const chat = await newChat({ model: 'qwen2.5-coder:7b' });
+            state.toolsSeen = [];
+            state.toolPlan = [[['find_skill', { query: 'cold email' }], ['find_skill', { query: 'zzzz' }]]];
+            state.chatReply = 'Turn on Cold Email under Skills.';
+            const { events: list } = await send(chat.id, { content: 'write a cold email' });
+
+            const finder = state.toolsSeen[0].find((tool) => tool.function.name === 'find_skill');
+            expect(finder.function.description).toContain(`Search the library of ${SKILLS.length - 1} skills`);
+            expect(finder.function.description).toMatch(/You cannot turn a skill on yourself: when one would help, tell the user its name/);
+            const answers = state.chatCalls[1].messages.filter((message) => message.role === 'tool');
+            const cold = SKILLS.find((skill) => skill.id === 'marketing-cold-email');
+            expect(answers[0].content.split('\n')[0]).toMatch(/^These skills are not turned on in this chat\. Tell the user by name which one would help/);
+            expect(answers[0].content.split('\n')[1]).toBe(`- Cold Email (Marketing (Corey Haines)): ${cold.description}`);
+            expect(answers[0].content.split('\n').length).toBeLessThanOrEqual(6);
+            expect(answers[0].content).not.toContain(cold.text.slice(40, 200));
+            expect(answers[1].content).toBe('No skill in the library matches. Answer without one.');
+            expect(list.at(-1).reply.steps.map(({ tool, input }) => ({ tool, input }))).toEqual([{ tool: 'Skill library', input: 'cold email' }, { tool: 'Skill library', input: 'zzzz' }]);
+            // Looking is all it does: the chat's skills are unchanged.
+            expect((await get(`/chats/${chat.id}`)).data.chat.skills).toEqual(['components']);
+
+            // A skill that is already on is not offered again by the search.
+            state.toolsSeen = [];
+            state.chatCalls.length = 0;
+            state.toolPlan = [[['find_skill', { query: 'cold email' }]]];
+            const has = await newChat({ model: 'qwen2.5-coder:7b', skills: ['components', 'marketing-cold-email'] });
+            await send(has.id, { content: 'write a cold email' });
+            expect(state.chatCalls[1].messages.find((message) => message.role === 'tool').content).not.toContain('- Cold Email (');
+
+            // Whole words are matched, the name counts most, and filler words are ignored.
+            const names = (query) => rankSkills(SKILLS, query).map((skill) => skill.name);
+            expect(names('cold email for bakery owner delivery app')[0]).toBe('Cold Email');
+            expect(names('app launch planning')[0]).toMatch(/Launch/);
+            expect(names('app launch planning')).not.toContain('Webapp Testing');
+            expect(names('app launch planning')).not.toContain('Apple Mail Setup');
+            expect(names('grill me on my plans')[0]).toBe('Grilling');
+            expect(names('help with the new')).toEqual([]);
+            expect(names('')).toEqual([]);
+
+            // A model that cannot use tools is offered nothing.
+            state.toolsSeen = [];
+            state.noTools = true;
+            const plain = await newChat({ model: 'qwen2.5-coder:7b' });
+            await send(plain.id, { content: 'hello' });
+            state.noTools = false;
+            expect(state.toolsSeen).toEqual([null]);
+        });
+
         test('stops offering tools after six rounds so a reply always ends', async () => {
             await withKey(async () => {
                 state.toolPlan = Array.from({ length: 10 }, () => [search]);
@@ -5191,7 +5247,9 @@ describe('Online model providers', () => {
         expect(call.body.model).toBe('big-one');
         expect(call.body.stream).toBe(true);
         expect(call.body.messages.at(-1)).toEqual({ role: 'user', content: 'Say hello' });
-        expect(Object.keys(call.body).sort()).toEqual(['messages', 'model', 'stream', 'stream_options']);
+        // Besides the conversation, the one function every chat is offered: the search of the skill library.
+        expect(Object.keys(call.body).sort()).toEqual(['messages', 'model', 'stream', 'stream_options', 'tools']);
+        expect(call.body.tools.map((tool) => tool.function.name)).toEqual(['find_skill']);
         expect(call.body.options).toBeUndefined();
         expect(call.body.keep_alive).toBeUndefined();
     });
