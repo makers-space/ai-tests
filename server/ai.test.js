@@ -4626,20 +4626,22 @@ describe('Linked devices', () => {
         expect(preflight.headers.get('access-control-allow-headers').toLowerCase()).toContain('x-mollama-device');
     });
 
-    test('no server counts as a computer unless the setting is exactly true, in development or production', async () => {
+    test('no running server counts as a computer, in development, staging or production, whatever its settings say', async () => {
         await testStartup.loginAsUser('admin');
         const kinds = async () => (await listed()).map((device) => device.kind);
         const before = { local: process.env.LOCAL_DEVICE, mode: process.env.NODE_ENV };
         try {
-            process.env.NODE_ENV = 'development';
-            delete process.env.LOCAL_DEVICE;
-            expect(await kinds()).not.toContain('local');
-            process.env.LOCAL_DEVICE = '';
-            expect(await kinds()).not.toContain('local');
-            process.env.NODE_ENV = 'production';
-            expect(await kinds()).not.toContain('local');
-            process.env.LOCAL_DEVICE = 'true';
             expect(await kinds()).toContain('local');
+            for (const mode of ['development', 'staging', 'production']) {
+                process.env.NODE_ENV = mode;
+                for (const setting of [undefined, '', 'false', 'true']) {
+                    if (setting === undefined) delete process.env.LOCAL_DEVICE;
+                    else process.env.LOCAL_DEVICE = setting;
+                    expect(await kinds()).not.toContain('local');
+                    const status = await client.get('/api/v1/setup/status');
+                    expect(status.data.device?.kind).not.toBe('local');
+                }
+            }
         } finally {
             process.env.NODE_ENV = before.mode;
             process.env.LOCAL_DEVICE = before.local;
