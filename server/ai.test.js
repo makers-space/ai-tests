@@ -877,6 +877,14 @@ describe('Fit rules', () => {
         expect(new Set(ranked.slice(0, 4).map((model) => model.tag)).size).toBe(4);
         expect(ranked.slice(4).every((model) => model.pick === null)).toBe(true);
         expect(ranked.find((model) => model.pick === 'best').fit.fits).toBe(true);
+        for (const model of ranked.filter((entry) => entry.pick)) {
+            expect(model.pickLabel.length).toBeGreaterThan(3);
+            expect(model.pickWhy).toMatch(/\d+(\.\d)? GB/);
+            expect(model.pickWhy).toMatch(/tokens a second|speed unknown/);
+        }
+        const fastest = ranked.find((model) => model.pick === 'fast');
+        const capable = ranked.filter((model) => model.parameters >= 1 && ['gpu', 'cpu'].includes(model.fit.verdict));
+        if (capable.length > 0) expect(fastest.parameters).toBeGreaterThanOrEqual(1);
     });
 
     test('a very small machine gets no recommendation instead of a wrong one', () => {
