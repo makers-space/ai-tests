@@ -12,7 +12,7 @@ import {
     fitModel, rankCatalogue, memoryNeededMb, VERDICTS,
     GenerationQueue, extractText, estimateTokens, setFilesFetch, MAX_ATTACHMENT_BYTES,
     isPublicAddress, setRemoteTransport, MAX_REMOTE_BYTES, setSearchFetch,
-    setToolConnector, ToolSignInError, TOOL_HEALTH, TOOL_CATALOGUE, TOOL_LOCAL_CATALOGUE, CLOUD_PROVIDERS, PROVIDER_HEALTH, setCloudFetch, seal, unseal, deviceGateway
+    setToolConnector, ToolSignInError, TOOL_HEALTH, TOOL_CATALOGUE, TOOL_LOCAL_CATALOGUE, CLOUD_PROVIDERS, PROVIDER_HEALTH, setCloudFetch, ollamaOnlineNames, runsOnline, seal, unseal, deviceGateway
 } from '../../server/middleware/ai.middleware.js';
 import { Device, Setting, Download, PersonalModel, Chat, Prompt, Guide, GUIDE_STEPS, MANAGER_GUIDE_STEPS, deviceSchemas, modelSchemas, chatSchemas, promptSchemas, ToolServer, TOOL_HEALTH_STATES, toolSchemas, Provider, PROVIDER_HEALTH_STATES, providerSchemas } from '../../server/models/ai.model.js';
 import { downloads, health, queue, COMPONENT_GUIDE, BASE_GUIDE, CLOSING_GUIDE, SKILLS, SEARCH_GUIDE, PLAN_GUIDE, RESULTS_GUIDE, REVIEW_GUIDE, TOUCH_GUIDE, writtenToolCalls } from '../../server/controllers/ai.controller.js';
@@ -4996,6 +4996,24 @@ describe('Online model providers', () => {
         expect((await add('openrouter', 'bad-key-0000')).data.provider.health.state).toBe('refused');
         expect(asked.some((one) => one.host === 'openrouter.ai' && one.path === '/api/v1/key')).toBe(true);
         expect((await add('google', 'odd-key-0000')).data.provider.health.state).toBe('refused');
+    });
+
+    test('the models Ollama runs online are read without a key, and a library entry is matched by its exact size or its bare name', async () => {
+        setCloudFetch(service);
+        const names = await ollamaOnlineNames();
+        expect([...names]).toEqual(['kimi-k3', 'embed-one']);
+        expect(asked.at(-1)).toMatchObject({ host: 'ollama.com', path: '/api/tags', key: '' });
+        asked.length = 0;
+        await ollamaOnlineNames();
+        expect(asked.length).toBe(0);
+
+        const listed = new Set(['gpt-oss:120b', 'kimi-k3', 'deepseek-v4-pro:0813']);
+        expect(runsOnline({ tag: 'gpt-oss:120b' }, listed)).toBe(true);
+        expect(runsOnline({ tag: 'gpt-oss:20b' }, listed)).toBe(false);
+        expect(runsOnline({ tag: 'kimi-k3', cloudOnly: true }, listed)).toBe(true);
+        expect(runsOnline({ tag: 'deepseek-v4-pro', cloudOnly: true }, listed)).toBe(true);
+        expect(runsOnline({ tag: 'deepseek-v4-pro' }, listed)).toBe(false);
+        expect(runsOnline({ tag: 'llama3.2:3b' }, listed)).toBe(false);
     });
 
     test('a refused key, an empty account, no credit and a busy service are told apart, and a new key puts it right', async () => {
