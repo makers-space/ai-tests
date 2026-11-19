@@ -4418,6 +4418,13 @@ describe('Chat endpoints', () => {
                 // Only the skill's own scripts run, so the skill still says what it lacks.
                 expect((await get('/skills')).data.skills.find((skill) => skill.id === 'anthropic-pdf').needs).toContain('commands');
 
+                // Every skill whose scripts are on the runner gets a function named after it.
+                const tracking = await newChat({ model: 'qwen2.5-coder:7b', skills: ['marketing-conversion-tracking'] });
+                state.toolPlan = [];
+                state.chatCalls = [];
+                await send(tracking.id, { content: 'hello' });
+                expect(state.chatCalls[0].tools.map((tool) => tool.function.name)).toContain('conversion_tracking_script');
+
                 // Without the runner's address and secret the function is not offered at all.
                 delete process.env.SKILL_RUNNER_SECRET;
                 state.toolPlan = [];
