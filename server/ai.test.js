@@ -4299,6 +4299,58 @@ describe('Chat endpoints', () => {
             expect(state.chatCalls[0].tools).toBeUndefined();
         });
 
+        test('with the skill runner set up, the Hairline checks are the kit\'s own scripts run there; when it does not answer, the checks kept here are made', async () => {
+            const riffle = fs.readFileSync(new URL('../../server/instructions/library/hairline/hairline-hairline-create/examples/riffle.js', import.meta.url), 'utf8').replace(/\r\n/g, '\n').trim();
+            const wrong = riffle.replace(/\bhairline\s*\(\s*\{(?![\s\S]*\bhairline\s*\(\s*\{)/, (found) => `setTimeout(() => {}, 10);\n${found}`);
+            const jobs = [];
+            let runner = 'faulty';
+            process.env.SKILL_RUNNER_URL = 'https://runner.test';
+            process.env.SKILL_RUNNER_SECRET = 'runner-secret';
+            setRunnerFetch(async (url, options) => {
+                const job = JSON.parse(options.body);
+                jobs.push(job);
+                if (runner === 'down') throw new TypeError('fetch failed');
+                if (job.script === 'build.mjs') return json(200, { exitCode: 0, timedOut: false, stdout: 'page.html', stderr: '', files: [{ path: 'page.html', data: Buffer.from('<html>built</html>').toString('base64') }] });
+                return runner === 'clean'
+                    ? json(200, { exitCode: 0, timedOut: false, stdout: 'ok page.html: kernel and bench intact, and the figure passes the static checks.', stderr: '', files: [] })
+                    : json(200, { exitCode: 1, timedOut: false, stdout: '', stderr: 'spin: said by the runner only.\n1 to fix in page.html\n', files: [] });
+            });
+            try {
+                const build = async (code) => {
+                    const chat = await newChat({ model: 'qwen2.5-coder:7b', skills: ['components', 'hairline-hairline-create'] });
+                    state.chatCalls.length = 0;
+                    state.toolPlan = [[['hairline_build', { code }]]];
+                    await send(chat.id, { content: 'draw it' });
+                    return state.chatCalls[1].messages.at(-1).content;
+                };
+
+                // The figure goes to build.mjs, and the page it wrote goes to validate.mjs; what validate prints is what the model is told.
+                const told = await build(riffle);
+                expect(jobs.map((job) => [job.skill, job.script, job.args, job.files.map((file) => file.path)])).toEqual([
+                    ['hairline-create', 'build.mjs', ['figure.js', 'page.html'], ['figure.js']],
+                    ['hairline-create', 'validate.mjs', ['page.html'], ['page.html']]
+                ]);
+                expect(Buffer.from(jobs[0].files[0].data, 'base64').toString()).toBe(`${riffle}\n`);
+                expect(Buffer.from(jobs[1].files[0].data, 'base64').toString()).toBe('<html>built</html>');
+                expect(told).toBe('Not shown yet. validate found 1 to fix in hairline-riffle.html:\nspin: said by the runner only.\nFix these in the figure and call hairline_build again with the whole file.');
+
+                // A page validate passes is shown.
+                runner = 'clean';
+                expect(await build(riffle)).toMatch(/^Built hairline-riffle\.html and showed it to the user in the chat\. validate: ok/);
+
+                // A runner that does not answer is not waited on: the checks kept here speak instead.
+                runner = 'down';
+                const local = await build(wrong);
+                expect(local).toMatch(/^Not shown yet\. validate found 1 to fix/);
+                expect(local).toMatch(/clock: rule 07/);
+                expect(local).not.toMatch(/said by the runner only/);
+            } finally {
+                setRunnerFetch(null);
+                delete process.env.SKILL_RUNNER_URL;
+                delete process.env.SKILL_RUNNER_SECRET;
+            }
+        });
+
         test('an office skill\'s own script runs on the skill runner, on the person\'s files, and only once they allow it', async () => {
             const runs = [];
             const uploads = [];
