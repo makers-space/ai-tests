@@ -15,7 +15,7 @@ import {
     setToolConnector, ToolSignInError, TOOL_HEALTH, TOOL_CATALOGUE, TOOL_LOCAL_CATALOGUE, CLOUD_PROVIDERS, PROVIDER_HEALTH, setCloudFetch, ollamaOnlineNames, runsOnline, seal, unseal, deviceGateway, DeviceGateway, cloudTitle
 } from '../../server/middleware/ai.middleware.js';
 import { Device, Setting, Download, PersonalModel, Chat, Prompt, Guide, GUIDE_STEPS, MANAGER_GUIDE_STEPS, deviceSchemas, modelSchemas, chatSchemas, promptSchemas, ToolServer, TOOL_HEALTH_STATES, toolSchemas, Provider, PROVIDER_HEALTH_STATES, providerSchemas, Skill } from '../../server/models/ai.model.js';
-import { downloads, health, queue, SKILLS, COMPONENT_PAGES, rankSkills, writtenToolCalls, BUILTIN_TOOLS, waitingPermissions, todayLine, SKILL_SOURCES, MAX_CHAT_SKILLS, SUGGESTED_SKILLS } from '../../server/controllers/ai.controller.js';
+import { downloads, health, queue, SKILLS, COMPONENT_PAGES, componentFaults, rankSkills, writtenToolCalls, BUILTIN_TOOLS, waitingPermissions, todayLine, SKILL_SOURCES, MAX_CHAT_SKILLS, SUGGESTED_SKILLS } from '../../server/controllers/ai.controller.js';
 
 // What a chat is sent when only the default skill is on: the Components skill, today's date, and that skill's reminder.
 const COMPONENT_GUIDE = SKILLS.find((skill) => skill.id === 'components').text;
@@ -643,7 +643,8 @@ const fakeChat = (request) => {
         wake = resolve;
         setTimeout(resolve, ms);
     });
-    const words = state.chatReply.split(' ');
+    // A test may line up several replies, given one after another; otherwise every reply is the same.
+    const words = (state.replyPlan?.length > 0 ? state.replyPlan.shift() : state.chatReply).split(' ');
 
     return {
         abort() {
@@ -4037,6 +4038,82 @@ describe('Chat endpoints', () => {
             const plain = await newChat({ model: 'qwen2.5-coder:7b' });
             await send(plain.id, { content: 'hello' });
             expect(state.chatCalls[0].tools).toBeUndefined();
+        });
+
+        test('what a model draws is checked by rule, and it is told why and given one chance to put it right', async () => {
+            const page = (name) => COMPONENT_PAGES.find((one) => one.name === name).text;
+            const block = (inside) => ['Here you go:', '', '```component', inside, '```'].join('\n');
+            const bad = block('<Card>\n<Grid>\n<Typography>Engine</Typography>\n</Grid>\n<FloatingActionButton />\n<Video src="engine.mp4" />\n</Card>');
+            const good = block('<Card>\n<Typography>Engine</Typography>\n</Card>');
+
+            const chat = await newChat({ model: 'qwen2.5-coder:7b' });
+            state.chatCalls.length = 0;
+            state.replyPlan = [bad, good];
+            const { events: list } = await send(chat.id, { content: 'show the engine' });
+
+            // The same model is asked once more, with the reasons and the pages of the components it used.
+            expect(state.chatCalls).toHaveLength(2);
+            expect(state.chatCalls[1].model).toBe(state.chatCalls[0].model);
+            const [wrote, told] = state.chatCalls[1].messages.slice(-2);
+            expect(wrote).toEqual({ role: 'assistant', content: bad });
+            expect(told.role).toBe('user');
+            expect(told.content).toMatch(/^The chat could not draw part of your reply:\n- "Grid" is not a component\. The components are: Audio, Badge, /);
+            expect(told.content).toContain('\n- FloatingActionButton needs the attribute "icon".');
+            expect(told.content).toContain('\n- Video: src must be a full https address of a real file, not "engine.mp4". Do not make an address up.');
+            // The pages come smallest first, as many as fit a small model: here all but the long Card page.
+            for (const name of ['Typography', 'FloatingActionButton', 'Video']) expect(told.content).toContain(page(name));
+            expect(told.content).not.toContain(page('Flow'));
+            expect(told.content.endsWith('Write your whole reply again with this put right. Do not mention this correction.')).toBe(true);
+
+            // The person is shown only the corrected reply, and that a correction was made.
+            const reply = list.at(-1).reply;
+            expect(reply.content).toBe(good);
+            expect(reply.steps.map(({ tool, input }) => ({ tool, input: input.slice(0, 27) }))).toEqual([{ tool: 'Drawing check', input: '"Grid" is not a component. ' }]);
+            expect(list.some((event) => event.type === 'replace' && event.text === '')).toBe(true);
+            expect(list.filter((event) => event.type === 'note').map((event) => event.text)).toEqual(['Correcting what it drew…', '']);
+            // Neither the first attempt nor the correction is kept in the chat.
+            const kept = (await get(`/chats/${chat.id}`)).data.chat.messages;
+            expect(kept.map((message) => message.role)).toEqual(['user', 'assistant']);
+            expect(kept[1].content).toBe(good);
+
+            // One chance only: a second attempt that is still wrong is left as written.
+            state.chatCalls.length = 0;
+            state.replyPlan = [bad, bad];
+            const again = await send(chat.id, { content: 'once more' });
+            expect(state.chatCalls).toHaveLength(2);
+            expect(again.events.at(-1).reply.content).toBe(bad);
+
+            // A second attempt that says nothing is not shown in place of the first.
+            state.chatCalls.length = 0;
+            state.replyPlan = [bad, ''];
+            const empty = await send(chat.id, { content: 'and again' });
+            expect(state.chatCalls).toHaveLength(2);
+            expect(empty.events.at(-1).reply.content).toBe(bad);
+
+            // A reply with nothing wrong, or with no component at all, is not asked again.
+            for (const fine of [good, 'An engine burns fuel.', ['```html', '<div>not for the chat to draw</div>', '```'].join('\n')]) {
+                state.chatCalls.length = 0;
+                state.replyPlan = [fine];
+                await send(chat.id, { content: 'next' });
+                expect(state.chatCalls, fine).toHaveLength(1);
+            }
+
+            // A chat without the Components skill is not checked.
+            const plain = await newChat({ model: 'qwen2.5-coder:7b', skills: [] });
+            state.chatCalls.length = 0;
+            state.replyPlan = [bad];
+            await send(plain.id, { content: 'show the engine' });
+            expect(state.chatCalls).toHaveLength(1);
+            state.replyPlan = [];
+
+            // The rules themselves: what a page, a drawing or code holds is its own; inner tags must have what they need.
+            expect(componentFaults(block('<Frame height="300px">\n<div><h1>Hi</h1></div>\n<script>const a = 1 < 2;</script>\n</Frame>')).faults).toEqual([]);
+            expect(componentFaults(block('<Image alt="dot"><svg viewBox="0 0 1 1"><circle r="1" /></svg></Image>')).faults).toEqual([]);
+            expect(componentFaults(block('<Flow>\n<Node id="a" label="A" />\n<Edge source="a" target="a" />\n</Flow>')).faults).toEqual([]);
+            expect(componentFaults(block('<Flow>\n<Node label="A" />\n<Edge source="a" />\n</Flow>')).faults).toEqual(['Node needs the attribute "id".', 'Edge needs the attribute "target".']);
+            expect(componentFaults('<Container layout="flex">\n<div>\n<h2>Parts</h2>\n</div>\n</Container>').faults.map((fault) => fault.split('.')[0])).toEqual(['"div" is not a component', '"h2" is not a component']);
+            expect(componentFaults(block('<Model3D src="https://example.com/engine.glb" autoRotate />')).faults).toEqual([]);
+            expect(componentFaults(block('<ProgressBar label="Done" />')).faults).toEqual(['ProgressBar needs the attribute "value".']);
         });
 
         test('stops offering tools after six rounds so a reply always ends', async () => {
