@@ -3892,7 +3892,7 @@ describe('Chat endpoints', () => {
             }
             // The five skills Mollama wrote itself are gone; the one that draws its viewers stays.
             expect(skills.filter((skill) => skill.source === 'mollama').map((skill) => skill.id)).toEqual(['components']);
-            expect(sources.map((source) => source.id)).toEqual(['mollama', 'anthropic', 'engineering', 'marketing', 'medical', 'dex', 'context7', 'search', 'last30days', 'anatomy', 'hairline']);
+            expect(sources.map((source) => source.id)).toEqual(['mollama', 'anthropic', 'engineering', 'marketing', 'medical', 'dex', 'context7', 'search', 'last30days', 'anatomy', 'hairline', 'taste']);
             expect(sources.reduce((sum, source) => sum + source.count, 0)).toBe(skills.length);
             expect(skills.every((skill) => skill.tokens > 0)).toBe(true);
 
