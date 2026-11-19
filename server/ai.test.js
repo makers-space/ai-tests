@@ -16,7 +16,7 @@ import {
     setToolConnector, ToolSignInError, TOOL_HEALTH, TOOL_CATALOGUE, TOOL_LOCAL_CATALOGUE, CLOUD_PROVIDERS, PROVIDER_HEALTH, setCloudFetch, ollamaOnlineNames, runsOnline, seal, unseal, deviceGateway, DeviceGateway, cloudTitle
 } from '../../server/middleware/ai.middleware.js';
 import { Device, Setting, Download, PersonalModel, Chat, Prompt, Guide, GUIDE_STEPS, MANAGER_GUIDE_STEPS, deviceSchemas, modelSchemas, chatSchemas, promptSchemas, ToolServer, TOOL_HEALTH_STATES, toolSchemas, Provider, PROVIDER_HEALTH_STATES, providerSchemas, Skill } from '../../server/models/ai.model.js';
-import { downloads, health, queue, SKILLS, COMPONENT_PAGES, componentFaults, rankSkills, writtenToolCalls, BUILTIN_TOOLS, waitingPermissions, todayLine, SKILL_SOURCES, MAX_CHAT_SKILLS, SUGGESTED_SKILLS } from '../../server/controllers/ai.controller.js';
+import { downloads, health, queue, SKILLS, COMPONENT_PAGES, COMPONENT_VALUES_PAGE, componentFaults, rankSkills, writtenToolCalls, BUILTIN_TOOLS, waitingPermissions, todayLine, SKILL_SOURCES, MAX_CHAT_SKILLS, SUGGESTED_SKILLS } from '../../server/controllers/ai.controller.js';
 
 // What a chat is sent when only the default skill is on: the Components skill, today's date, and that skill's reminder.
 const COMPONENT_GUIDE = SKILLS.find((skill) => skill.id === 'components').text;
@@ -605,6 +605,7 @@ const resetState = () => {
         chatReply: 'A short answer',
         chatCalls: [],
         guidesSeen: 0,
+        valuesSeen: 0,
         toolPlan: [],
         toolsAsText: false,
         plan: { searches: [] },
@@ -781,6 +782,10 @@ const fakeOllama = (host, signal) => ({
             if (own.startsWith(COMPONENT_GUIDE)) {
                 state.guidesSeen += 1;
                 own = own.slice(COMPONENT_GUIDE.length).replace(/^\n\n/, '');
+            }
+            if (own.startsWith(COMPONENT_VALUES_PAGE)) {
+                state.valuesSeen += 1;
+                own = own.slice(COMPONENT_VALUES_PAGE.length).replace(/^\n\n/, '');
             }
             if (own.endsWith(CLOSING_GUIDE)) own = own.slice(0, own.length - CLOSING_GUIDE.length).replace(/\n\n$/, '');
             own = own.split('\n\n').filter((part) => part !== todayLine()).join('\n\n');
@@ -3848,13 +3853,21 @@ describe('Chat endpoints', () => {
             for (let turn = 0; turn < 6; turn++) await send(quiet.id, { content: `question ${turn}` });
             expect(state.chatCalls.every((call) => call.messages[0].role === 'user')).toBe(true);
 
-            // A model that cannot use tools has the index alone, never the pages; a chat without the skill has neither.
+            // A model that can use tools is never sent the compact page of values: it opens the page it needs.
+            expect(state.valuesSeen).toBe(0);
+
+            // A model that cannot use tools cannot open a page, so after the index it is sent one compact page of the
+            // values each attribute takes, built from the pages' own tables; never the pages themselves.
+            expect(COMPONENT_VALUES_PAGE.startsWith('COMPONENT VALUES\n')).toBe(true);
+            expect(COMPONENT_VALUES_PAGE).toMatch(/\n- Badge: color = default, primary, secondary, tertiary, success, warning, error/);
+            expect(COMPONENT_VALUES_PAGE.length).toBeLessThan(6000);
             state.noTools = true;
             state.chatCalls.length = 0;
             const before = state.guidesSeen;
             const plain = await newChat({ model: 'qwen2.5-coder:7b' });
             await send(plain.id, { content: 'hello' });
             expect(state.guidesSeen).toBe(before + 1);
+            expect(state.valuesSeen).toBe(1);
             expect(pageText(state.chatCalls[0])).toEqual([]);
             expect(state.chatCalls[0].messages.map((message) => message.role)).toEqual(['user']);
             state.noTools = false;
