@@ -1282,6 +1282,50 @@ describe('Model endpoints', () => {
             expect((await get('/catalogue')).data.size).toBe(48);
         });
 
+        test('a search forgives spacing and spelling, reads a size, and puts the closest name first', async () => {
+            signOut();
+            const tags = async (query) => (await get(`/catalogue?${query}`)).data.models.map((model) => model.tag);
+            // The name asked for comes before a longer name that starts the same way, and 30b keeps to that size.
+            expect(await tags('q=qwen3%2030b')).toEqual(['qwen3:30b', 'qwen3-coder:30b']);
+            expect(await tags('q=qwen3:30b')).toEqual(['qwen3:30b', 'qwen3-coder:30b']);
+            // Spaces, dots and hyphens in a name do not have to be typed as the library writes them.
+            expect((await tags('q=deep%20seek')).sort()).toEqual(['deepseek-r1:14b', 'deepseek-r1:8b']);
+            expect(await tags('q=llama%203.2')).toEqual(['llama3.2:3b']);
+            expect((await tags('q=qwen%202.5%20coder')).sort()).toEqual(['qwen2.5-coder:32b', 'qwen2.5-coder:7b']);
+            // An ability can be searched for by its name.
+            expect((await tags('q=vision')).sort()).toEqual(['gemma3:12b', 'gemma3:27b', 'gemma3:4b']);
+            // A slip of a letter still finds the model, and the answer says the match is not exact.
+            const slip = (await get('/catalogue?q=gemna')).data;
+            expect(slip.near).toBe(true);
+            expect(slip.models.map((model) => model.tag).sort()).toEqual(['gemma3:12b', 'gemma3:27b', 'gemma3:4b']);
+            expect((await get('/catalogue?q=gemma')).data.near).toBe(false);
+            expect((await get('/catalogue?q=zzzzzz')).data).toMatchObject({ near: false, models: [], total: 0 });
+        });
+
+        test('the list can be narrowed by what a model is for, what it can do and whether it fits, across every page', async () => {
+            signOut();
+            const ask = async (query) => (await get(`/catalogue?${query}`)).data;
+            const code = await ask('purpose=code&size=4');
+            expect(code.total).toBeGreaterThan(0);
+            expect(code.total).toBeLessThan(catalogue.length);
+            expect(code.models.every((model) => model.goodFor.includes('code'))).toBe(true);
+            const seeing = await ask('can=vision');
+            expect(seeing.models.map((model) => model.tag).sort()).toEqual(['gemma3:12b', 'gemma3:27b', 'gemma3:4b']);
+            expect((await ask('can=tools,thinking')).models.every((model) => model.capabilities.includes('tools') && model.capabilities.includes('thinking'))).toBe(true);
+            expect((await ask('can=vision&q=27b')).models.map((model) => model.tag)).toEqual(['gemma3:27b']);
+            const small = await ask('fits=true&memoryMb=8192&gpuMemoryMb=4096');
+            const whole = await ask('memoryMb=8192&gpuMemoryMb=4096');
+            expect(small.total).toBe(whole.fitting);
+            expect(small.total).toBeLessThan(whole.total);
+            expect(small.models.every((model) => model.fit.fits)).toBe(true);
+            // The count is of the whole narrowed list, not of the page in hand.
+            const paged = await ask('purpose=chat&size=4');
+            expect(paged.models.filter((model) => !model.pick).length).toBeLessThanOrEqual(4);
+            expect(paged.paged).toBeGreaterThan(4);
+            expect((await get('/catalogue?can=flying')).status).toBe(400);
+            expect((await get('/catalogue?purpose=cooking')).status).toBe(400);
+        });
+
         test('says plainly when ollama.com cannot be reached or its page cannot be read', async () => {
             signOut();
             setLibraryFetch(fakeLibrary);
@@ -3675,6 +3719,8 @@ describe('Chat endpoints', () => {
             expect(pageText(state.chatCalls[0])).toEqual([]);
             const opener = state.toolsSeen[0].find((tool) => tool.function.name === 'open_component');
             expect(opener.function.description).toMatch(/every attribute it takes, every value, and what each does on screen/);
+            // A model is told the function is for reading: some took a page for the drawing itself and said they could not draw.
+            expect(opener.function.description).toMatch(/only returns the page and draws nothing: a component is drawn by writing its tags in your reply, inside a ```component fence\.$/);
             // The two it asked for come back together, and only those two.
             expect(state.chatCalls[1].messages.at(-1)).toMatchObject({ role: 'tool', content: `${page('Flow')}\n\n${page('Badge')}` });
             expect(pageText(state.chatCalls[1])).toEqual(['Badge', 'Flow']);
@@ -3896,6 +3942,8 @@ describe('Chat endpoints', () => {
             expect(first.messages.map((message) => message.role)).toEqual(['user']);
             const opener = (request) => request.tools.find((tool) => tool.function.name === 'open_skill');
             expect(opener(first).function.description).toContain(`- Copywriting: ${copy.description}`);
+            // A model is told whose the instructions are: some wrote a skill's own questions back to the user as the answer.
+            expect(opener(first).function.description).toMatch(/^Open one of this chat's skills and get its full instructions\. .*The instructions are written for you and the user does not see them: do what they say in your reply, and do not repeat them back\.\n- /);
             expect(opener(first).function.description).toContain(`- Grilling: ${grill.description}`);
             expect([...opener(first).function.parameters.properties.skill.enum].sort()).toEqual(['Copywriting', 'Grilling']);
             // Room is kept for the largest skill that may be opened.
