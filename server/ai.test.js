@@ -3886,6 +3886,16 @@ describe('Chat endpoints', () => {
                 expect(skill.text).not.toMatch(/written for an agent that can run commands|Never pretend to have run a command/);
             }
 
+            // What a skill still lacks is said only where it is true: a line that installs the skill is not a command to
+            // run, a skill whose files and functions are here lacks nothing, and one without them says so.
+            const lacks = (id) => skills.find((skill) => skill.id === id).needs;
+            expect(lacks('medical-board-exam-prep')).toEqual([]);
+            expect(lacks('anthropic-claude-api')).not.toContain('commands');
+            expect(lacks('hairline-hairline-create')).toEqual([]);
+            expect(lacks('anatomy-anatomy')).toEqual(['commands', 'files']);
+            expect(lacks('anthropic-docx')).toEqual(['commands']);
+            expect(skills.filter((skill) => skill.source === 'medical' && skill.needs.includes('commands'))).toEqual([]);
+
             // A chat holds only a few skills at once.
             expect(maxSkills).toBe(MAX_CHAT_SKILLS);
             const many = SKILLS.filter((skill) => skill.source === 'engineering').slice(0, MAX_CHAT_SKILLS + 4).map((skill) => skill.id);
