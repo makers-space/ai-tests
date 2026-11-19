@@ -667,6 +667,8 @@ const fakeChat = (request) => {
             yield {
                 message: { role: 'assistant', content: '' },
                 done: true,
+                // A test may say how replies end, one after another: "length" is a model that ran out of room.
+                ...(state.endings?.length > 0 ? { done_reason: state.endings.shift() } : {}),
                 eval_count: words.length,
                 prompt_eval_count: 20,
                 total_duration: 2e9,
@@ -2787,6 +2789,49 @@ describe('Chat endpoints', () => {
                     process.env.TAVILY_API_KEY = '';
                 }
             }
+        });
+
+        test('a reply cut short for want of room is tried again with more, and when there is no more the person is told', async () => {
+            // A model that thinks is given room for its thinking as well as its answer.
+            const chat = await newChat({ model: 'qwen2.5-coder:7b' });
+            state.chatCalls.length = 0;
+            await send(chat.id, { content: 'hello' });
+            const usual = state.chatCalls[0].options.num_ctx;
+            expect(usual).toBeGreaterThanOrEqual(8192);
+            expect(state.chatCalls[0].options.num_predict).toBe(usual);
+
+            // Cut once: the same question is asked again with the next size up, and only the full answer is kept.
+            state.chatCalls.length = 0;
+            state.endings = ['length', 'stop'];
+            state.replyPlan = ['Half an', 'The whole answer.'];
+            const { events: list } = await send(chat.id, { content: 'a long one' });
+            expect(state.chatCalls).toHaveLength(2);
+            expect(state.chatCalls[1].options.num_ctx).toBeGreaterThan(state.chatCalls[0].options.num_ctx);
+            expect(list.at(-1)).toMatchObject({ type: 'done' });
+            expect(list.at(-1).reply.content).toBe('The whole answer.');
+            expect(list.at(-1).reply.error).toBeNull();
+            expect(list.filter((event) => event.type === 'note').map((event) => event.text)).toEqual(['Giving the model more room and trying again…', '']);
+
+            // Cut again with nothing more to give: what there is, is kept, and the person is told it is incomplete.
+            state.chatCalls.length = 0;
+            state.endings = ['length', 'length'];
+            state.replyPlan = ['Half an', 'Half an answer'];
+            const cut = await send(chat.id, { content: 'another long one' });
+            expect(state.chatCalls).toHaveLength(2);
+            expect(cut.events.at(-1)).toMatchObject({ type: 'error', code: 'REPLY_CUT', message: 'The model ran out of room before it finished, so this reply is incomplete.' });
+            expect(cut.events.at(-1).reply.content).toBe('Half an answer');
+            const saved = (await get(`/chats/${chat.id}`)).data.chat.messages.at(-1);
+            expect(saved).toMatchObject({ role: 'assistant', content: 'Half an answer', error: { code: 'REPLY_CUT' } });
+
+            // Even a reply that got no further than thinking is kept and explained, not dropped.
+            state.chatCalls.length = 0;
+            state.endings = ['length', 'length'];
+            state.replyPlan = ['', ''];
+            const nothing = await send(chat.id, { content: 'and another' });
+            expect(nothing.events.at(-1)).toMatchObject({ type: 'error', code: 'REPLY_CUT' });
+            expect((await get(`/chats/${chat.id}`)).data.chat.messages.at(-1)).toMatchObject({ role: 'assistant', content: '', error: { code: 'REPLY_CUT' } });
+            state.endings = [];
+            state.replyPlan = [];
         });
 
         test('Stop ends generation and keeps what was written', async () => {
