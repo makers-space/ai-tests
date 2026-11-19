@@ -2557,6 +2557,20 @@ describe('Chat endpoints', () => {
             state.streamErrors = [];
         });
 
+        test('a function called by a slightly wrong name is still run, and one that does not exist is answered with the real names', async () => {
+            const chat = await newChat({ model: 'qwen2.5-coder:7b' });
+            state.chatCalls.length = 0;
+            state.toolPlan = [[['open_component_page', { component: 'Badge' }], ['Calculator', { expression: '2 + 2' }], ['fly_to_the_moon', { speed: 'fast' }]]];
+            state.chatReply = 'Done.';
+            const { events: list } = await send(chat.id, { content: 'try these' });
+            const answers = state.chatCalls[1].messages.filter((message) => message.role === 'tool');
+            expect(answers[0].content).toBe(COMPONENT_PAGES.find((page) => page.name === 'Badge').text);
+            expect(answers[1].content).toMatch(/4/);
+            expect(answers[2].content).toMatch(/^There is no function called fly_to_the_moon\. The functions you can call are: open_component, find_skill, ask_user, date_time, calculator, read_web_page\.$/);
+            expect(list.at(-1).reply.steps.map(({ tool, failed }) => ({ tool, failed: failed || null }))).toEqual([{ tool: 'Component', failed: null }, { tool: 'Calculator', failed: null }, { tool: 'fly_to_the_moon', failed: 'failed' }]);
+            state.toolPlan = [];
+        });
+
         test('a model can put a question to the person with choices to press, and that ends the reply', async () => {
             const chat = await newChat({ model: 'qwen2.5-coder:7b' });
             state.chatCalls.length = 0;
@@ -4192,6 +4206,14 @@ describe('Chat endpoints', () => {
             expect(state.chatCalls[2].messages.at(-1).content).toMatch(/validate: ok/);
             expect(mended.events.at(-1).reply.content.match(/<Frame /g)).toHaveLength(1);
 
+            // Built once with faults and never again: the figure held back is shown when the reply ends.
+            state.chatCalls.length = 0;
+            state.toolPlan = [[['hairline_build', { code: wrong }]]];
+            state.chatReply = 'I could not finish the figure.';
+            const left = await send(chat.id, { content: 'one more' });
+            expect(left.events.at(-1).reply.content.match(/<Frame /g)).toHaveLength(1);
+            expect(left.events.at(-1).reply.content).toContain('I could not finish the figure.');
+
             // Sent again unfixed, it is shown all the same with what is still wrong, so the person is not left with nothing.
             state.chatCalls.length = 0;
             state.toolPlan = [[['hairline_build', { code: wrong }]], [['hairline_build', { code: wrong }]]];
@@ -4362,14 +4384,14 @@ describe('Chat endpoints', () => {
             expect(componentFaults(block('\n  <Badge>Done</Badge>')).faults).toEqual([]);
         });
 
-        test('stops offering tools after six rounds so a reply always ends', async () => {
+        test('stops offering tools after ten rounds so a reply always ends', async () => {
             await withKey(async () => {
-                state.toolPlan = Array.from({ length: 10 }, () => [search]);
+                state.toolPlan = Array.from({ length: 14 }, () => [search]);
                 const chat = await newChat({ model: 'qwen2.5-coder:7b' });
                 const { events: list } = await send(chat.id, { content: 'find a duck model' });
-                expect(state.searches).toHaveLength(6);
-                expect(state.chatCalls).toHaveLength(7);
-                expect(state.chatCalls[6].tools).toBeUndefined();
+                expect(state.searches).toHaveLength(10);
+                expect(state.chatCalls).toHaveLength(11);
+                expect(state.chatCalls[10].tools).toBeUndefined();
                 expect(list[list.length - 1].type).toBe('done');
             });
         });
