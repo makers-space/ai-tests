@@ -626,6 +626,7 @@ const resetState = () => {
         chatAborted: 0,
         chatHold: false,
         chatError: null,
+        streamErrors: [],
         chatFailsMidway: false,
         thinkingModel: false,
         contextLength: 32768,
@@ -654,7 +655,10 @@ const fakeChat = (request) => {
         },
         async *[Symbol.asyncIterator]() {
             if (request.think) yield { message: { role: 'assistant', content: '', thinking: 'Let me consider this.' } };
+            // A test may make replies break off partway with what Ollama said, one after another; an empty entry is a reply that does not break.
+            const broken = state.streamErrors?.length > 0 ? state.streamErrors.shift() : null;
             for (let index = 0; index < words.length; index++) {
+                if (broken && index === 1) throw Object.assign(new Error(broken), { error: broken });
                 await pause(2);
                 check();
                 yield { message: { role: 'assistant', content: index < words.length - 1 ? `${words[index]} ` : words[index] } };
@@ -2505,6 +2509,40 @@ describe('Chat endpoints', () => {
             expect(saved.messages.map((message) => message.content)).toEqual(['hello', 'Whole answer']);
         });
 
+        test('a function call Ollama could not read is asked for once more, and said plainly when it happens twice', async () => {
+            const unreadable = "invalid character '.' looking for beginning of object key string";
+            const chat = await newChat({ model: 'qwen2.5-coder:7b' });
+            state.chatCalls.length = 0;
+            state.streamErrors = [unreadable];
+            state.replyPlan = ['Let me build that now', 'Here is the figure.'];
+            const { events: list } = await send(chat.id, { content: 'build it' });
+            // The same request goes again, the half-written first attempt is taken back, and only the second is kept.
+            expect(state.chatCalls).toHaveLength(2);
+            expect(state.chatCalls[1].messages).toEqual(state.chatCalls[0].messages);
+            expect(list.filter((event) => event.type === 'note').map((event) => event.text)).toEqual(['The model wrote a function call that could not be read. Asking again…', '']);
+            expect(list.at(-1)).toMatchObject({ type: 'done' });
+            expect(list.at(-1).reply.content).toBe('Here is the figure.');
+            expect(list.at(-1).reply.error).toBeNull();
+
+            // Twice in one reply: it stops, and the person is told what happened instead of "a problem it did not explain".
+            state.chatCalls.length = 0;
+            state.streamErrors = [unreadable, 'error parsing tool call: raw=\'{"code": \' err=unexpected end of JSON input'];
+            state.replyPlan = ['Let me build', 'Let me build'];
+            const twice = await send(chat.id, { content: 'build it again' });
+            expect(state.chatCalls).toHaveLength(2);
+            expect(twice.events.at(-1)).toMatchObject({ type: 'error', code: 'CALL_UNREADABLE', message: 'The model tried to use a function but wrote the request so that it could not be read.' });
+            state.streamErrors = [];
+            state.replyPlan = [];
+
+            // Any other failure midway is not asked again.
+            state.chatCalls.length = 0;
+            state.streamErrors = ['something else went wrong'];
+            const other = await send(chat.id, { content: 'and again' });
+            expect(state.chatCalls).toHaveLength(1);
+            expect(other.events.at(-1)).toMatchObject({ type: 'error', code: 'UNKNOWN' });
+            state.streamErrors = [];
+        });
+
         test('not enough memory is said plainly', async () => {
             const chat = await newChat({ model: 'qwen2.5-coder:7b' });
             state.chatError = 'model requires more system memory (9.1 GiB) than is available (4.0 GiB)';
@@ -4207,6 +4245,10 @@ describe('Chat endpoints', () => {
             expect(componentFaults('<Container layout="flex">\n<div>\n<h2>Parts</h2>\n</div>\n</Container>').faults.map((fault) => fault.split('.')[0])).toEqual(['"div" is not a component', '"h2" is not a component']);
             expect(componentFaults(block('<Model3D src="https://example.com/engine.glb" autoRotate />')).faults).toEqual([]);
             expect(componentFaults(block('<ProgressBar label="Done" />')).faults).toEqual(['ProgressBar needs the attribute "value".']);
+            // A block that holds program code or plain words, as some models write, is caught as well.
+            expect(componentFaults(block('import { gear } from "kernel.js";\ngear({ teeth: 12 });')).faults).toEqual(['A component block holds only component tags, and one of yours holds something else. Program code goes in an ordinary code fence, and words go outside the block.']);
+            expect(componentFaults(block('Here is the panel you asked for.')).faults).toHaveLength(1);
+            expect(componentFaults(block('\n  <Badge>Done</Badge>')).faults).toEqual([]);
         });
 
         test('stops offering tools after six rounds so a reply always ends', async () => {
