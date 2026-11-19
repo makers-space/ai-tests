@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import { createRequire } from 'node:module';
 import { Readable } from 'node:stream';
@@ -10,7 +11,7 @@ import {
     mapOllamaError, OllamaError, ERROR_CODES,
     parseNvidiaSmi, appleGpus, parseDisplayAdapters, detectHardware,
     fitModel, rankCatalogue, memoryNeededMb, VERDICTS,
-    GenerationQueue, extractText, estimateTokens, setFilesFetch, MAX_ATTACHMENT_BYTES,
+    GenerationQueue, extractText, estimateTokens, setFilesFetch, setRunnerFetch, MAX_ATTACHMENT_BYTES,
     isPublicAddress, setRemoteTransport, MAX_REMOTE_BYTES, setSearchFetch,
     setToolConnector, ToolSignInError, TOOL_HEALTH, TOOL_CATALOGUE, TOOL_LOCAL_CATALOGUE, CLOUD_PROVIDERS, PROVIDER_HEALTH, setCloudFetch, ollamaOnlineNames, runsOnline, seal, unseal, deviceGateway, DeviceGateway, cloudTitle
 } from '../../server/middleware/ai.middleware.js';
@@ -4296,6 +4297,87 @@ describe('Chat endpoints', () => {
             const plain = await newChat({ model: 'qwen2.5-coder:7b' });
             await send(plain.id, { content: 'hello' });
             expect(state.chatCalls[0].tools).toBeUndefined();
+        });
+
+        test('an office skill\'s own script runs on the skill runner, on the person\'s files, and only once they allow it', async () => {
+            const runs = [];
+            const uploads = [];
+            process.env.SKILL_RUNNER_URL = 'https://runner.test/';
+            process.env.SKILL_RUNNER_SECRET = 'runner-secret';
+            setRunnerFetch(async (url, options) => {
+                const job = JSON.parse(options.body);
+                runs.push({ url, headers: options.headers, raw: options.body, job });
+                if (job.script === 'scripts/missing.py') return json(404, { detail: 'The skill pdf has no script scripts/missing.py' });
+                if (job.script === 'scripts/slow.py') throw new TypeError('fetch failed');
+                return json(200, { exitCode: job.script === 'scripts/fails.py' ? 2 : 0, timedOut: false, stdout: 'Found 2 fields', stderr: job.script === 'scripts/fails.py' ? 'bad input' : '', files: [{ path: 'fields.json', data: Buffer.from('{"a":1}').toString('base64') }], skipped: [] });
+            });
+            setFilesFetch(async (url, options) => {
+                if (!String(url).endsWith('/files/upload')) return fakeFilesystemOne(url, options);
+                uploads.push({ cookie: options.headers.Cookie, folder: options.body.get('basePath'), paths: options.body.get('relativePaths'), conflict: options.body.get('onConflict'), text: Buffer.from(await options.body.get('files').arrayBuffer()).toString() });
+                return json(201, { success: true });
+            });
+            try {
+                const chat = await newChat({ model: 'qwen2.5-coder:7b', skills: ['anthropic-pdf'] });
+                const turn = async (input, answer) => {
+                    state.toolPlan = [[['pdf_script', input]]];
+                    state.chatCalls = [];
+                    const pending = send(chat.id, { content: 'check the form' });
+                    for (let tries = 0; tries < 200 && !waitingPermissions().some((waiting) => waiting.chatId === chat.id); tries += 1) await wait(25);
+                    const waiting = waitingPermissions().find((one) => one.chatId === chat.id);
+                    expect(waiting).toBeTruthy();
+                    expect((await post(`/chats/${chat.id}/permission`, { id: waiting.id, answer })).status).toBe(200);
+                    await pending;
+                    return state.chatCalls[1].messages.at(-1).content;
+                };
+                const work = { script: 'python scripts/extract_form_field_info.py', args: ['report.pdf', 'fields.json'], files: ['/docs/report.pdf'] };
+
+                // It changes the person's files, so it waits for them; refused, nothing leaves this server.
+                await turn(work, 'no');
+                expect(runs).toHaveLength(0);
+                expect(uploads).toHaveLength(0);
+
+                // Allowed: the file is read with the person's own sign-in, sent to the runner in a signed request, and what
+                // the script made is saved beside it without overwriting anything.
+                const told = await turn(work, 'once');
+                expect(runs).toHaveLength(1);
+                expect(runs[0].url).toBe('https://runner.test/run');
+                expect(runs[0].job).toEqual({ skill: 'pdf', script: 'scripts/extract_form_field_info.py', args: ['report.pdf', 'fields.json'], files: [{ path: 'report.pdf', data: fsFiles['/docs/report.pdf'].bytes.toString('base64') }] });
+                expect(runs[0].headers['X-Runner-Signature']).toBe(crypto.createHmac('sha256', 'runner-secret').update(`${runs[0].headers['X-Runner-Timestamp']}.${runs[0].raw}`).digest('hex'));
+                expect(runs[0].raw).not.toContain('accessToken');
+                expect(uploads).toHaveLength(1);
+                expect(uploads[0]).toMatchObject({ folder: '/docs', paths: '["fields.json"]', conflict: 'rename', text: '{"a":1}' });
+                expect(uploads[0].cookie).toMatch(/accessToken=\S+/);
+                expect(told).toMatch(/^scripts\/extract_form_field_info\.py report\.pdf fields\.json finished with exit code 0\./);
+                expect(told).toMatch(/It printed:\nFound 2 fields/);
+                expect(told).toMatch(/Saved in \/docs: fields\.json\./);
+                const offered = state.chatCalls[0].tools.find((tool) => tool.function.name === 'pdf_script');
+                expect(offered.function.description).toMatch(/^Runs one of the pdf skill's own scripts/);
+                expect(Object.keys(offered.function.parameters.properties)).toEqual(['script', 'args', 'files', 'save_to']);
+
+                // A script that fails says so with what it printed; one the skill does not have, a file that is not
+                // there, and a runner that does not answer each say that nothing was run.
+                expect(await turn({ ...work, script: 'scripts/fails.py' }, 'once')).toMatch(/finished with exit code 2\.[\s\S]*Errors:\nbad input/);
+                expect(await turn({ script: 'scripts/missing.py' }, 'once')).toBe('Nothing was run. The skill pdf has no script scripts/missing.py');
+                expect(await turn({ ...work, files: ['/docs/nothing.pdf'] }, 'once')).toMatch(/^Nothing was run\. A file could not be read from the user's FilesystemOne: \/docs\/nothing\.pdf/);
+                expect(await turn({ script: 'scripts/slow.py' }, 'once')).toMatch(/^Nothing was run\. The skill runner could not be reached/);
+                // A script that makes a file with nowhere to put it says so.
+                expect(await turn({ script: 'scripts/extract_form_field_info.py' }, 'once')).toMatch(/It made fields\.json, but nothing was saved: call again with save_to/);
+
+                // Only the skill's own scripts run, so the skill still says what it lacks.
+                expect((await get('/skills')).data.skills.find((skill) => skill.id === 'anthropic-pdf').needs).toContain('commands');
+
+                // Without the runner's address and secret the function is not offered at all.
+                delete process.env.SKILL_RUNNER_SECRET;
+                state.toolPlan = [];
+                state.chatCalls = [];
+                await send(chat.id, { content: 'hello' });
+                expect((state.chatCalls[0].tools || []).some((tool) => tool.function.name === 'pdf_script')).toBe(false);
+            } finally {
+                setRunnerFetch(null);
+                setFilesFetch(fakeFilesystemOne);
+                delete process.env.SKILL_RUNNER_URL;
+                delete process.env.SKILL_RUNNER_SECRET;
+            }
         });
 
         test('what a model draws is checked by rule, and it is told why and given one chance to put it right', async () => {
