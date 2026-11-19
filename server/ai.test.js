@@ -3898,6 +3898,17 @@ describe('Chat endpoints', () => {
             expect(lacks('anthropic-docx')).toEqual(['commands']);
             expect(skills.filter((skill) => skill.source === 'medical' && skill.needs.includes('commands'))).toEqual([]);
 
+            // Every skill says what running it on a person's own computer takes, read from its own page: where it comes
+            // from, its author's install line, the programs its commands call, and whether it runs commands at all.
+            const setupOf = async (id) => (await get(`/skills/${id}`)).data.skill.setup;
+            expect(await setupOf('anthropic-xlsx')).toMatchObject({ repos: ['anthropics/skills'], runs: true, programs: expect.arrayContaining(['python', 'libreoffice']) });
+            expect((await setupOf('anthropic-pdf')).libraries).toEqual(expect.arrayContaining(['pdf2image']));
+            const prep = await setupOf('medical-board-exam-prep');
+            expect(prep).toMatchObject({ runs: false, install: ['npx skills add Open-Medica/open-medical-skills --skill board-exam-prep'], libraries: [] });
+            // The install line needs Node; it is not counted as a command the skill runs.
+            expect(prep.programs).toEqual(['node']);
+            for (const skill of SKILLS.filter((one) => one.source !== 'mollama')) expect((await setupOf(skill.id)).repos.length).toBeGreaterThan(0);
+
             // A chat holds only a few skills at once.
             expect(maxSkills).toBe(MAX_CHAT_SKILLS);
             const many = SKILLS.filter((skill) => skill.source === 'engineering').slice(0, MAX_CHAT_SKILLS + 4).map((skill) => skill.id);
