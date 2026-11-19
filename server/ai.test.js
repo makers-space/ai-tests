@@ -4237,6 +4237,21 @@ describe('Chat endpoints', () => {
             expect(state.chatCalls).toHaveLength(1);
             state.replyPlan = [];
 
+            // A wrong value alone is put right from the fault itself, which lists the values: no page is sent, because a
+            // small model given a whole page for one word copied the page's example in place of its own diagram.
+            const valued = await newChat({ model: 'qwen2.5-coder:7b' });
+            const slip = block('<Flow arrange="horizontal">\n<Node id="a" label="Intake" />\n</Flow>');
+            state.chatCalls.length = 0;
+            state.replyPlan = [slip, slip.replace('horizontal', 'lr')];
+            const fixed = await send(valued.id, { content: 'draw the stroke' });
+            expect(state.chatCalls).toHaveLength(2);
+            expect(state.chatCalls[1].messages.at(-1).content).toBe('The chat could not draw part of your reply as you meant it:\n- Flow: arrange="horizontal" is not a value it takes. arrange takes: lr, tb, grid, circle.\n\nWrite your whole reply again with only this put right, keeping everything else as you wrote it. Do not mention this correction.');
+            expect(fixed.events.at(-1).reply.content).toBe(slip.replace('horizontal', 'lr'));
+            expect(componentFaults(slip).valuesOnly).toBe(true);
+            expect(componentFaults(block('<Flow arrange="horizontal">\n<Node label="Intake" />\n</Flow>')).valuesOnly).toBe(false);
+            expect(componentFaults(good).valuesOnly).toBe(false);
+            state.replyPlan = [];
+
             // The rules themselves: what a page, a drawing or code holds is its own; inner tags must have what they need.
             expect(componentFaults(block('<Frame height="300px">\n<div><h1>Hi</h1></div>\n<script>const a = 1 < 2;</script>\n</Frame>')).faults).toEqual([]);
             expect(componentFaults(block('<Image alt="dot"><svg viewBox="0 0 1 1"><circle r="1" /></svg></Image>')).faults).toEqual([]);
@@ -4245,6 +4260,20 @@ describe('Chat endpoints', () => {
             expect(componentFaults('<Container layout="flex">\n<div>\n<h2>Parts</h2>\n</div>\n</Container>').faults.map((fault) => fault.split('.')[0])).toEqual(['"div" is not a component', '"h2" is not a component']);
             expect(componentFaults(block('<Model3D src="https://example.com/engine.glb" autoRotate />')).faults).toEqual([]);
             expect(componentFaults(block('<ProgressBar label="Done" />')).faults).toEqual(['ProgressBar needs the attribute "value".']);
+            // A value a component does not take is caught, and the fault names the values it does take, as its page lists them.
+            expect(componentFaults(block('<Flow arrange="horizontal" background="white">\n<Node id="a" label="A" color="blue" shape="rectangle" />\n<Node id="b" label="B" color="blue" />\n<Edge source="a" target="b" arrow="true" />\n</Flow>')).faults).toEqual([
+                'Flow: arrange="horizontal" is not a value it takes. arrange takes: lr, tb, grid, circle.',
+                'Flow: background="white" is not a value it takes. background takes: dots, lines, cross, none.',
+                'Node: color="blue" is not a value it takes. color takes: primary, secondary, tertiary, success, warning, error, neutral, surface, background.',
+                'Edge: arrow="true" is not a value it takes. arrow takes: filled, open, none.'
+            ]);
+            expect(componentFaults(block('<Flow arrange="tb" background="none" height="400">\n<Node id="a" label="A" color="success" shape="diamond" size="2xl" width="220" />\n<Edge source="a" target="a" type="step" arrow="open" dashed />\n</Flow>')).faults).toEqual([]);
+            expect(componentFaults(block('<Flow>\n<Node id="a" width="220px" />\n</Flow>')).faults).toEqual(['Node: width="220px" must be a number with no unit.']);
+            expect(componentFaults(block('<Card layout="grid" columns="auto" gap="md" padding="none" shadow bordered="true" backgroundColor="surface">\n<Typography size="4xl" weight="black" color="muted" as="h2">Hi</Typography>\n<Badge color="green">New</Badge>\n</Card>')).faults).toEqual(['Badge: color="green" is not a value it takes. color takes: default, primary, secondary, tertiary, success, warning, error.']);
+            // What a page describes in words is not checked, nor is a list the page leaves open.
+            expect(componentFaults(block('<Editor mode="code" language="brainfuck">+++</Editor>')).faults).toEqual([]);
+            expect(componentFaults(block('<Editor mode="slides">x</Editor>')).faults).toEqual(['Editor: mode="slides" is not a value it takes. mode takes: markdown, document, code.']);
+            expect(componentFaults(block('<Container layout="flex" width="50%" columns="3">\n<Button send="Go" size="xs" variant="ghost" width="120px">Go</Button>\n<Icon name="FiCheck" size="2xl" />\n</Container>')).faults).toEqual([]);
             // A block that holds program code or plain words, as some models write, is caught as well.
             expect(componentFaults(block('import { gear } from "kernel.js";\ngear({ teeth: 12 });')).faults).toEqual(['A component block holds only component tags, and one of yours holds something else. Program code goes in an ordinary code fence, and words go outside the block.']);
             expect(componentFaults(block('Here is the panel you asked for.')).faults).toHaveLength(1);
