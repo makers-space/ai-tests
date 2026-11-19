@@ -3248,6 +3248,8 @@ describe('Chat endpoints', () => {
         Video: ['src', 'title'],
         Audio: ['src', 'title'],
         PdfViewer: ['src'],
+        Slides: ['src', 'height'],
+        Sheet: ['src', 'height'],
         Model3D: ['src', 'format', 'fileName', 'autoRotate', 'height'],
         Editor: ['src', 'mode', 'language'],
         Input: ['label', 'placeholder', 'multiline', 'rows'],
