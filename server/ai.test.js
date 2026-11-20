@@ -3747,7 +3747,9 @@ describe('Chat endpoints', () => {
                 const sent = state.chatCalls[0].messages;
                 expect(sent[0]).toMatchObject({ role: 'system', content: expect.stringContaining(`Memory of the earlier part of this conversation (those messages are not repeated below):\n${state.memoryReply}`) });
                 expect(sent.filter((message) => message.role === 'user').map((message) => message.content.split(' ')[0])).toEqual(['2', '3', '4', '5']);
-                expect((await get(`/chats/${chat.id}`)).data.chat.memoryThrough).toBeGreaterThanOrEqual(2);
+                const shownChat = (await get(`/chats/${chat.id}`)).data.chat;
+                expect(shownChat.memoryThrough).toBeGreaterThanOrEqual(2);
+                expect(shownChat.memory).toBe(state.memoryReply);
                 expect((await get(`/chats/${chat.id}`)).data.chat.messages).toHaveLength(10);
 
                 // Editing a message the memory covers drops the memory.
