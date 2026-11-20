@@ -11,7 +11,7 @@ import {
     mapOllamaError, OllamaError, ERROR_CODES,
     parseNvidiaSmi, appleGpus, parseDisplayAdapters, detectHardware,
     fitModel, rankCatalogue, memoryNeededMb, VERDICTS,
-    GenerationQueue, extractText, estimateTokens, setFilesFetch, setRunnerFetch, setSandboxClient, MAX_ATTACHMENT_BYTES,
+    GenerationQueue, extractText, estimateTokens, setFilesFetch, setFilesWakeMs, setRunnerFetch, setSandboxClient, MAX_ATTACHMENT_BYTES,
     isPublicAddress, setRemoteTransport, MAX_REMOTE_BYTES, setSearchFetch,
     setToolConnector, ToolSignInError, TOOL_HEALTH, TOOL_CATALOGUE, TOOL_LOCAL_CATALOGUE, CLOUD_PROVIDERS, PROVIDER_HEALTH, setCloudFetch, ollamaOnlineNames, runsOnline, seal, unseal, deviceGateway, DeviceGateway, cloudTitle
 } from '../../server/middleware/ai.middleware.js';
@@ -2281,6 +2281,11 @@ describe('Chat endpoints', () => {
         const cookie = options.headers.Cookie || '';
         filesCalls.push({ url, method: options.method || 'GET', cookie, csrf: options.headers['X-CSRF-Token'], body: options.body });
         if (state.filesDown) throw new TypeError('fetch failed');
+        // A FilesystemOne still waking up answers 502 for a while.
+        if (state.filesWaking > 0) {
+            state.filesWaking -= 1;
+            return json(502, { message: 'Bad Gateway' });
+        }
         const address = new URL(url);
         if (address.pathname.endsWith('/directory/contents')) {
             const folder = address.searchParams.get('filePath');
@@ -4543,6 +4548,7 @@ describe('Chat endpoints', () => {
             const sent = [];
             const ended = [];
             let fault = null;
+            let madeList = 'out/summary.pdf\nnotes.txt\n';
             process.env.SANDBOX_API_KEY = 'rnd_test';
             process.env.SANDBOX_WORKSPACE_ID = 'tea-test';
             process.env.SANDBOX_SNAPSHOT = 'mollama-skills';
@@ -4556,7 +4562,7 @@ describe('Chat endpoints', () => {
                     lines.push(line);
                     if (fault === 'run' && line.includes('timeout')) throw new Error('stream lost');
                     const events = line.includes('timeout') ? [{ type: 'output', stream: 'stdout', data: 'made it\n' }, { type: 'exit', exit_code: 0 }]
-                        : line.startsWith('cd /root/work && find') ? [{ type: 'output', stream: 'stdout', data: 'out/summary.pdf\nnotes.txt\n' }, { type: 'exit', exit_code: 0 }]
+                        : line.startsWith('cd /root/work && find') ? [{ type: 'output', stream: 'stdout', data: madeList }, { type: 'exit', exit_code: 0 }]
                             : [{ type: 'exit', exit_code: 0 }];
                     return (async function* () { yield* events; })();
                 },
@@ -4623,6 +4629,27 @@ describe('Chat endpoints', () => {
                 expect(looked.some((event) => event.type === 'permission')).toBe(false);
                 expect(state.chatCalls[1].messages.at(-1).content).toMatch(/^The bash program finished with exit code 0\.[\s\S]*nothing was saved: call again with save_to/);
                 expect(uploads).toHaveLength(before);
+
+                // Pictures named in look come back to a model that can see, as images on the result, and are not saved;
+                // one that was not made is said to be missing.
+                madeList = 'shots/front.png\nfigure.html\n';
+                state.vision = true;
+                state.toolPlan = [[['run_program', { language: 'bash', code: 'chromium --headless --screenshot=shots/front.png figure.html', look: ['shots/front.png', 'shots/side.png'] }]]];
+                state.chatCalls = [];
+                await send(chat.id, { content: 'build it and look' });
+                const seenResult = state.chatCalls[1].messages.at(-1);
+                expect(seenResult.images).toEqual([Buffer.from('content of /root/work/shots/front.png').toString('base64')]);
+                expect(seenResult.content).toMatch(/The pictures you asked to see are attached: shots\/front\.png\. Not attached \(not made[^)]*\): shots\/side\.png\./);
+                expect(uploads).toHaveLength(before);
+
+                // A model that cannot see is told the pictures were not sent.
+                state.vision = false;
+                state.toolPlan = [[['run_program', { language: 'bash', code: 'chromium --headless --screenshot=shots/front.png figure.html', look: ['shots/front.png'] }]]];
+                state.chatCalls = [];
+                await send(chat.id, { content: 'look again' });
+                expect(state.chatCalls[1].messages.at(-1).images).toBeUndefined();
+                expect(state.chatCalls[1].messages.at(-1).content).toMatch(/This model cannot see pictures, so they were not sent\.$/);
+                madeList = 'out/summary.pdf\nnotes.txt\n';
 
                 // With sandboxes set up, a skill whose files are in the snapshot lacks nothing.
                 const lacks = async (id) => (await get('/skills')).data.skills.find((skill) => skill.id === id).needs;
@@ -5049,13 +5076,30 @@ describe('Chat endpoints', () => {
             expect(response.data).toMatchObject({ code: 'FILE_TOO_LARGE' });
         }, 30000);
 
+        test('a FilesystemOne that is waking up is asked again until it answers', async () => {
+            setFilesWakeMs(5000, 10);
+            try {
+                state.filesWaking = 2;
+                const response = await get('/files/browse?path=/');
+                expect(response.status).toBe(200);
+                expect(response.data.entries.length).toBeGreaterThan(0);
+                expect(state.filesWaking).toBe(0);
+            } finally {
+                setFilesWakeMs();
+                state.filesWaking = 0;
+            }
+        });
+
         test('FilesystemOne being down gives a plain message and chat still works', async () => {
             state.filesDown = true;
+            setFilesWakeMs(0);
             for (const response of [await get('/files/browse?path=/'), await get('/files/text?path=/docs/brief.md')]) {
                 expect(response.status).toBe(503);
                 expect(response.data).toMatchObject({ code: 'FILES_DOWN' });
-                expect(response.data.action).toMatch(/FilesystemOne/);
+                expect(response.data.message).toMatch(/FilesystemOne may still be starting up/);
+                expect(response.data.action).toMatch(/Try again in a minute/);
             }
+            setFilesWakeMs();
             const chat = await newChat({ model: 'qwen2.5-coder:7b' });
             expect((await send(chat.id, { content: 'still here?' })).response.status).toBe(200);
         });
@@ -6223,6 +6267,25 @@ describe('Online model providers', () => {
             if (key !== 'good-key-0000') return json({ type: 'error', error: { type: 'authentication_error', message: 'invalid x-api-key' } }, 401);
             if (url.pathname === '/v1/models') return json({ data: [{ type: 'model', id: 'claude-large', display_name: 'Claude Large', max_input_tokens: 1000000, max_tokens: 128000, capabilities: { image_input: { supported: true } } }], has_more: false, first_id: 'claude-large', last_id: 'claude-large' });
             if (url.pathname === '/v1/messages') {
+                // "Work it out" makes Claude stream a calculator call in pieces; "cut" stops it at the length limit mid-call.
+                const last = body.messages.at(-1);
+                const wanted = typeof last?.content === 'string' && last.content.includes('Work it out');
+                if (body.tools && wanted) {
+                    const cut = last.content.includes('cut');
+                    const calling = [
+                        ['message_start', { type: 'message_start', message: { id: 'msg_2', type: 'message', role: 'assistant', model: body.model, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 30, output_tokens: 1 } } }],
+                        ['content_block_start', { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } }],
+                        ['content_block_delta', { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'Let me work it out. ' } }],
+                        ['content_block_stop', { type: 'content_block_stop', index: 0 }],
+                        ['content_block_start', { type: 'content_block_start', index: 1, content_block: { type: 'tool_use', id: 'toolu_a', name: 'calculator', input: {} } }],
+                        ['content_block_delta', { type: 'content_block_delta', index: 1, delta: { type: 'input_json_delta', partial_json: '{"expres' } }],
+                        ['content_block_delta', { type: 'content_block_delta', index: 1, delta: { type: 'input_json_delta', partial_json: 'sion":"6 * 7"}' } }],
+                        ['content_block_stop', { type: 'content_block_stop', index: 1 }],
+                        ['message_delta', { type: 'message_delta', delta: { stop_reason: cut ? 'max_tokens' : 'tool_use', stop_sequence: null }, usage: { output_tokens: 20 } }],
+                        ['message_stop', { type: 'message_stop' }]
+                    ];
+                    return new Response(calling.map(([name, data]) => `event: ${name}\ndata: ${JSON.stringify(data)}\n\n`).join(''), { status: 200, headers: { 'Content-Type': 'text/event-stream' } });
+                }
                 const events = [
                     ['message_start', { type: 'message_start', message: { id: 'msg_1', type: 'message', role: 'assistant', model: body.model, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 30, output_tokens: 1 } } }],
                     ['content_block_start', { type: 'content_block_start', index: 0, content_block: { type: 'thinking', thinking: '', signature: '' } }],
@@ -6443,6 +6506,34 @@ describe('Online model providers', () => {
         expect((await add('anthropic', 'bad-key-0000')).status).toBe(409);
         await Provider.deleteMany({});
         expect((await add('anthropic', 'bad-key-0000')).data.provider.health.state).toBe('refused');
+    });
+
+    test('a call Claude is writing is shown as it streams, and a call cut off by the length limit is never run', async () => {
+        const { provider } = (await add('anthropic')).data;
+        const made = await client.post('/api/v1/chats', { model: 'claude-large', device: provider.id }, any);
+        const say = async (content) => {
+            const sent = await client.client.post(`/api/v1/chats/${made.data.chat.id}/messages`, { content }, { responseType: 'text', validateStatus: () => true });
+            return String(sent.data).trim().split('\n').map((line) => JSON.parse(line));
+        };
+        asked.length = 0;
+        const events = await say('Work it out: 6 * 7');
+        // Every tool is sent with eager input streaming, and the call's input reaches the page piece by piece.
+        const first = asked.find((one) => one.path === '/v1/messages');
+        expect(first.body.tools.length).toBeGreaterThan(0);
+        expect(first.body.tools.every((tool) => tool.eager_input_streaming === true)).toBe(true);
+        expect(events.filter((event) => event.type === 'draft').map((event) => event.text)).toEqual(['{"expres', 'sion":"6 * 7"}']);
+        expect(events.find((event) => event.type === 'tool')).toMatchObject({ tool: 'Calculator' });
+        const second = asked.filter((one) => one.path === '/v1/messages')[1];
+        expect(JSON.stringify(second.body.messages.at(-1))).toContain('42');
+
+        // Cut off at the length limit, the half-written call is not run; the model is asked to go on instead.
+        asked.length = 0;
+        const cut = await say('Work it out, but this one gets cut');
+        expect(cut.some((event) => event.type === 'tool')).toBe(false);
+        // First it is given more room and asked again, which is cut the same way; then it is asked to go on.
+        const calls = asked.filter((one) => one.path === '/v1/messages');
+        expect(calls).toHaveLength(3);
+        expect(JSON.stringify(calls[2].body.messages.at(-1))).toContain('Go on from exactly where you stopped');
     });
 
     test('a key that stops working mid-use ends the reply with a plain reason', async () => {
