@@ -4848,6 +4848,11 @@ describe('Chat endpoints', () => {
                 expect(await turn({ script: 'scripts/slow.py' }, 'once')).toMatch(/^Nothing was run\. The skill runner could not be reached/);
                 // A script that makes a file with nowhere to put it says so.
                 expect(await turn({ script: 'scripts/extract_form_field_info.py' }, 'once')).toMatch(/It made fields\.json, but nothing was saved: call again with save_to/);
+                // A folder the model names goes inside the person's own folder; the folder of a file it was given stays.
+                expect(await turn({ ...work, save_to: '/Gearbox' }, 'once')).toMatch(/Saved in \/[a-z0-9]+\/Gearbox: fields\.json\./);
+                expect(uploads.at(-1).folder).toMatch(/^\/[a-z0-9]+\/Gearbox$/);
+                await turn({ ...work, save_to: '/docs' }, 'once');
+                expect(uploads.at(-1).folder).toBe('/docs');
 
                 // Only the skill's own scripts run, so the skill still says what it lacks.
                 expect((await get('/skills')).data.skills.find((skill) => skill.id === 'anthropic-pdf').needs).toContain('commands');
@@ -5175,9 +5180,23 @@ describe('Chat endpoints', () => {
                 expect(waiting).toBeTruthy();
                 expect((await post(`/chats/${chat.id}/permission`, { id: waiting.id, answer: 'once' })).status).toBe(200);
                 const { events } = await pending;
-                expect(events.find((event) => event.type === 'tool')).toMatchObject({ tool: 'Save to files', input: '/docs/found.png' });
-                expect(uploads.at(-1)).toMatchObject({ folder: '/docs', paths: '["found.png"]' });
-                expect(state.chatCalls[1].messages.at(-1).content).toMatch(/^Saved the file from https:\/\/models\.example\/found\.png to \/docs\/found\.png\./);
+                // A folder a model names goes inside the person's own folder, where they can see it, and the model is
+                // told the full path.
+                const home = uploads.at(-1).folder.replace(/\/docs$/, '');
+                expect(home).toMatch(/^\/[a-z0-9]+$/);
+                expect(events.find((event) => event.type === 'tool')).toMatchObject({ tool: 'Save to files', input: `${home}/docs/found.png` });
+                expect(uploads.at(-1)).toMatchObject({ folder: `${home}/docs`, paths: '["found.png"]' });
+                expect(state.chatCalls[1].messages.at(-1).content).toContain(`to ${home}/docs/found.png.`);
+
+                // A folder already in their home, or one climbing out of it, stays inside it.
+                for (const [folder, where] of [[`${home}/Gearbox/`, `${home}/Gearbox`], ['/../Gearbox', `${home}/Gearbox`], ['/', home]]) {
+                    state.toolPlan = [[['save_to_files', { folder, name: 'found.png', address: 'https://models.example/found.png' }]]];
+                    const again = send(chat.id, { content: 'save it again' });
+                    for (let tries = 0; tries < 200 && !waitingPermissions().some((one) => one.chatId === chat.id); tries += 1) await wait(25);
+                    await post(`/chats/${chat.id}/permission`, { id: waitingPermissions().find((one) => one.chatId === chat.id).id, answer: 'once' });
+                    await again;
+                    expect(uploads.at(-1).folder).toBe(where);
+                }
             } finally {
                 setRemoteTransport(before);
                 setFilesFetch(fakeFilesystemOne);
