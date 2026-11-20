@@ -4180,7 +4180,7 @@ describe('Chat endpoints', () => {
             // With every skill opened there is nothing left to list, so the function is gone.
             state.chatCalls.length = 0;
             await send(chat.id, { content: 'thanks' });
-            expect(state.chatCalls[0].tools).toBeUndefined();
+            expect((state.chatCalls[0].tools || []).some((tool) => tool.function.name === 'open_skill')).toBe(false);
             expect(state.chatCalls[0].messages[0].content).toContain(grill.text);
         });
 
@@ -4239,7 +4239,11 @@ describe('Chat endpoints', () => {
             expect(paths).toEqual(['bench.html', 'build.mjs', 'concepts.md', 'examples/riffle.js', 'examples/terrain.js', 'kernel.js', 'look.md', 'look.mjs', 'read.mjs', 'rules.md', 'source.md', 'validate.mjs']);
             // The kit is its project's own, unchanged: the engine carries the mark its authors put on it.
             expect(onDisk('kernel.js')).toMatch(/^\/\* hairline kernel sha256:[0-9a-f]{64} \*\//);
-            expect(SKILLS.filter((skill) => (skill.files || []).length > 0).map((skill) => skill.id)).toEqual(['skill-map', 'anatomy-anatomy', 'hairline-hairline-create', 'richmd-rich-md-first', 'explainer-visual-explainer']);
+            // Each skill that ships files has them beside its page, and every file it lists is there to read.
+            const withFiles = SKILLS.filter((skill) => (skill.files || []).length > 0);
+            expect(withFiles.map((skill) => skill.id)).toEqual(expect.arrayContaining(['skill-map', 'anatomy-anatomy', 'hairline-hairline-create', 'richmd-rich-md-first', 'explainer-visual-explainer', 'marketing-cold-email', 'engineering-tdd', 'anthropic-internal-comms', 'dex-dhh-rails-style']));
+            expect(withFiles.length).toBeGreaterThan(140);
+            for (const skill of withFiles) for (const file of skill.files) expect(fs.existsSync(`${skill.folder}/${file.path}`)).toBe(true);
 
             // The page that shows a figure asks for the files by path.
             expect((await get('/skills')).data.skills.find((skill) => skill.id === hairline.id).files).toEqual(paths);
@@ -4278,7 +4282,8 @@ describe('Chat endpoints', () => {
 
             // A chat whose skills have no files is not offered the function, and neither is a model that cannot use tools.
             state.chatCalls.length = 0;
-            const plain = await newChat({ model: 'qwen2.5-coder:7b', skills: ['components', 'engineering-grilling'] });
+            const bare = SKILLS.find((skill) => skill.source !== 'mollama' && !(skill.files || []).length);
+            const plain = await newChat({ model: 'qwen2.5-coder:7b', skills: ['components', bare.id] });
             await send(plain.id, { content: 'hello' });
             expect(state.chatCalls[0].tools.some((tool) => tool.function.name === 'open_skill_file')).toBe(false);
 
