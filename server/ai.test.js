@@ -18,9 +18,11 @@ import {
 import { Device, Setting, Download, PersonalModel, Chat, Prompt, Guide, GUIDE_STEPS, MANAGER_GUIDE_STEPS, deviceSchemas, modelSchemas, chatSchemas, promptSchemas, ToolServer, TOOL_HEALTH_STATES, toolSchemas, Provider, PROVIDER_HEALTH_STATES, providerSchemas, Skill } from '../../server/models/ai.model.js';
 import { downloads, health, queue, SKILLS, DEFAULT_LIBRARY_SKILLS, COMPONENT_PAGES, COMPONENT_VALUES_PAGE, componentFaults, rankSkills, writtenToolCalls, BUILTIN_TOOLS, waitingPermissions, todayLine, SKILL_SOURCES, MAX_CHAT_SKILLS, SUGGESTED_SKILLS } from '../../server/controllers/ai.controller.js';
 
-// What a chat is sent when only the default skill is on: the Components skill, today's date, and that skill's reminder.
+// What a chat is sent when only the default skills are on: the Components skill, the skill map, today's date, and
+// their reminders.
 const COMPONENT_GUIDE = SKILLS.find((skill) => skill.id === 'components').text;
-const CLOSING_GUIDE = `REMEMBER\n${SKILLS.find((skill) => skill.id === 'components').remember}`;
+const SKILL_MAP = SKILLS.find((skill) => skill.id === 'skill-map').text;
+const CLOSING_GUIDE = `REMEMBER\n${SKILLS.filter((skill) => skill.source === 'mollama' && skill.default).map((skill) => skill.remember).filter(Boolean).join('\n')}`;
 
 const MB = 1024 * 1024;
 
@@ -788,6 +790,10 @@ const fakeOllama = (host, signal) => ({
                 state.valuesSeen += 1;
                 own = own.slice(COMPONENT_VALUES_PAGE.length).replace(/^\n\n/, '');
             }
+            if (own.startsWith(SKILL_MAP)) {
+                state.mapsSeen = (state.mapsSeen || 0) + 1;
+                own = own.slice(SKILL_MAP.length).replace(/^\n\n/, '');
+            }
             if (own.endsWith(CLOSING_GUIDE)) own = own.slice(0, own.length - CLOSING_GUIDE.length).replace(/\n\n$/, '');
             own = own.split('\n\n').filter((part) => part !== todayLine()).join('\n\n');
             request = { ...request, messages: own ? [{ role: 'system', content: own }, ...request.messages.slice(1)] : request.messages.slice(1) };
@@ -799,8 +805,10 @@ const fakeOllama = (host, signal) => ({
         (state.toolsSeen ||= []).push(offered);
         // A skill that is on by default for models that can use tools is listed in every such chat; a list of nothing
         // but those is taken off too.
+        // The skill map's worked examples are offered with every chat too, as files of a skill that is always on.
         const everyChat = (tool) => EVERY_CHAT_TOOLS.includes(tool.function?.name)
-            || (tool.function?.name === 'open_skill' && tool.function.parameters.properties.skill.enum.every((name) => DEFAULT_SKILL_NAMES.includes(name)));
+            || (tool.function?.name === 'open_skill' && tool.function.parameters.properties.skill.enum.every((name) => DEFAULT_SKILL_NAMES.includes(name)))
+            || (tool.function?.name === 'open_skill_file' && tool.function.parameters.properties.skill.enum.every((id) => id === 'skill-map'));
         if (offered?.some(everyChat)) {
             const rest = offered.filter((tool) => !everyChat(tool));
             request = { ...request, tools: rest.length > 0 ? rest : undefined };
@@ -2577,7 +2585,7 @@ describe('Chat endpoints', () => {
             const answers = state.chatCalls[1].messages.filter((message) => message.role === 'tool');
             expect(answers[0].content).toBe(COMPONENT_PAGES.find((page) => page.name === 'Badge').text);
             expect(answers[1].content).toMatch(/4/);
-            expect(answers[2].content).toMatch(/^There is no function called fly_to_the_moon\. The functions you can call are: open_component, open_skill, find_skill, ask_user, date_time, calculator, read_web_page\.$/);
+            expect(answers[2].content).toMatch(/^There is no function called fly_to_the_moon\. The functions you can call are: open_component, open_skill_file, open_skill, find_skill, ask_user, date_time, calculator, read_web_page\.$/);
             expect(list.at(-1).reply.steps.map(({ tool, failed }) => ({ tool, failed: failed || null }))).toEqual([{ tool: 'Component', failed: null }, { tool: 'Calculator', failed: null }, { tool: 'fly_to_the_moon', failed: 'failed' }]);
             state.toolPlan = [];
         });
@@ -2635,7 +2643,7 @@ describe('Chat endpoints', () => {
         test('warns as the conversation nears the limit', async () => {
             state.contextLength = 8192;
             const chat = await newChat({ model: 'qwen2.5-coder:7b' });
-            const { events: list } = await send(chat.id, { content: 'word '.repeat(Math.floor(((8192 - 1024 - 300 - estimateTokens(COMPONENT_GUIDE)) * 4) / 5)) });
+            const { events: list } = await send(chat.id, { content: 'word '.repeat(Math.floor(((8192 - 1024 - 300 - estimateTokens(COMPONENT_GUIDE) - estimateTokens(SKILL_MAP)) * 4) / 5)) });
             expect(list[list.length - 1].context).toMatchObject({ capacityTokens: 8192, warn: true });
             expect(state.chatCalls[0].options.num_ctx).toBe(8192);
         });
@@ -2945,14 +2953,34 @@ describe('Chat endpoints', () => {
             }
         });
 
-        test('a reply cut short for want of room is tried again with more, and when there is no more the person is told', async () => {
-            // A model that thinks is given room for its thinking as well as its answer.
+        test('the skill map is sent with every chat, and its worked examples are opened one at a time', async () => {
+            const map = SKILLS.find((skill) => skill.id === 'skill-map');
+            expect(map).toMatchObject({ source: 'mollama', default: true });
+            expect(map.files.map((file) => file.path)).toEqual(['examples/combining.md', 'examples/comparison.md', 'examples/concept.md', 'examples/machine.md', 'examples/plain.md', 'examples/process.md']);
+            // Every example the map names is one of its files, and every component an example draws can be drawn.
+            for (const file of map.files) {
+                expect(map.text).toContain(file.path);
+                expect(componentFaults(fs.readFileSync(`${map.folder}/${file.path}`, 'utf8')).faults).toEqual([]);
+            }
+            state.mapsSeen = 0;
+            state.toolPlan = [[['open_skill_file', { skill: 'skill-map', file: 'examples/machine.md' }]]];
+            state.chatReply = 'Here is how it is built.';
+            const chat = await newChat({ model: 'qwen2.5-coder:7b' });
+            await send(chat.id, { content: 'how is an electric bike built?' });
+            expect(state.mapsSeen).toBeGreaterThan(0);
+            expect(state.toolsSeen[0].find((tool) => tool.function.name === 'open_skill_file').function.parameters.properties.skill.enum).toEqual(['skill-map']);
+            expect(state.chatCalls[1].messages.at(-1)).toMatchObject({ role: 'tool', content: expect.stringMatching(/^EXAMPLE: HOW A MACHINE IS BUILT/) });
+            state.toolPlan = [];
+        });
+
+        test('a reply cut short for want of room is tried again with more, then carried on until it is finished', async () => {
+            // Nothing caps how much a model writes unless the person set a limit for the chat.
             const chat = await newChat({ model: 'qwen2.5-coder:7b' });
             state.chatCalls.length = 0;
             await send(chat.id, { content: 'hello' });
             const usual = state.chatCalls[0].options.num_ctx;
             expect(usual).toBeGreaterThanOrEqual(8192);
-            expect(state.chatCalls[0].options.num_predict).toBe(usual);
+            expect(state.chatCalls[0].options.num_predict).toBe(-1);
 
             // Cut once: the same question is asked again with the next size up, and only the full answer is kept.
             state.chatCalls.length = 0;
@@ -2966,18 +2994,21 @@ describe('Chat endpoints', () => {
             expect(list.at(-1).reply.error).toBeNull();
             expect(list.filter((event) => event.type === 'note').map((event) => event.text)).toEqual(['Giving the model more room and trying again…', '']);
 
-            // Cut again with nothing more to give: what there is, is kept, and the person is told it is incomplete.
+            // Cut again with nothing more to give: the model is asked to go on from where it stopped, as often as it
+            // takes, and the pieces make one reply.
             state.chatCalls.length = 0;
-            state.endings = ['length', 'length'];
-            state.replyPlan = ['Half an', 'Half an answer'];
-            const cut = await send(chat.id, { content: 'another long one' });
-            expect(state.chatCalls).toHaveLength(2);
-            expect(cut.events.at(-1)).toMatchObject({ type: 'error', code: 'REPLY_CUT', message: 'The model ran out of room before it finished, so this reply is incomplete.' });
-            expect(cut.events.at(-1).reply.content).toBe('Half an answer');
-            const saved = (await get(`/chats/${chat.id}`)).data.chat.messages.at(-1);
-            expect(saved).toMatchObject({ role: 'assistant', content: 'Half an answer', error: { code: 'REPLY_CUT' } });
+            state.endings = ['length', 'length', 'length', 'stop'];
+            state.replyPlan = ['Half an', 'Half an answer,', 'then more,', 'and the end.'];
+            const carried = await send(chat.id, { content: 'another long one' });
+            expect(state.chatCalls).toHaveLength(4);
+            expect(state.chatCalls[2].messages.at(-1)).toMatchObject({ role: 'user', content: expect.stringContaining('Go on from exactly where you stopped') });
+            expect(state.chatCalls[2].messages.at(-2)).toMatchObject({ role: 'assistant', content: 'Half an answer,' });
+            expect(carried.events.at(-1)).toMatchObject({ type: 'done' });
+            expect(carried.events.at(-1).reply.content).toBe('Half an answer,then more,and the end.');
+            expect(carried.events.at(-1).reply.error).toBeNull();
+            expect((await get(`/chats/${chat.id}`)).data.chat.messages.at(-1)).toMatchObject({ role: 'assistant', content: 'Half an answer,then more,and the end.' });
 
-            // Even a reply that got no further than thinking is kept and explained, not dropped.
+            // A reply that got no further than thinking is kept and explained, not dropped.
             state.chatCalls.length = 0;
             state.endings = ['length', 'length'];
             state.replyPlan = ['', ''];
@@ -3716,13 +3747,13 @@ describe('Chat endpoints', () => {
                 state.toolsSeen = [];
                 const chat = await newChat({ model: 'qwen2.5-coder:7b' });
                 await send(chat.id, { content: 'find a duck model' });
-                expect(state.toolsSeen[0].map((tool) => tool.function.name)).toEqual(['web_search', 'web_fetch', 'open_component', 'open_skill', 'find_skill', 'ask_user', 'date_time', 'calculator']);
+                expect(state.toolsSeen[0].map((tool) => tool.function.name)).toEqual(['web_search', 'web_fetch', 'open_component', 'open_skill_file', 'open_skill', 'find_skill', 'ask_user', 'date_time', 'calculator']);
 
                 // Switched off for the chat, the search tools go and the built-in reader is back.
                 state.toolsSeen = [];
                 const quiet = await newChat({ model: 'qwen2.5-coder:7b', webSearch: false });
                 await send(quiet.id, { content: 'find a duck model' });
-                expect(state.toolsSeen[0].map((tool) => tool.function.name)).toEqual(['open_component', 'open_skill', 'find_skill', 'ask_user', 'date_time', 'calculator', 'read_web_page']);
+                expect(state.toolsSeen[0].map((tool) => tool.function.name)).toEqual(['open_component', 'open_skill_file', 'open_skill', 'find_skill', 'ask_user', 'date_time', 'calculator', 'read_web_page']);
             });
         });
 
@@ -3814,15 +3845,15 @@ describe('Chat endpoints', () => {
                 state.chatReply = 'Here is the duck.';
                 const chat = await newChat({ model: 'qwen2.5-coder:7b' });
                 const { events: list } = await send(chat.id, { content: 'find a duck model' });
-                expect(state.searches).toEqual(['duck 3d model', 'second', 'third', 'fourth']);
+                expect(state.searches).toEqual(['duck 3d model', 'second', 'third', 'fourth', 'fifth']);
                 expect(state.fetches).toEqual(['https://models.example/duck']);
                 expect(list.filter((event) => event.type === 'replace')).toEqual([{ type: 'replace', text: '' }, { type: 'replace', text: '' }]);
                 const done = list[list.length - 1];
                 expect(done.reply.content).toBe('Here is the duck.');
-                expect(done.reply.steps).toHaveLength(5);
+                expect(done.reply.steps).toHaveLength(6);
                 const second = state.chatCalls[1].messages;
-                expect(second.find((message) => message.tool_calls).tool_calls).toHaveLength(4);
-                expect(second.filter((message) => message.role === 'tool')).toHaveLength(4);
+                expect(second.find((message) => message.tool_calls).tool_calls).toHaveLength(5);
+                expect(second.filter((message) => message.role === 'tool')).toHaveLength(5);
             });
         });
 
@@ -3929,8 +3960,8 @@ describe('Chat endpoints', () => {
                 expect(skill.credit).toMatch(/\((MIT|Apache-2\.0|MIT, Apache-2\.0)\)$/);
                 expect(skill.text.startsWith(`SKILL: ${skill.name}`)).toBe(true);
             }
-            // The five skills Mollama wrote itself are gone; the one that draws its viewers stays.
-            expect(skills.filter((skill) => skill.source === 'mollama').map((skill) => skill.id)).toEqual(['components']);
+            // Mollama's own skills: the one that draws its viewers and the map of what each skill is for.
+            expect(skills.filter((skill) => skill.source === 'mollama').map((skill) => skill.id)).toEqual(['components', 'skill-map']);
             expect(sources.map((source) => source.id)).toEqual(['mollama', 'anthropic', 'engineering', 'marketing', 'medical', 'dex', 'context7', 'search', 'last30days', 'anatomy', 'hairline', 'taste', 'richmd', 'explainer']);
             expect(sources.reduce((sum, source) => sum + source.count, 0)).toBe(skills.length);
             expect(skills.every((skill) => skill.tokens > 0)).toBe(true);
@@ -3947,7 +3978,7 @@ describe('Chat endpoints', () => {
             expect(lacks('medical-board-exam-prep')).toEqual([]);
             expect(lacks('anthropic-claude-api')).not.toContain('commands');
             expect(lacks('hairline-hairline-create')).toEqual([]);
-            expect(lacks('anatomy-anatomy')).toEqual(['commands', 'files']);
+            expect(lacks('anatomy-anatomy')).toEqual(['commands']);
             expect(lacks('anthropic-docx')).toEqual(['commands']);
             expect(skills.filter((skill) => skill.source === 'medical' && skill.needs.includes('commands'))).toEqual([]);
 
@@ -4080,7 +4111,7 @@ describe('Chat endpoints', () => {
             const listed = (await get('/skills')).data.skills;
             expect(listed.map((skill) => skill.id)).toEqual(SKILLS.map((skill) => skill.id));
             expect(listed.find((skill) => skill.id === 'components')).toMatchObject({ default: true });
-            expect(listed.filter((skill) => skill.default).map((skill) => [skill.id, skill.default])).toEqual([['components', true], ['richmd-rich-md-first', 'tools'], ['explainer-visual-explainer', 'tools']]);
+            expect(listed.filter((skill) => skill.default).map((skill) => [skill.id, skill.default])).toEqual([['components', true], ['skill-map', true], ['richmd-rich-md-first', 'tools'], ['explainer-visual-explainer', 'tools']]);
             expect(listed.find((skill) => skill.id === 'marketing-copywriting')).toMatchObject({ name: 'Copywriting', source: 'marketing', credit: 'coreyhaines31/marketingskills (MIT)', default: false });
             expect(listed[0].text).toBeUndefined();
 
@@ -4099,7 +4130,7 @@ describe('Chat endpoints', () => {
             const none = (await client.patch(`/api/v1/chats/${chat.id}`, { skills: [] })).data.chat;
             expect(none.skills).toEqual([]);
             const back = (await client.patch(`/api/v1/chats/${chat.id}`, { skills: null })).data.chat;
-            expect(back.skills).toEqual(['components', 'richmd-rich-md-first', 'explainer-visual-explainer']);
+            expect(back.skills).toEqual(['components', 'skill-map', 'richmd-rich-md-first', 'explainer-visual-explainer']);
             expect((await client.patch(`/api/v1/chats/${chat.id}`, { skills: ['Bad Id'] })).status).toBe(400);
         });
 
@@ -4161,7 +4192,7 @@ describe('Chat endpoints', () => {
             const { events: list } = await send(chat.id, { content: 'write a cold email' });
 
             const finder = state.toolsSeen[0].find((tool) => tool.function.name === 'find_skill');
-            expect(finder.function.description).toContain(`Search the library of ${SKILLS.length - 3} skills`);
+            expect(finder.function.description).toContain(`Search the library of ${SKILLS.length - 4} skills`);
             expect(finder.function.description).toMatch(/You cannot turn a skill on yourself: when one would help, tell the user its name/);
             const answers = state.chatCalls[1].messages.filter((message) => message.role === 'tool');
             const cold = SKILLS.find((skill) => skill.id === 'marketing-cold-email');
@@ -4172,7 +4203,7 @@ describe('Chat endpoints', () => {
             expect(answers[1].content).toBe('No skill in the library matches. Answer without one.');
             expect(list.at(-1).reply.steps.map(({ tool, input }) => ({ tool, input }))).toEqual([{ tool: 'Skill library', input: 'cold email' }, { tool: 'Skill library', input: 'zzzz' }]);
             // Looking is all it does: the chat's skills are unchanged.
-            expect((await get(`/chats/${chat.id}`)).data.chat.skills).toEqual(['components', 'richmd-rich-md-first', 'explainer-visual-explainer']);
+            expect((await get(`/chats/${chat.id}`)).data.chat.skills).toEqual(['components', 'skill-map', 'richmd-rich-md-first', 'explainer-visual-explainer']);
 
             // A skill that is already on is not offered again by the search.
             state.toolsSeen = [];
@@ -4208,7 +4239,7 @@ describe('Chat endpoints', () => {
             expect(paths).toEqual(['bench.html', 'build.mjs', 'concepts.md', 'examples/riffle.js', 'examples/terrain.js', 'kernel.js', 'look.md', 'look.mjs', 'read.mjs', 'rules.md', 'source.md', 'validate.mjs']);
             // The kit is its project's own, unchanged: the engine carries the mark its authors put on it.
             expect(onDisk('kernel.js')).toMatch(/^\/\* hairline kernel sha256:[0-9a-f]{64} \*\//);
-            expect(SKILLS.filter((skill) => (skill.files || []).length > 0).map((skill) => skill.id)).toEqual(['hairline-hairline-create', 'richmd-rich-md-first', 'explainer-visual-explainer']);
+            expect(SKILLS.filter((skill) => (skill.files || []).length > 0).map((skill) => skill.id)).toEqual(['skill-map', 'anatomy-anatomy', 'hairline-hairline-create', 'richmd-rich-md-first', 'explainer-visual-explainer']);
 
             // The page that shows a figure asks for the files by path.
             expect((await get('/skills')).data.skills.find((skill) => skill.id === hairline.id).files).toEqual(paths);
@@ -4492,7 +4523,7 @@ describe('Chat endpoints', () => {
                 state.chatCalls = [];
                 await send(chat.id, { content: 'hello' });
                 expect((state.chatCalls[0].tools || []).some((tool) => tool.function.name === 'run_program')).toBe(false);
-                expect(await lacks('anatomy-anatomy')).toEqual(['commands', 'files']);
+                expect(await lacks('anatomy-anatomy')).toEqual(['commands']);
             } finally {
                 setSandboxClient(null);
                 setFilesFetch(fakeFilesystemOne);
@@ -4784,15 +4815,25 @@ describe('Chat endpoints', () => {
             expect(componentFaults(block('\n  <Badge>Done</Badge>')).faults).toEqual([]);
         });
 
-        test('stops offering tools after ten rounds so a reply always ends', async () => {
+        test('a reply may use as many tools as it needs, and a call repeated with the same input is not run again', async () => {
             await withKey(async () => {
-                state.toolPlan = Array.from({ length: 14 }, () => [search]);
+                // Fourteen rounds, the last with six calls at once: every one runs and tools stay on offer throughout.
+                state.toolPlan = [...Array.from({ length: 13 }, (_, index) => [['web_search', { query: `duck model ${index}` }]]), Array.from({ length: 6 }, (_, index) => ['web_search', { query: `goose model ${index}` }])];
                 const chat = await newChat({ model: 'qwen2.5-coder:7b' });
                 const { events: list } = await send(chat.id, { content: 'find a duck model' });
-                expect(state.searches).toHaveLength(10);
-                expect(state.chatCalls).toHaveLength(11);
-                expect(state.chatCalls[10].tools).toBeUndefined();
-                expect(list[list.length - 1].type).toBe('done');
+                expect(state.searches).toHaveLength(19);
+                expect(state.chatCalls).toHaveLength(15);
+                expect(state.chatCalls.every((call) => Array.isArray(call.tools))).toBe(true);
+                expect(list.at(-1).type).toBe('done');
+
+                // The same search twice: the second is answered from the first, with a note to move on.
+                state.searches.length = 0;
+                state.chatCalls.length = 0;
+                state.toolPlan = [[search], [search]];
+                await send(chat.id, { content: 'and again' });
+                expect(state.searches).toHaveLength(1);
+                expect(state.chatCalls).toHaveLength(3);
+                expect(state.chatCalls[2].messages.at(-1)).toMatchObject({ role: 'tool', content: expect.stringContaining('You already called web_search with the same input') });
             });
         });
     });
@@ -6246,7 +6287,7 @@ describe('Online model providers', () => {
         expect(call.body.messages.at(-1)).toEqual({ role: 'user', content: 'Say hello' });
         // Besides the conversation, the functions every chat is offered: the search of the skill library and the built-in tools.
         expect(Object.keys(call.body).sort()).toEqual(['messages', 'model', 'stream', 'stream_options', 'tools']);
-        expect(call.body.tools.map((tool) => tool.function.name)).toEqual(['open_component', 'open_skill', 'find_skill', 'ask_user', 'date_time', 'calculator', 'read_web_page']);
+        expect(call.body.tools.map((tool) => tool.function.name)).toEqual(['open_component', 'open_skill_file', 'open_skill', 'find_skill', 'ask_user', 'date_time', 'calculator', 'read_web_page']);
         expect(call.body.options).toBeUndefined();
         expect(call.body.keep_alive).toBeUndefined();
 
@@ -6402,7 +6443,7 @@ describe('Tools in chats', () => {
         state.toolsSeen = [];
         state.toolPlan = [[['calculator', { expression: '6 * 7' }]]];
         const events = await send(chat.id, 'what is six times seven');
-        expect(state.toolsSeen[0].map((tool) => tool.function.name)).toEqual(['open_component', 'open_skill', 'find_skill', 'ask_user', 'date_time', 'calculator', 'read_web_page']);
+        expect(state.toolsSeen[0].map((tool) => tool.function.name)).toEqual(['open_component', 'open_skill_file', 'open_skill', 'find_skill', 'ask_user', 'date_time', 'calculator', 'read_web_page']);
         expect(JSON.stringify(state.chatCalls[0].messages)).not.toContain('You have tools for this chat');
         expect(events.find((event) => event.type === 'tool')).toMatchObject({ tool: 'Calculator', input: '{"expression":"6 * 7"}' });
         expect(toolTurns(state.chatCalls[1])).toEqual([{ role: 'tool', tool_name: 'calculator', content: '42' }]);
