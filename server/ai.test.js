@@ -733,7 +733,7 @@ const fakePull = (model) => {
     };
 };
 
-const EVERY_CHAT_TOOLS = ['open_component', 'find_skill', 'ask_user', 'save_note', 'save_to_files', 'date_time', 'calculator', 'read_web_page'];
+const EVERY_CHAT_TOOLS = ['open_component', 'find_skill', 'ask_user', 'save_note', 'list_my_files', 'read_my_file', 'save_to_files', 'date_time', 'calculator', 'read_web_page'];
 const DEFAULT_SKILL_NAMES = SKILLS.filter((skill) => DEFAULT_LIBRARY_SKILLS[skill.id]).map((skill) => skill.name);
 const fakeOllama = (host, signal) => ({
     version: async () => {
@@ -2618,7 +2618,7 @@ describe('Chat endpoints', () => {
             const answers = state.chatCalls[1].messages.filter((message) => message.role === 'tool');
             expect(answers[0].content).toBe(COMPONENT_PAGES.find((page) => page.name === 'Badge').text);
             expect(answers[1].content).toMatch(/4/);
-            expect(answers[2].content).toMatch(/^There is no function called fly_to_the_moon\. The functions you can call are: open_component, open_skill_file, open_skill, find_skill, ask_user, save_note, save_to_files, date_time, calculator, read_web_page\.$/);
+            expect(answers[2].content).toMatch(/^There is no function called fly_to_the_moon\. The functions you can call are: open_component, open_skill_file, open_skill, find_skill, ask_user, save_note, list_my_files, read_my_file, save_to_files, date_time, calculator, read_web_page\.$/);
             expect(list.at(-1).reply.steps.map(({ tool, failed }) => ({ tool, failed: failed || null }))).toEqual([{ tool: 'Component', failed: null }, { tool: 'Calculator', failed: null }, { tool: 'fly_to_the_moon', failed: 'failed' }]);
             state.toolPlan = [];
         });
@@ -3872,13 +3872,13 @@ describe('Chat endpoints', () => {
                 state.toolsSeen = [];
                 const chat = await newChat({ model: 'qwen2.5-coder:7b' });
                 await send(chat.id, { content: 'find a duck model' });
-                expect(state.toolsSeen[0].map((tool) => tool.function.name)).toEqual(['web_search', 'web_fetch', 'open_component', 'open_skill_file', 'open_skill', 'find_skill', 'ask_user', 'save_note', 'save_to_files', 'date_time', 'calculator']);
+                expect(state.toolsSeen[0].map((tool) => tool.function.name)).toEqual(['web_search', 'web_fetch', 'open_component', 'open_skill_file', 'open_skill', 'find_skill', 'ask_user', 'save_note', 'list_my_files', 'read_my_file', 'save_to_files', 'date_time', 'calculator']);
 
                 // Switched off for the chat, the search tools go and the built-in reader is back.
                 state.toolsSeen = [];
                 const quiet = await newChat({ model: 'qwen2.5-coder:7b', webSearch: false });
                 await send(quiet.id, { content: 'find a duck model' });
-                expect(state.toolsSeen[0].map((tool) => tool.function.name)).toEqual(['open_component', 'open_skill_file', 'open_skill', 'find_skill', 'ask_user', 'save_note', 'save_to_files', 'date_time', 'calculator', 'read_web_page']);
+                expect(state.toolsSeen[0].map((tool) => tool.function.name)).toEqual(['open_component', 'open_skill_file', 'open_skill', 'find_skill', 'ask_user', 'save_note', 'list_my_files', 'read_my_file', 'save_to_files', 'date_time', 'calculator', 'read_web_page']);
             });
         });
 
@@ -4218,7 +4218,7 @@ describe('Chat endpoints', () => {
             const bare = await newChat({ model: 'qwen2.5-coder:7b', skills: [], tools: [] });
             await send(bare.id, { content: 'hello' });
             expect(state.chatCalls.at(-1).messages.map((message) => message.role)).toEqual(['user']);
-            expect(state.toolsSeen.at(-1).map((tool) => tool.function.name)).toEqual(['find_skill', 'ask_user', 'save_note', 'save_to_files', 'date_time', 'calculator', 'read_web_page']);
+            expect(state.toolsSeen.at(-1).map((tool) => tool.function.name)).toEqual(['find_skill', 'ask_user', 'save_note', 'list_my_files', 'read_my_file', 'save_to_files', 'date_time', 'calculator', 'read_web_page']);
 
             const suggested = skills.filter((skill) => skill.suggested);
             expect(suggested.map((skill) => skill.id).sort()).toEqual([...SUGGESTED_SKILLS].sort());
@@ -5031,6 +5031,24 @@ describe('Chat endpoints', () => {
     });
 
     describe('Files from FilesystemOne', () => {
+        test('a model can look through the person\'s files and read one without asking, and each step keeps what came back', async () => {
+            const chat = await newChat({ model: 'qwen2.5-coder:7b' });
+            state.toolPlan = [[['list_my_files', { folder: '/docs' }], ['read_my_file', { path: '/docs/brief.md' }], ['read_my_file', { path: '/docs/missing.md' }]]];
+            state.chatCalls = [];
+            const { events } = await send(chat.id, { content: 'what does my brief say?' });
+            state.toolPlan = [];
+            expect(events.some((event) => event.type === 'permission')).toBe(false);
+            const told = state.chatCalls[1].messages.filter((message) => message.role === 'tool').map((message) => message.content);
+            expect(told[0]).toContain('file /docs/brief.md (1 KB)');
+            expect(told[0]).toContain('folder /docs');
+            expect(told[1]).toBe('brief.md:\n\nThe client wants a harbour survey by June.');
+            expect(told[2]).toMatch(/^Nothing was read: /);
+            expect(events.filter((event) => event.type === 'toolAnswer').map((event) => event.answer)).toEqual(told);
+            const stored = (await Chat.findById(chat.id)).messages.at(-1).steps;
+            expect(stored.map((step) => [step.tool, step.input, step.failed])).toEqual([['List files', '/docs', null], ['Read a file', '/docs/brief.md', null], ['Read a file', '/docs/missing.md', 'failed']]);
+            expect(stored[1].answer).toBe(told[1]);
+        });
+
         test('browse passes the caller’s own sign-in through', async () => {
             const response = await get('/files/browse?path=/');
             expect(response.status).toBe(200);
@@ -6564,7 +6582,7 @@ describe('Online model providers', () => {
         expect(call.body.messages.at(-1)).toEqual({ role: 'user', content: 'Say hello' });
         // Besides the conversation, the functions every chat is offered: the search of the skill library and the built-in tools.
         expect(Object.keys(call.body).sort()).toEqual(['messages', 'model', 'stream', 'stream_options', 'tools']);
-        expect(call.body.tools.map((tool) => tool.function.name)).toEqual(['open_component', 'open_skill_file', 'open_skill', 'find_skill', 'ask_user', 'save_note', 'save_to_files', 'date_time', 'calculator', 'read_web_page']);
+        expect(call.body.tools.map((tool) => tool.function.name)).toEqual(['open_component', 'open_skill_file', 'open_skill', 'find_skill', 'ask_user', 'save_note', 'list_my_files', 'read_my_file', 'save_to_files', 'date_time', 'calculator', 'read_web_page']);
         expect(call.body.options).toBeUndefined();
         expect(call.body.keep_alive).toBeUndefined();
 
@@ -6748,7 +6766,7 @@ describe('Tools in chats', () => {
         state.toolsSeen = [];
         state.toolPlan = [[['calculator', { expression: '6 * 7' }]]];
         const events = await send(chat.id, 'what is six times seven');
-        expect(state.toolsSeen[0].map((tool) => tool.function.name)).toEqual(['open_component', 'open_skill_file', 'open_skill', 'find_skill', 'ask_user', 'save_note', 'save_to_files', 'date_time', 'calculator', 'read_web_page']);
+        expect(state.toolsSeen[0].map((tool) => tool.function.name)).toEqual(['open_component', 'open_skill_file', 'open_skill', 'find_skill', 'ask_user', 'save_note', 'list_my_files', 'read_my_file', 'save_to_files', 'date_time', 'calculator', 'read_web_page']);
         expect(JSON.stringify(state.chatCalls[0].messages)).not.toContain('You have tools for this chat');
         expect(events.find((event) => event.type === 'tool')).toMatchObject({ tool: 'Calculator', input: '{"expression":"6 * 7"}' });
         expect(toolTurns(state.chatCalls[1])).toEqual([{ role: 'tool', tool_name: 'calculator', content: '42' }]);
