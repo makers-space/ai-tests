@@ -2577,7 +2577,7 @@ describe('Chat endpoints', () => {
             const answers = state.chatCalls[1].messages.filter((message) => message.role === 'tool');
             expect(answers[0].content).toBe(COMPONENT_PAGES.find((page) => page.name === 'Badge').text);
             expect(answers[1].content).toMatch(/4/);
-            expect(answers[2].content).toMatch(/^There is no function called fly_to_the_moon\. The functions you can call are: open_component, find_skill, ask_user, date_time, calculator, read_web_page\.$/);
+            expect(answers[2].content).toMatch(/^There is no function called fly_to_the_moon\. The functions you can call are: open_component, open_skill, find_skill, ask_user, date_time, calculator, read_web_page\.$/);
             expect(list.at(-1).reply.steps.map(({ tool, failed }) => ({ tool, failed: failed || null }))).toEqual([{ tool: 'Component', failed: null }, { tool: 'Calculator', failed: null }, { tool: 'fly_to_the_moon', failed: 'failed' }]);
             state.toolPlan = [];
         });
@@ -3682,13 +3682,13 @@ describe('Chat endpoints', () => {
                 state.toolsSeen = [];
                 const chat = await newChat({ model: 'qwen2.5-coder:7b' });
                 await send(chat.id, { content: 'find a duck model' });
-                expect(state.toolsSeen[0].map((tool) => tool.function.name)).toEqual(['web_search', 'web_fetch', 'open_component', 'find_skill', 'ask_user', 'date_time', 'calculator']);
+                expect(state.toolsSeen[0].map((tool) => tool.function.name)).toEqual(['web_search', 'web_fetch', 'open_component', 'open_skill', 'find_skill', 'ask_user', 'date_time', 'calculator']);
 
                 // Switched off for the chat, the search tools go and the built-in reader is back.
                 state.toolsSeen = [];
                 const quiet = await newChat({ model: 'qwen2.5-coder:7b', webSearch: false });
                 await send(quiet.id, { content: 'find a duck model' });
-                expect(state.toolsSeen[0].map((tool) => tool.function.name)).toEqual(['open_component', 'find_skill', 'ask_user', 'date_time', 'calculator', 'read_web_page']);
+                expect(state.toolsSeen[0].map((tool) => tool.function.name)).toEqual(['open_component', 'open_skill', 'find_skill', 'ask_user', 'date_time', 'calculator', 'read_web_page']);
             });
         });
 
@@ -3897,7 +3897,7 @@ describe('Chat endpoints', () => {
             }
             // The five skills Mollama wrote itself are gone; the one that draws its viewers stays.
             expect(skills.filter((skill) => skill.source === 'mollama').map((skill) => skill.id)).toEqual(['components']);
-            expect(sources.map((source) => source.id)).toEqual(['mollama', 'anthropic', 'engineering', 'marketing', 'medical', 'dex', 'context7', 'search', 'last30days', 'anatomy', 'hairline', 'taste']);
+            expect(sources.map((source) => source.id)).toEqual(['mollama', 'anthropic', 'engineering', 'marketing', 'medical', 'dex', 'context7', 'search', 'last30days', 'anatomy', 'hairline', 'taste', 'richmd', 'explainer']);
             expect(sources.reduce((sum, source) => sum + source.count, 0)).toBe(skills.length);
             expect(skills.every((skill) => skill.tokens > 0)).toBe(true);
 
@@ -4046,7 +4046,7 @@ describe('Chat endpoints', () => {
             const listed = (await get('/skills')).data.skills;
             expect(listed.map((skill) => skill.id)).toEqual(SKILLS.map((skill) => skill.id));
             expect(listed.find((skill) => skill.id === 'components')).toMatchObject({ default: true });
-            expect(listed.filter((skill) => skill.default).map((skill) => [skill.id, skill.default])).toEqual([['components', true]]);
+            expect(listed.filter((skill) => skill.default).map((skill) => [skill.id, skill.default])).toEqual([['components', true], ['richmd-rich-md-first', 'tools'], ['explainer-visual-explainer', 'tools']]);
             expect(listed.find((skill) => skill.id === 'marketing-copywriting')).toMatchObject({ name: 'Copywriting', source: 'marketing', credit: 'coreyhaines31/marketingskills (MIT)', default: false });
             expect(listed[0].text).toBeUndefined();
 
@@ -4065,7 +4065,7 @@ describe('Chat endpoints', () => {
             const none = (await client.patch(`/api/v1/chats/${chat.id}`, { skills: [] })).data.chat;
             expect(none.skills).toEqual([]);
             const back = (await client.patch(`/api/v1/chats/${chat.id}`, { skills: null })).data.chat;
-            expect(back.skills).toEqual(['components']);
+            expect(back.skills).toEqual(['components', 'richmd-rich-md-first', 'explainer-visual-explainer']);
             expect((await client.patch(`/api/v1/chats/${chat.id}`, { skills: ['Bad Id'] })).status).toBe(400);
         });
 
@@ -4127,7 +4127,7 @@ describe('Chat endpoints', () => {
             const { events: list } = await send(chat.id, { content: 'write a cold email' });
 
             const finder = state.toolsSeen[0].find((tool) => tool.function.name === 'find_skill');
-            expect(finder.function.description).toContain(`Search the library of ${SKILLS.length - 1} skills`);
+            expect(finder.function.description).toContain(`Search the library of ${SKILLS.length - 3} skills`);
             expect(finder.function.description).toMatch(/You cannot turn a skill on yourself: when one would help, tell the user its name/);
             const answers = state.chatCalls[1].messages.filter((message) => message.role === 'tool');
             const cold = SKILLS.find((skill) => skill.id === 'marketing-cold-email');
@@ -4138,7 +4138,7 @@ describe('Chat endpoints', () => {
             expect(answers[1].content).toBe('No skill in the library matches. Answer without one.');
             expect(list.at(-1).reply.steps.map(({ tool, input }) => ({ tool, input }))).toEqual([{ tool: 'Skill library', input: 'cold email' }, { tool: 'Skill library', input: 'zzzz' }]);
             // Looking is all it does: the chat's skills are unchanged.
-            expect((await get(`/chats/${chat.id}`)).data.chat.skills).toEqual(['components']);
+            expect((await get(`/chats/${chat.id}`)).data.chat.skills).toEqual(['components', 'richmd-rich-md-first', 'explainer-visual-explainer']);
 
             // A skill that is already on is not offered again by the search.
             state.toolsSeen = [];
@@ -4174,7 +4174,7 @@ describe('Chat endpoints', () => {
             expect(paths).toEqual(['bench.html', 'build.mjs', 'concepts.md', 'examples/riffle.js', 'examples/terrain.js', 'kernel.js', 'look.md', 'look.mjs', 'read.mjs', 'rules.md', 'source.md', 'validate.mjs']);
             // The kit is its project's own, unchanged: the engine carries the mark its authors put on it.
             expect(onDisk('kernel.js')).toMatch(/^\/\* hairline kernel sha256:[0-9a-f]{64} \*\//);
-            expect(SKILLS.filter((skill) => (skill.files || []).length > 0).map((skill) => skill.id)).toEqual(['hairline-hairline-create']);
+            expect(SKILLS.filter((skill) => (skill.files || []).length > 0).map((skill) => skill.id)).toEqual(['hairline-hairline-create', 'richmd-rich-md-first', 'explainer-visual-explainer']);
 
             // The page that shows a figure asks for the files by path.
             expect((await get('/skills')).data.skills.find((skill) => skill.id === hairline.id).files).toEqual(paths);
@@ -4462,6 +4462,91 @@ describe('Chat endpoints', () => {
             } finally {
                 setSandboxClient(null);
                 setFilesFetch(fakeFilesystemOne);
+                delete process.env.SANDBOX_API_KEY;
+                delete process.env.SANDBOX_WORKSPACE_ID;
+                delete process.env.SANDBOX_SNAPSHOT;
+            }
+        });
+
+        test('Visual Explainer renders in a sandbox, goes back once to be fixed, shows in the app\'s theme with its kit named not pasted, and a long page is not sent back to the model', async () => {
+            const kitFile = (name) => fs.readFileSync(new URL(`../../server/instructions/library/explainer/explainer-visual-explainer/kit/${name}`, import.meta.url), 'utf8').replace(/\r\n/g, '\n');
+            const css = kitFile('kit.css');
+            const builtPage = (body) => `<!doctype html><html><head><style data-ve-kit>\n${css}</style></head><body><main>${body}</main><script data-ve-kit>\n${[kitFile('reply.js'), kitFile('kit.js')].join('\n')}</script></body></html>`;
+            let body = '<h1>94% of reads skip Postgres</h1>';
+            let renders = 0;
+            const lines = [];
+            const uploaded = [];
+            const started = [];
+            process.env.SANDBOX_API_KEY = 'rnd_test';
+            process.env.SANDBOX_WORKSPACE_ID = 'tea-test';
+            process.env.SANDBOX_SNAPSHOT = 'mollama-skills';
+            setSandboxClient({
+                create: async (options) => { started.push(options); return { id: 'sbx-ve', status: 'running' }; },
+                exec: async (id, line) => {
+                    lines.push(line);
+                    if (line.includes('timeout')) {
+                        renders += 1;
+                        const events = renders === 1
+                            ? [{ type: 'output', stream: 'stdout', data: '✓ page.html  kit inlined\n  ✗ a label is cut off at 390px\n✗ 1 visual problem(s); the page was written. Fix them and render again.\n' }, { type: 'exit', exit_code: 1 }]
+                            : [{ type: 'output', stream: 'stdout', data: '✓ page.html  kit inlined\n  ✓ Visual check: no problems\n' }, { type: 'exit', exit_code: 0 }];
+                        return (async function* () { yield* events; })();
+                    }
+                    const events = line.startsWith('cd /root/work && find') ? [{ type: 'output', stream: 'stdout', data: 'page.html\n' }, { type: 'exit', exit_code: 0 }] : [{ type: 'exit', exit_code: 0 }];
+                    return (async function* () { yield* events; })();
+                },
+                upload: async (id, where, data) => { uploaded.push({ where, text: Buffer.from(data).toString() }); },
+                download: async () => ({ data: Buffer.from(builtPage(body)) }),
+                terminate: async () => {}
+            });
+            try {
+                // On by default for a model that can use tools, and offered only where its render can run.
+                const chat = await newChat({ model: 'qwen2.5-coder:7b' });
+                const source = '<!doctype html><html><head><link rel="stylesheet" href="kit.css" data-ve-kit></head><body><main><h1>Cache</h1></main></body></html>';
+                state.chatCalls.length = 0;
+                state.toolPlan = [[['visual_explainer_render', { page: source, title: 'Cache reads' }]], [['visual_explainer_render', { page: source, title: 'Cache reads' }]]];
+                state.chatReply = 'Here is the page.';
+                await send(chat.id, { content: 'explain the cache' });
+                expect(uploaded.find((one) => one.where === '/root/work/page.src.html').text).toBe(source);
+                // A render may reach the two addresses its page's fonts come from, and nothing else.
+                expect(started[0].networkPolicy).toEqual({ type: 'allow-list', rules: [{ domain: 'fonts.googleapis.com' }, { domain: 'fonts.gstatic.com' }] });
+                expect(uploaded.find((one) => one.where === '/root/job/main.sh').text).toMatch(/^node \/root\/skills\/visual-explainer\/kit\/render\.mjs page\.src\.html -o page\.html/);
+                expect(state.chatCalls[1].messages.at(-1).content).toMatch(/^Not shown yet\. The render found something to fix:\n[\s\S]*a label is cut off at 390px[\s\S]*Fix these and call visual_explainer_render again/);
+                expect(state.chatCalls[2].messages.at(-1).content).toMatch(/^Rendered and showed "Cache reads" to the user in the chat, in the app's theme\. Report:/);
+
+                // The reply holds the page with the kit's files named, and the theme in place of the kit's colours.
+                const shown = (await get(`/chats/${chat.id}`)).data.chat.messages.at(-1).content;
+                expect(shown).toMatch(/```component\n<Frame height="720px" title="Cache reads" palette="bg:background, surface:surface, [^"]*accent:primary[^"]*">/);
+                expect(shown).toContain('<Part name="VE_CSS_1" file="explainer-visual-explainer/kit/kit.css" />');
+                expect(shown).toContain('<Part name="VE_JS_1" file="explainer-visual-explainer/kit/reply.js" />');
+                expect(shown).toContain('<Part name="VE_JS_2" file="explainer-visual-explainer/kit/kit.js" />');
+                expect(shown).toContain('<style data-ve-kit>/*VE_CSS_1*/</style>');
+                expect(shown).not.toContain(css.slice(0, 300));
+                expect(shown.length).toBeLessThan(2000);
+
+                // A long page is shown whole to the person but sent back to the model as one line.
+                body = 'x'.repeat(8000);
+                renders = 1;
+                state.toolPlan = [[['visual_explainer_render', { page: source, title: 'Long page' }]]];
+                await send(chat.id, { content: 'a longer one' });
+                state.toolPlan = [];
+                state.chatCalls.length = 0;
+                await send(chat.id, { content: 'thanks' });
+                const history = state.chatCalls[0].messages.filter((message) => message.role === 'assistant').map((message) => message.content).join('\n');
+                expect(history).toMatch(/\[Shown here: "Long page", a page of [\d,]+ characters, not repeated\.\]/);
+                expect(history).not.toContain('x'.repeat(8000));
+                expect(history).toContain('title="Cache reads"');
+
+                // With sandboxes set up it lacks nothing; without them it is not offered and says it needs commands.
+                const lacks = async () => (await get('/skills')).data.skills.find((skill) => skill.id === 'explainer-visual-explainer').needs;
+                expect(await lacks()).toEqual([]);
+                delete process.env.SANDBOX_SNAPSHOT;
+                state.chatCalls.length = 0;
+                await send(chat.id, { content: 'hello' });
+                expect(state.toolsSeen.at(-1).some((tool) => tool.function.name === 'visual_explainer_render')).toBe(false);
+                expect(await lacks()).toEqual(['commands']);
+                expect((await get('/skills')).data.skills.find((skill) => skill.id === 'richmd-rich-md-first').needs).toEqual([]);
+            } finally {
+                setSandboxClient(null);
                 delete process.env.SANDBOX_API_KEY;
                 delete process.env.SANDBOX_WORKSPACE_ID;
                 delete process.env.SANDBOX_SNAPSHOT;
@@ -6127,7 +6212,7 @@ describe('Online model providers', () => {
         expect(call.body.messages.at(-1)).toEqual({ role: 'user', content: 'Say hello' });
         // Besides the conversation, the functions every chat is offered: the search of the skill library and the built-in tools.
         expect(Object.keys(call.body).sort()).toEqual(['messages', 'model', 'stream', 'stream_options', 'tools']);
-        expect(call.body.tools.map((tool) => tool.function.name)).toEqual(['open_component', 'find_skill', 'ask_user', 'date_time', 'calculator', 'read_web_page']);
+        expect(call.body.tools.map((tool) => tool.function.name)).toEqual(['open_component', 'open_skill', 'find_skill', 'ask_user', 'date_time', 'calculator', 'read_web_page']);
         expect(call.body.options).toBeUndefined();
         expect(call.body.keep_alive).toBeUndefined();
 
@@ -6283,7 +6368,7 @@ describe('Tools in chats', () => {
         state.toolsSeen = [];
         state.toolPlan = [[['calculator', { expression: '6 * 7' }]]];
         const events = await send(chat.id, 'what is six times seven');
-        expect(state.toolsSeen[0].map((tool) => tool.function.name)).toEqual(['open_component', 'find_skill', 'ask_user', 'date_time', 'calculator', 'read_web_page']);
+        expect(state.toolsSeen[0].map((tool) => tool.function.name)).toEqual(['open_component', 'open_skill', 'find_skill', 'ask_user', 'date_time', 'calculator', 'read_web_page']);
         expect(JSON.stringify(state.chatCalls[0].messages)).not.toContain('You have tools for this chat');
         expect(events.find((event) => event.type === 'tool')).toMatchObject({ tool: 'Calculator', input: '{"expression":"6 * 7"}' });
         expect(toolTurns(state.chatCalls[1])).toEqual([{ role: 'tool', tool_name: 'calculator', content: '42' }]);
