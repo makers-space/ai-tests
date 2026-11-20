@@ -2,7 +2,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import { createRequire } from 'node:module';
 import { Readable } from 'node:stream';
-import { describe, test, expect, beforeAll, afterAll, beforeEach } from 'vitest';
+import { describe, test, expect, beforeAll, afterAll, beforeEach, vi } from 'vitest';
 import TestStartup from '../utils/test.startup.js';
 import { getNotificationService } from '../../server/middleware/app.middleware.js';
 import { ROLES, RIGHTS, hasRight } from '../../server/config/rights.js';
@@ -16,7 +16,7 @@ import {
     setToolConnector, ToolSignInError, TOOL_HEALTH, TOOL_CATALOGUE, TOOL_LOCAL_CATALOGUE, CLOUD_PROVIDERS, PROVIDER_HEALTH, setCloudFetch, ollamaOnlineNames, runsOnline, seal, unseal, deviceGateway, DeviceGateway, cloudTitle
 } from '../../server/middleware/ai.middleware.js';
 import { Device, Setting, Download, PersonalModel, Chat, Prompt, Guide, GUIDE_STEPS, MANAGER_GUIDE_STEPS, deviceSchemas, modelSchemas, chatSchemas, promptSchemas, ToolServer, TOOL_HEALTH_STATES, toolSchemas, Provider, PROVIDER_HEALTH_STATES, providerSchemas, Skill } from '../../server/models/ai.model.js';
-import { downloads, health, queue, SKILLS, DEFAULT_LIBRARY_SKILLS, COMPONENT_PAGES, COMPONENT_VALUES_PAGE, componentFaults, rankSkills, writtenToolCalls, BUILTIN_TOOLS, waitingPermissions, todayLine, SKILL_SOURCES, MAX_CHAT_SKILLS, SUGGESTED_SKILLS, setHairlineWait } from '../../server/controllers/ai.controller.js';
+import { downloads, health, queue, SKILLS, DEFAULT_LIBRARY_SKILLS, COMPONENT_PAGES, COMPONENT_VALUES_PAGE, componentFaults, rankSkills, writtenToolCalls, BUILTIN_TOOLS, waitingPermissions, todayLine, SKILL_SOURCES, MAX_CHAT_SKILLS, SUGGESTED_SKILLS, setHairlineWait, setToolCallLimit } from '../../server/controllers/ai.controller.js';
 
 // What a chat is sent when only the default skills are on: the Components skill, the skill map, today's date, and
 // their reminders.
@@ -6787,6 +6787,42 @@ describe('Tools in chats', () => {
         const chat = await newChat({ tools: ['calculator'] });
         await send(chat.id);
         expect(state.toolsSeen).toEqual([null]);
+    });
+
+    test('past the hourly limit on tool calls a call is not run and the model is told why, and an hour later calls run again', async () => {
+        // The real limit is 120 calls a person an hour; 2 shows the same rule. Only the clock is faked, so the server's
+        // own timers still run.
+        setToolCallLimit(2);
+        vi.useFakeTimers({ toFake: ['Date'] });
+        try {
+            const chat = await newChat();
+            state.toolPlan = [[['calculator', { expression: '1 + 1' }], ['calculator', { expression: '2 + 2' }], ['calculator', { expression: '3 + 3' }]]];
+            const events = await send(chat.id, 'add these');
+            expect(toolTurns(state.chatCalls[1]).map((turn) => turn.content)).toEqual(['2', '4', 'The limit on tool use for this hour has been reached. Answer without tools and say so.']);
+            expect(events.filter((event) => event.type === 'toolFailed').map((event) => event.failed)).toEqual(['limited']);
+
+            // Still inside the hour: refused.
+            vi.setSystemTime(Date.now() + 59 * 60 * 1000);
+            resetState();
+            // A sign-in lasts less than an hour, so the person signs in again, as they would.
+            signOut();
+            await testStartup.loginAsUser('user');
+            state.toolPlan = [[['calculator', { expression: '4 + 4' }]]];
+            await send(chat.id, 'and this');
+            expect(toolTurns(state.chatCalls[1])[0].content).toMatch(/^The limit on tool use for this hour/);
+
+            // An hour after the first call, the count starts again.
+            vi.setSystemTime(Date.now() + 2 * 60 * 1000);
+            resetState();
+            signOut();
+            await testStartup.loginAsUser('user');
+            state.toolPlan = [[['calculator', { expression: '5 + 5' }]]];
+            await send(chat.id, 'and now');
+            expect(toolTurns(state.chatCalls[1])[0].content).toBe('10');
+        } finally {
+            vi.useRealTimers();
+            setToolCallLimit(null);
+        }
     });
 
     test('an answer far too long is cut to the limit, and a call that fails or times out is said plainly while the reply goes on', async () => {
