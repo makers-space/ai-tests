@@ -4959,7 +4959,10 @@ describe('Chat endpoints', () => {
             expect(componentFaults(block('<Image alt="dot"><svg viewBox="0 0 1 1"><circle r="1" /></svg></Image>')).faults).toEqual([]);
             expect(componentFaults(block('<Flow>\n<Node id="a" label="A" />\n<Edge source="a" target="a" />\n</Flow>')).faults).toEqual([]);
             expect(componentFaults(block('<Flow>\n<Node label="A" />\n<Edge source="a" />\n</Flow>')).faults).toEqual(['Node needs the attribute "id".', 'Edge needs the attribute "target".']);
-            expect(componentFaults('<Container layout="flex">\n<div>\n<h2>Parts</h2>\n</div>\n</Container>').faults.map((fault) => fault.split('.')[0])).toEqual(['"div" is not a component', '"h2" is not a component']);
+            expect(componentFaults('<Container layout="flex">\n<div>\n<h2>Parts</h2>\n</div>\n</Container>').faults.map((fault) => fault.split('.')[0])).toEqual(['<Container> is written as plain text, so it shows as text and is not drawn', '"div" is not a component', '"h2" is not a component']);
+            // Tags written as plain text are caught, and so is a Button with no label; a tag named in a sentence is not.
+            expect(componentFaults('Next:\n\n<ButtonGroup>\n  <Button send="More" />\n</ButtonGroup>').faults).toEqual(expect.arrayContaining([expect.stringMatching(/^<ButtonGroup> is written as plain text/), expect.stringMatching(/^A Button holds its label as text/)]));
+            expect(componentFaults('Use the <Button> tag for this.').faults).toEqual([]);
             expect(componentFaults(block('<Model3D src="https://example.com/engine.glb" autoRotate />')).faults).toEqual([]);
             expect(componentFaults(block('<ProgressBar label="Done" />')).faults).toEqual(['ProgressBar needs the attribute "value".']);
             // A value a component does not take is caught, and the fault names the values it does take, as its page lists them.
