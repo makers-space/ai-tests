@@ -733,7 +733,7 @@ const fakePull = (model) => {
     };
 };
 
-const EVERY_CHAT_TOOLS = ['open_component', 'find_skill', 'ask_user', 'save_note', 'date_time', 'calculator', 'read_web_page'];
+const EVERY_CHAT_TOOLS = ['open_component', 'find_skill', 'ask_user', 'save_note', 'save_to_files', 'date_time', 'calculator', 'read_web_page'];
 const DEFAULT_SKILL_NAMES = SKILLS.filter((skill) => DEFAULT_LIBRARY_SKILLS[skill.id]).map((skill) => skill.name);
 const fakeOllama = (host, signal) => ({
     version: async () => {
@@ -2595,7 +2595,7 @@ describe('Chat endpoints', () => {
             const answers = state.chatCalls[1].messages.filter((message) => message.role === 'tool');
             expect(answers[0].content).toBe(COMPONENT_PAGES.find((page) => page.name === 'Badge').text);
             expect(answers[1].content).toMatch(/4/);
-            expect(answers[2].content).toMatch(/^There is no function called fly_to_the_moon\. The functions you can call are: open_component, open_skill_file, open_skill, find_skill, ask_user, save_note, date_time, calculator, read_web_page\.$/);
+            expect(answers[2].content).toMatch(/^There is no function called fly_to_the_moon\. The functions you can call are: open_component, open_skill_file, open_skill, find_skill, ask_user, save_note, save_to_files, date_time, calculator, read_web_page\.$/);
             expect(list.at(-1).reply.steps.map(({ tool, failed }) => ({ tool, failed: failed || null }))).toEqual([{ tool: 'Component', failed: null }, { tool: 'Calculator', failed: null }, { tool: 'fly_to_the_moon', failed: 'failed' }]);
             state.toolPlan = [];
         });
@@ -3849,13 +3849,13 @@ describe('Chat endpoints', () => {
                 state.toolsSeen = [];
                 const chat = await newChat({ model: 'qwen2.5-coder:7b' });
                 await send(chat.id, { content: 'find a duck model' });
-                expect(state.toolsSeen[0].map((tool) => tool.function.name)).toEqual(['web_search', 'web_fetch', 'open_component', 'open_skill_file', 'open_skill', 'find_skill', 'ask_user', 'save_note', 'date_time', 'calculator']);
+                expect(state.toolsSeen[0].map((tool) => tool.function.name)).toEqual(['web_search', 'web_fetch', 'open_component', 'open_skill_file', 'open_skill', 'find_skill', 'ask_user', 'save_note', 'save_to_files', 'date_time', 'calculator']);
 
                 // Switched off for the chat, the search tools go and the built-in reader is back.
                 state.toolsSeen = [];
                 const quiet = await newChat({ model: 'qwen2.5-coder:7b', webSearch: false });
                 await send(quiet.id, { content: 'find a duck model' });
-                expect(state.toolsSeen[0].map((tool) => tool.function.name)).toEqual(['open_component', 'open_skill_file', 'open_skill', 'find_skill', 'ask_user', 'save_note', 'date_time', 'calculator', 'read_web_page']);
+                expect(state.toolsSeen[0].map((tool) => tool.function.name)).toEqual(['open_component', 'open_skill_file', 'open_skill', 'find_skill', 'ask_user', 'save_note', 'save_to_files', 'date_time', 'calculator', 'read_web_page']);
             });
         });
 
@@ -4195,7 +4195,7 @@ describe('Chat endpoints', () => {
             const bare = await newChat({ model: 'qwen2.5-coder:7b', skills: [], tools: [] });
             await send(bare.id, { content: 'hello' });
             expect(state.chatCalls.at(-1).messages.map((message) => message.role)).toEqual(['user']);
-            expect(state.toolsSeen.at(-1).map((tool) => tool.function.name)).toEqual(['find_skill', 'ask_user', 'save_note', 'date_time', 'calculator', 'read_web_page']);
+            expect(state.toolsSeen.at(-1).map((tool) => tool.function.name)).toEqual(['find_skill', 'ask_user', 'save_note', 'save_to_files', 'date_time', 'calculator', 'read_web_page']);
 
             const suggested = skills.filter((skill) => skill.suggested);
             expect(suggested.map((skill) => skill.id).sort()).toEqual([...SUGGESTED_SKILLS].sort());
@@ -5112,6 +5112,52 @@ describe('Chat endpoints', () => {
             expect(call.method).toBe('POST');
             expect(JSON.parse(call.body)).toEqual({ filePath: '/docs/chat.md', content: '# Chat', onConflict: 'rename' });
             expect(call.cookie).toContain(`csrfToken=${call.csrf}`);
+        });
+
+        test('a file a reply showed from the web is fetched by the server and saved into a folder, and a model can save one too once allowed', async () => {
+            const uploads = [];
+            const fetched = [];
+            const before = setRemoteTransport({
+                lookup: async () => [{ address: '93.184.216.34', family: 4 }],
+                request: async (url) => {
+                    fetched.push(url.href);
+                    return { status: 200, headers: { 'content-type': 'image/png' }, stream: Readable.from([Buffer.from('png-bytes')]) };
+                }
+            });
+            setFilesFetch(async (url, options) => {
+                if (!String(url).endsWith('/files/upload')) return fakeFilesystemOne(url, options);
+                uploads.push({ folder: options.body.get('basePath'), paths: options.body.get('relativePaths'), conflict: options.body.get('onConflict'), text: await options.body.get('files').text() });
+                return new Response(JSON.stringify({ success: true }), { status: 201, headers: { 'Content-Type': 'application/json' } });
+            });
+            try {
+                // From the Save button: the address is fetched here, with the usual checks, and uploaded without overwriting.
+                const response = await post('/files/save-address', { folder: '/docs', name: 'duck.png', url: 'https://models.example/duck.png' });
+                expect(response.status).toBe(201);
+                expect(response.data.path).toBe('/docs/duck.png');
+                expect(fetched).toEqual(['https://models.example/duck.png']);
+                expect(uploads).toEqual([{ folder: '/docs', paths: '["duck.png"]', conflict: 'rename', text: 'png-bytes' }]);
+                // Only https addresses, and only a plain file name.
+                expect((await post('/files/save-address', { folder: '/docs', name: 'duck.png', url: 'http://models.example/duck.png' })).status).toBe(400);
+                expect((await post('/files/save-address', { folder: '/docs', name: '../duck.png', url: 'https://models.example/duck.png' })).status).toBe(400);
+
+                // From a model: it asks first, then saves what it found.
+                const chat = await newChat({ model: 'qwen2.5-coder:7b' });
+                state.toolPlan = [[['save_to_files', { folder: '/docs', name: 'found.png', address: 'https://models.example/found.png' }]]];
+                state.chatCalls = [];
+                const pending = send(chat.id, { content: 'save that picture' });
+                for (let tries = 0; tries < 200 && !waitingPermissions().some((waiting) => waiting.chatId === chat.id); tries += 1) await wait(25);
+                const waiting = waitingPermissions().find((one) => one.chatId === chat.id);
+                expect(waiting).toBeTruthy();
+                expect((await post(`/chats/${chat.id}/permission`, { id: waiting.id, answer: 'once' })).status).toBe(200);
+                const { events } = await pending;
+                expect(events.find((event) => event.type === 'tool')).toMatchObject({ tool: 'Save to files', input: '/docs/found.png' });
+                expect(uploads.at(-1)).toMatchObject({ folder: '/docs', paths: '["found.png"]' });
+                expect(state.chatCalls[1].messages.at(-1).content).toMatch(/^Saved the file from https:\/\/models\.example\/found\.png to \/docs\/found\.png\./);
+            } finally {
+                setRemoteTransport(before);
+                setFilesFetch(fakeFilesystemOne);
+                state.toolPlan = [];
+            }
         });
 
         test('a folder that cannot be written to is said plainly', async () => {
@@ -6468,7 +6514,7 @@ describe('Online model providers', () => {
         expect(call.body.messages.at(-1)).toEqual({ role: 'user', content: 'Say hello' });
         // Besides the conversation, the functions every chat is offered: the search of the skill library and the built-in tools.
         expect(Object.keys(call.body).sort()).toEqual(['messages', 'model', 'stream', 'stream_options', 'tools']);
-        expect(call.body.tools.map((tool) => tool.function.name)).toEqual(['open_component', 'open_skill_file', 'open_skill', 'find_skill', 'ask_user', 'save_note', 'date_time', 'calculator', 'read_web_page']);
+        expect(call.body.tools.map((tool) => tool.function.name)).toEqual(['open_component', 'open_skill_file', 'open_skill', 'find_skill', 'ask_user', 'save_note', 'save_to_files', 'date_time', 'calculator', 'read_web_page']);
         expect(call.body.options).toBeUndefined();
         expect(call.body.keep_alive).toBeUndefined();
 
@@ -6652,7 +6698,7 @@ describe('Tools in chats', () => {
         state.toolsSeen = [];
         state.toolPlan = [[['calculator', { expression: '6 * 7' }]]];
         const events = await send(chat.id, 'what is six times seven');
-        expect(state.toolsSeen[0].map((tool) => tool.function.name)).toEqual(['open_component', 'open_skill_file', 'open_skill', 'find_skill', 'ask_user', 'save_note', 'date_time', 'calculator', 'read_web_page']);
+        expect(state.toolsSeen[0].map((tool) => tool.function.name)).toEqual(['open_component', 'open_skill_file', 'open_skill', 'find_skill', 'ask_user', 'save_note', 'save_to_files', 'date_time', 'calculator', 'read_web_page']);
         expect(JSON.stringify(state.chatCalls[0].messages)).not.toContain('You have tools for this chat');
         expect(events.find((event) => event.type === 'tool')).toMatchObject({ tool: 'Calculator', input: '{"expression":"6 * 7"}' });
         expect(toolTurns(state.chatCalls[1])).toEqual([{ role: 'tool', tool_name: 'calculator', content: '42' }]);
