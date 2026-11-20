@@ -4515,7 +4515,17 @@ describe('Chat endpoints', () => {
                 expect(await turn(work, 'once')).toBe('Nothing was run. stream lost');
                 expect(ended).toEqual(['sbx-1', 'sbx-2']);
                 fault = null;
-                expect(await turn({ language: 'ruby', code: 'puts 1' }, 'once')).toMatch(/^Nothing was run\. Say what the program is written in/);
+                expect(await turn({ language: 'ruby', code: 'puts 1', files: ['/docs/report.pdf'] }, 'once')).toMatch(/^Nothing was run\. Say what the program is written in/);
+
+                // A program given no files and no folder reads nothing of the person's and saves nothing, so it runs
+                // without asking; what it makes is reported, not saved.
+                const before = uploads.length;
+                state.toolPlan = [[['run_program', { language: 'bash', code: 'ls /root/skills' }]]];
+                state.chatCalls = [];
+                const { events: looked } = await send(chat.id, { content: 'look around' });
+                expect(looked.some((event) => event.type === 'permission')).toBe(false);
+                expect(state.chatCalls[1].messages.at(-1).content).toMatch(/^The bash program finished with exit code 0\.[\s\S]*nothing was saved: call again with save_to/);
+                expect(uploads).toHaveLength(before);
 
                 // With sandboxes set up, a skill whose files are in the snapshot lacks nothing.
                 const lacks = async (id) => (await get('/skills')).data.skills.find((skill) => skill.id === id).needs;
@@ -4646,6 +4656,12 @@ describe('Chat endpoints', () => {
                     state.toolPlan = [[['pdf_script', input]]];
                     state.chatCalls = [];
                     const pending = send(chat.id, { content: 'check the form' });
+                    // A script given no files and no folder touches nothing of the person's, so it is not asked about.
+                    if (!input.files && !input.save_to) {
+                        const { events } = await pending;
+                        expect(events.some((event) => event.type === 'permission')).toBe(false);
+                        return state.chatCalls[1].messages.at(-1).content;
+                    }
                     for (let tries = 0; tries < 200 && !waitingPermissions().some((waiting) => waiting.chatId === chat.id); tries += 1) await wait(25);
                     const waiting = waitingPermissions().find((one) => one.chatId === chat.id);
                     expect(waiting).toBeTruthy();
