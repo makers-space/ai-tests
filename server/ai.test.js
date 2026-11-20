@@ -3918,8 +3918,8 @@ describe('Chat endpoints', () => {
                 const done = list[list.length - 1];
                 expect(done).toMatchObject({ type: 'done', reply: { content: 'Here is the duck.' } });
                 expect(done.reply.steps).toEqual([
-                    { tool: 'web_search', input: 'duck 3d model', failed: null },
-                    { tool: 'web_fetch', input: 'https://models.example/duck', failed: null }
+                    { tool: 'web_search', input: 'duck 3d model', failed: null, answer: expect.any(String) },
+                    { tool: 'web_fetch', input: 'https://models.example/duck', failed: null, answer: expect.any(String) }
                 ]);
                 expect((await get(`/chats/${chat.id}`)).data.chat.messages[1].steps).toHaveLength(2);
             });
@@ -6701,6 +6701,8 @@ describe('Tools in chats', () => {
         callTool: async (params) => {
             called.push(params);
             if (params.arguments?.words === 'broken') return { isError: true, content: [{ type: 'text', text: 'No page has those words.' }] };
+            if (params.arguments?.words === 'huge') return { content: [{ type: 'text', text: 'x'.repeat(50000) }] };
+            if (params.arguments?.words === 'slow') throw new Error('Request timed out');
             return { content: [{ type: 'text', text: params.name === 'find_page' ? 'Found: the launch plan.' : 'Saved.' }] };
         },
         close: async () => {}
@@ -6785,6 +6787,20 @@ describe('Tools in chats', () => {
         const chat = await newChat({ tools: ['calculator'] });
         await send(chat.id);
         expect(state.toolsSeen).toEqual([null]);
+    });
+
+    test('an answer far too long is cut to the limit, and a call that fails or times out is said plainly while the reply goes on', async () => {
+        const server = await addServer();
+        const chat = await newChat({ tools: [server.id] });
+        state.toolPlan = [[['notes_find_page', { words: 'huge' }]], [['notes_find_page', { words: 'slow' }]]];
+        const events = await send(chat.id, 'find everything');
+        const long = toolTurns(state.chatCalls[1])[0].content;
+        expect(long.length).toBeLessThan(20100);
+        expect(long.startsWith('x'.repeat(1000))).toBe(true);
+        expect(events.filter((event) => event.type === 'toolFailed')).toHaveLength(1);
+        expect(toolTurns(state.chatCalls[2])[1].content).toMatch(/\S/);
+        expect(events.find((event) => event.type === 'done').reply.steps.map((step) => step.failed)).toEqual([null, expect.any(String)]);
+        expect(events.find((event) => event.type === 'done').reply.steps[0].answer.length).toBeLessThanOrEqual(1503);
     });
 
     test('a tool from a tool server is offered under its own name, called on that server, and a failure is passed on plainly', async () => {
