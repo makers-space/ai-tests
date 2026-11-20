@@ -11,12 +11,12 @@ import {
     mapOllamaError, OllamaError, ERROR_CODES,
     parseNvidiaSmi, appleGpus, parseDisplayAdapters, detectHardware,
     fitModel, rankCatalogue, memoryNeededMb, VERDICTS,
-    GenerationQueue, extractText, estimateTokens, setFilesFetch, setFilesWakeMs, setRunnerFetch, setSandboxClient, releaseSandboxes, MAX_ATTACHMENT_BYTES,
+    GenerationQueue, extractText, estimateTokens, setFilesFetch, setFilesWakeMs, setSandboxClient, releaseSandboxes, MAX_ATTACHMENT_BYTES,
     isPublicAddress, setRemoteTransport, MAX_REMOTE_BYTES, setSearchFetch,
     setToolConnector, ToolSignInError, TOOL_HEALTH, TOOL_CATALOGUE, TOOL_LOCAL_CATALOGUE, CLOUD_PROVIDERS, PROVIDER_HEALTH, setCloudFetch, ollamaOnlineNames, runsOnline, seal, unseal, deviceGateway, DeviceGateway, cloudTitle
 } from '../../server/middleware/ai.middleware.js';
 import { Device, Setting, Download, PersonalModel, Chat, Prompt, Guide, GUIDE_STEPS, MANAGER_GUIDE_STEPS, deviceSchemas, modelSchemas, chatSchemas, promptSchemas, ToolServer, TOOL_HEALTH_STATES, toolSchemas, Provider, PROVIDER_HEALTH_STATES, providerSchemas, Skill } from '../../server/models/ai.model.js';
-import { downloads, health, queue, SKILLS, DEFAULT_LIBRARY_SKILLS, COMPONENT_PAGES, COMPONENT_VALUES_PAGE, componentFaults, rankSkills, writtenToolCalls, BUILTIN_TOOLS, waitingPermissions, todayLine, SKILL_SOURCES, MAX_CHAT_SKILLS, SUGGESTED_SKILLS } from '../../server/controllers/ai.controller.js';
+import { downloads, health, queue, SKILLS, DEFAULT_LIBRARY_SKILLS, COMPONENT_PAGES, COMPONENT_VALUES_PAGE, componentFaults, rankSkills, writtenToolCalls, BUILTIN_TOOLS, waitingPermissions, todayLine, SKILL_SOURCES, MAX_CHAT_SKILLS, SUGGESTED_SKILLS, setHairlineWait } from '../../server/controllers/ai.controller.js';
 
 // What a chat is sent when only the default skills are on: the Components skill, the skill map, today's date, and
 // their reminders.
@@ -4489,22 +4489,36 @@ describe('Chat endpoints', () => {
             expect(state.chatCalls[0].tools).toBeUndefined();
         });
 
-        test('with the skill runner set up, the Hairline checks are the kit\'s own scripts run there; when it does not answer, the checks kept here are made', async () => {
+        test('with sandboxes set up, the Hairline checks are the kit\'s own scripts run in one; when it cannot start or is slow, the checks kept here are made', async () => {
             const riffle = fs.readFileSync(new URL('../../server/instructions/library/hairline/hairline-hairline-create/examples/riffle.js', import.meta.url), 'utf8').replace(/\r\n/g, '\n').trim();
             const wrong = riffle.replace(/\bhairline\s*\(\s*\{(?![\s\S]*\bhairline\s*\(\s*\{)/, (found) => `setTimeout(() => {}, 10);\n${found}`);
-            const jobs = [];
-            let runner = 'faulty';
-            process.env.SKILL_RUNNER_URL = 'https://runner.test';
-            process.env.SKILL_RUNNER_SECRET = 'runner-secret';
-            setRunnerFetch(async (url, options) => {
-                const job = JSON.parse(options.body);
-                jobs.push(job);
-                if (runner === 'down') throw new TypeError('fetch failed');
-                if (job.script === 'build.mjs') return json(200, { exitCode: 0, timedOut: false, stdout: 'page.html', stderr: '', files: [{ path: 'page.html', data: Buffer.from('<html>built</html>').toString('base64') }] });
-                return runner === 'clean'
-                    ? json(200, { exitCode: 0, timedOut: false, stdout: 'ok page.html: kernel and bench intact, and the figure passes the static checks.', stderr: '', files: [] })
-                    : json(200, { exitCode: 1, timedOut: false, stdout: '', stderr: 'spin: said by the runner only.\n1 to fix in page.html\n', files: [] });
+            const uploads = [];
+            const ended = [];
+            let mode = 'faulty';
+            let finishSlow = () => {};
+            process.env.SANDBOX_API_KEY = 'rnd_test';
+            process.env.SANDBOX_WORKSPACE_ID = 'tea-test';
+            process.env.SANDBOX_SNAPSHOT = 'mollama-skills';
+            setSandboxClient({
+                create: async () => {
+                    if (mode === 'down') throw new Error('quota reached');
+                    return { id: 'sbx-hairline', status: 'running' };
+                },
+                exec: async (id, line) => {
+                    let events = [{ type: 'exit', exit_code: 0 }];
+                    if (line.includes('timeout')) {
+                        if (mode === 'slow') await new Promise((resolve) => { finishSlow = resolve; });
+                        events = mode === 'clean'
+                            ? [{ type: 'output', stream: 'stdout', data: 'ok page.html: kernel and bench intact, and the figure passes the static checks.\n' }, { type: 'exit', exit_code: 0 }]
+                            : [{ type: 'output', stream: 'stderr', data: 'spin: said by the kit in the sandbox only.\n1 to fix in page.html\n' }, { type: 'exit', exit_code: 1 }];
+                    }
+                    return (async function* () { yield* events; })();
+                },
+                upload: async (id, where, data) => { uploads.push({ where, data: Buffer.from(data).toString() }); },
+                download: async () => ({ data: Buffer.from('') }),
+                terminate: async (id) => { ended.push(id); }
             });
+            setHairlineWait(300);
             try {
                 const build = async (code) => {
                     const chat = await newChat({ model: 'qwen2.5-coder:7b', skills: ['components', 'hairline-hairline-create'] });
@@ -4514,30 +4528,35 @@ describe('Chat endpoints', () => {
                     return state.chatCalls[1].messages.at(-1).content;
                 };
 
-                // The figure goes to build.mjs, and the page it wrote goes to validate.mjs; what validate prints is what the model is told.
+                // The figure goes in as figure.js; build.mjs puts it on the bench and validate.mjs checks the page, both
+                // from the skill's own folder; what validate prints is what the model is told, and the sandbox goes.
                 const told = await build(riffle);
-                expect(jobs.map((job) => [job.skill, job.script, job.args, job.files.map((file) => file.path)])).toEqual([
-                    ['hairline-create', 'build.mjs', ['figure.js', 'page.html'], ['figure.js']],
-                    ['hairline-create', 'validate.mjs', ['page.html'], ['page.html']]
-                ]);
-                expect(Buffer.from(jobs[0].files[0].data, 'base64').toString()).toBe(`${riffle}\n`);
-                expect(Buffer.from(jobs[1].files[0].data, 'base64').toString()).toBe('<html>built</html>');
-                expect(told).toBe('Not shown yet. validate found 1 to fix in hairline-riffle.html:\nspin: said by the runner only.\nFix these in the figure and call hairline_build again with the whole file.');
+                expect(uploads.find((one) => one.where === '/root/work/figure.js').data).toBe(riffle + '\n');
+                const job = uploads.find((one) => one.where === '/root/job/main.sh').data;
+                expect(job).toContain('node /root/skills/hairline-create/build.mjs figure.js page.html');
+                expect(job).toContain('node /root/skills/hairline-create/validate.mjs page.html');
+                expect(ended).toEqual(['sbx-hairline']);
+                expect(told).toBe('Not shown yet. validate found 1 to fix in hairline-riffle.html:\nspin: said by the kit in the sandbox only.\nFix these in the figure and call hairline_build again with the whole file.');
 
                 // A page validate passes is shown.
-                runner = 'clean';
+                mode = 'clean';
                 expect(await build(riffle)).toMatch(/^Built hairline-riffle\.html and showed it to the user in the chat\. validate: ok/);
 
-                // A runner that does not answer is not waited on: the checks kept here speak instead.
-                runner = 'down';
-                const local = await build(wrong);
-                expect(local).toMatch(/^Not shown yet\. validate found 1 to fix/);
-                expect(local).toMatch(/clock: rule 07/);
-                expect(local).not.toMatch(/said by the runner only/);
+                // A sandbox that cannot start, or is slow, is not waited on: the checks kept here speak instead.
+                for (const which of ['down', 'slow']) {
+                    mode = which;
+                    const local = await build(wrong);
+                    expect(local).toMatch(/^Not shown yet\. validate found 1 to fix/);
+                    expect(local).toMatch(/clock: rule 07/);
+                    expect(local).not.toMatch(/said by the kit in the sandbox only/);
+                }
             } finally {
-                setRunnerFetch(null);
-                delete process.env.SKILL_RUNNER_URL;
-                delete process.env.SKILL_RUNNER_SECRET;
+                finishSlow();
+                setHairlineWait(null);
+                setSandboxClient(null);
+                delete process.env.SANDBOX_API_KEY;
+                delete process.env.SANDBOX_WORKSPACE_ID;
+                delete process.env.SANDBOX_SNAPSHOT;
             }
         });
 
@@ -4779,102 +4798,65 @@ describe('Chat endpoints', () => {
             }
         });
 
-        test('an office skill\'s own script runs on the skill runner, on the person\'s files, and only once they allow it', async () => {
-            const runs = [];
+        test('an office skill\'s own scripts run as a program in the sandbox, beside the skill\'s files, and what they make is saved in the person\'s own folder', async () => {
             const uploads = [];
-            process.env.SKILL_RUNNER_URL = 'https://runner.test/';
-            process.env.SKILL_RUNNER_SECRET = 'runner-secret';
-            setRunnerFetch(async (url, options) => {
-                const job = JSON.parse(options.body);
-                runs.push({ url, headers: options.headers, raw: options.body, job });
-                if (job.script === 'scripts/missing.py') return json(404, { detail: 'The skill pdf has no script scripts/missing.py' });
-                if (job.script === 'scripts/slow.py') throw new TypeError('fetch failed');
-                return json(200, { exitCode: job.script === 'scripts/fails.py' ? 2 : 0, timedOut: false, stdout: 'Found 2 fields', stderr: job.script === 'scripts/fails.py' ? 'bad input' : '', files: [{ path: 'fields.json', data: Buffer.from('{"a":1}').toString('base64') }], skipped: [] });
+            const lines = [];
+            process.env.SANDBOX_API_KEY = 'rnd_test';
+            process.env.SANDBOX_WORKSPACE_ID = 'tea-test';
+            process.env.SANDBOX_SNAPSHOT = 'mollama-skills';
+            setSandboxClient({
+                create: async () => ({ id: 'sbx-office', status: 'running' }),
+                exec: async (id, line) => {
+                    lines.push(line);
+                    const events = line.includes('timeout') ? [{ type: 'output', stream: 'stdout', data: 'Found 2 fields\n' }, { type: 'exit', exit_code: 0 }]
+                        : line.startsWith('cd /root/work && find') ? [{ type: 'output', stream: 'stdout', data: 'fields.json\n' }, { type: 'exit', exit_code: 0 }]
+                            : [{ type: 'exit', exit_code: 0 }];
+                    return (async function* () { yield* events; })();
+                },
+                upload: async () => {},
+                download: async () => ({ data: Buffer.from('{"a":1}') }),
+                terminate: async () => {}
             });
             setFilesFetch(async (url, options) => {
                 if (!String(url).endsWith('/files/upload')) return fakeFilesystemOne(url, options);
-                uploads.push({ cookie: options.headers.Cookie, folder: options.body.get('basePath'), paths: options.body.get('relativePaths'), conflict: options.body.get('onConflict'), text: Buffer.from(await options.body.get('files').arrayBuffer()).toString() });
+                uploads.push({ folder: options.body.get('basePath'), paths: options.body.get('relativePaths') });
                 return json(201, { success: true });
             });
             try {
                 const chat = await newChat({ model: 'qwen2.5-coder:7b', skills: ['anthropic-pdf'] });
-                const turn = async (input, answer) => {
-                    state.toolPlan = [[['pdf_script', input]]];
+                const turn = async (input) => {
+                    state.toolPlan = [[['run_program', input]]];
                     state.chatCalls = [];
                     const pending = send(chat.id, { content: 'check the form' });
-                    // A script given no files and no folder touches nothing of the person's, so it is not asked about.
-                    if (!input.files && !input.save_to) {
-                        const { events } = await pending;
-                        expect(events.some((event) => event.type === 'permission')).toBe(false);
-                        return state.chatCalls[1].messages.at(-1).content;
-                    }
                     for (let tries = 0; tries < 200 && !waitingPermissions().some((waiting) => waiting.chatId === chat.id); tries += 1) await wait(25);
-                    const waiting = waitingPermissions().find((one) => one.chatId === chat.id);
-                    expect(waiting).toBeTruthy();
-                    expect((await post(`/chats/${chat.id}/permission`, { id: waiting.id, answer })).status).toBe(200);
+                    await post(`/chats/${chat.id}/permission`, { id: waitingPermissions().find((one) => one.chatId === chat.id).id, answer: 'once' });
                     await pending;
                     return state.chatCalls[1].messages.at(-1).content;
                 };
-                const work = { script: 'python scripts/extract_form_field_info.py', args: ['report.pdf', 'fields.json'], files: ['/docs/report.pdf'] };
+                const work = { language: 'bash', code: 'python /root/skills/pdf/scripts/extract_form_field_info.py report.pdf fields.json', files: ['/docs/report.pdf'] };
 
-                // It changes the person's files, so it waits for them; refused, nothing leaves this server.
-                await turn(work, 'no');
-                expect(runs).toHaveLength(0);
-                expect(uploads).toHaveLength(0);
-
-                // Allowed: the file is read with the person's own sign-in, sent to the runner in a signed request, and what
-                // the script made is saved beside it without overwriting anything.
-                const told = await turn(work, 'once');
-                expect(runs).toHaveLength(1);
-                expect(runs[0].url).toBe('https://runner.test/run');
-                expect(runs[0].job).toEqual({ skill: 'pdf', script: 'scripts/extract_form_field_info.py', args: ['report.pdf', 'fields.json'], files: [{ path: 'report.pdf', data: fsFiles['/docs/report.pdf'].bytes.toString('base64') }] });
-                expect(runs[0].headers['X-Runner-Signature']).toBe(crypto.createHmac('sha256', 'runner-secret').update(`${runs[0].headers['X-Runner-Timestamp']}.${runs[0].raw}`).digest('hex'));
-                expect(runs[0].raw).not.toContain('accessToken');
-                expect(uploads).toHaveLength(1);
-                expect(uploads[0]).toMatchObject({ folder: '/docs', paths: '["fields.json"]', conflict: 'rename', text: '{"a":1}' });
-                expect(uploads[0].cookie).toMatch(/accessToken=\S+/);
-                expect(told).toMatch(/^scripts\/extract_form_field_info\.py report\.pdf fields\.json finished with exit code 0\./);
+                // There is no script function of its own any more: run_program is offered, and says where the skill's files are.
+                const told = await turn(work);
+                const names = state.chatCalls[0].tools.map((tool) => tool.function.name);
+                expect(names).toContain('run_program');
+                expect(names.some((name) => name.endsWith('_script'))).toBe(false);
+                expect(state.chatCalls[0].tools.find((tool) => tool.function.name === 'run_program').function.description).toContain('PDF in /root/skills/pdf');
+                expect(lines.find((line) => line.includes('timeout'))).toMatch(/timeout -k 5 300 bash \/root\/job\/main\.sh$/);
                 expect(told).toMatch(/It printed:\nFound 2 fields/);
-                expect(told).toMatch(/Saved in \/docs: fields\.json\./);
-                const offered = state.chatCalls[0].tools.find((tool) => tool.function.name === 'pdf_script');
-                expect(offered.function.description).toMatch(/^Runs one of the pdf skill's own scripts/);
-                expect(Object.keys(offered.function.parameters.properties)).toEqual(['script', 'args', 'files', 'save_to']);
-
-                // A script that fails says so with what it printed; one the skill does not have, a file that is not
-                // there, and a runner that does not answer each say that nothing was run.
-                expect(await turn({ ...work, script: 'scripts/fails.py' }, 'once')).toMatch(/finished with exit code 2\.[\s\S]*Errors:\nbad input/);
-                expect(await turn({ script: 'scripts/missing.py' }, 'once')).toBe('Nothing was run. The skill pdf has no script scripts/missing.py');
-                expect(await turn({ ...work, files: ['/docs/nothing.pdf'] }, 'once')).toMatch(/^Nothing was run\. A file could not be read from the user's FilesystemOne: \/docs\/nothing\.pdf/);
-                expect(await turn({ script: 'scripts/slow.py' }, 'once')).toMatch(/^Nothing was run\. The skill runner could not be reached/);
-                // A script that makes a file with nowhere to put it says so.
-                expect(await turn({ script: 'scripts/extract_form_field_info.py' }, 'once')).toMatch(/It made fields\.json, but nothing was saved: call again with save_to/);
-                // A folder the model names goes inside the person's own folder; the folder of a file it was given stays.
-                expect(await turn({ ...work, save_to: '/Gearbox' }, 'once')).toMatch(/Saved in \/[a-z0-9]+\/Gearbox: fields\.json\./);
+                // Saved beside the file it was given, or, for a folder the model names, inside the person's own folder.
+                expect(uploads.at(-1)).toEqual({ folder: '/docs', paths: '["fields.json"]' });
+                expect(await turn({ ...work, save_to: '/Gearbox' })).toMatch(/Saved in \/[a-z0-9]+\/Gearbox: fields\.json\./);
                 expect(uploads.at(-1).folder).toMatch(/^\/[a-z0-9]+\/Gearbox$/);
-                await turn({ ...work, save_to: '/docs' }, 'once');
-                expect(uploads.at(-1).folder).toBe('/docs');
 
-                // Only the skill's own scripts run, so the skill still says what it lacks.
-                expect((await get('/skills')).data.skills.find((skill) => skill.id === 'anthropic-pdf').needs).toContain('commands');
-
-                // Every skill whose scripts are on the runner gets a function named after it.
-                const tracking = await newChat({ model: 'qwen2.5-coder:7b', skills: ['marketing-conversion-tracking'] });
-                state.toolPlan = [];
-                state.chatCalls = [];
-                await send(tracking.id, { content: 'hello' });
-                expect(state.chatCalls[0].tools.map((tool) => tool.function.name)).toContain('conversion_tracking_script');
-
-                // Without the runner's address and secret the function is not offered at all.
-                delete process.env.SKILL_RUNNER_SECRET;
-                state.toolPlan = [];
-                state.chatCalls = [];
-                await send(chat.id, { content: 'hello' });
-                expect((state.chatCalls[0].tools || []).some((tool) => tool.function.name === 'pdf_script')).toBe(false);
+                // With sandboxes set up the skill lacks nothing.
+                expect((await get('/skills')).data.skills.find((skill) => skill.id === 'anthropic-pdf').needs).not.toContain('commands');
             } finally {
-                setRunnerFetch(null);
+                await releaseSandboxes();
+                setSandboxClient(null);
                 setFilesFetch(fakeFilesystemOne);
-                delete process.env.SKILL_RUNNER_URL;
-                delete process.env.SKILL_RUNNER_SECRET;
+                delete process.env.SANDBOX_API_KEY;
+                delete process.env.SANDBOX_WORKSPACE_ID;
+                delete process.env.SANDBOX_SNAPSHOT;
             }
         });
 
