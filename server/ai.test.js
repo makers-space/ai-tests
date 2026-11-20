@@ -16,7 +16,7 @@ import {
     setToolConnector, ToolSignInError, TOOL_HEALTH, TOOL_CATALOGUE, TOOL_LOCAL_CATALOGUE, CLOUD_PROVIDERS, PROVIDER_HEALTH, setCloudFetch, ollamaOnlineNames, runsOnline, seal, unseal, deviceGateway, DeviceGateway, cloudTitle
 } from '../../server/middleware/ai.middleware.js';
 import { Device, Setting, Download, PersonalModel, Chat, Prompt, Guide, GUIDE_STEPS, MANAGER_GUIDE_STEPS, deviceSchemas, modelSchemas, chatSchemas, promptSchemas, ToolServer, TOOL_HEALTH_STATES, toolSchemas, Provider, PROVIDER_HEALTH_STATES, providerSchemas, Skill } from '../../server/models/ai.model.js';
-import { downloads, health, queue, SKILLS, DEFAULT_LIBRARY_SKILLS, COMPONENT_PAGES, COMPONENT_VALUES_PAGE, componentFaults, rankSkills, writtenToolCalls, BUILTIN_TOOLS, waitingPermissions, todayLine, SKILL_SOURCES, MAX_CHAT_SKILLS, SUGGESTED_SKILLS, setHairlineWait, setToolCallLimit } from '../../server/controllers/ai.controller.js';
+import { downloads, health, queue, SKILLS, DEFAULT_LIBRARY_SKILLS, COMPONENT_PAGES, COMPONENT_VALUES_PAGE, componentFaults, rankSkills, writtenToolCalls, BUILTIN_TOOLS, waitingPermissions, todayLine, SKILL_SOURCES, MAX_CHAT_SKILLS, SUGGESTED_SKILLS, setHairlineWait, setToolCallLimit, skillLinks } from '../../server/controllers/ai.controller.js';
 
 // What a chat is sent when only the default skills are on: the Components skill, the skill map, today's date, and
 // their reminders.
@@ -4282,7 +4282,11 @@ describe('Chat endpoints', () => {
             expect(first.options.num_ctx).toBeGreaterThanOrEqual(8192);
 
             // The skill's own page comes back as the answer, and the chat shows the step.
-            expect(state.chatCalls[1].messages.at(-1)).toMatchObject({ role: 'tool', content: copy.text });
+            // It ends with the skills it goes with, those on in the chat apart from those in the library.
+            const opened = state.chatCalls[1].messages.at(-1);
+            expect(opened.role).toBe('tool');
+            expect(opened.content.startsWith(copy.text)).toBe(true);
+            expect(opened.content.slice(copy.text.length)).toMatch(/^\n\nGOES WITH\n(On in this chat, open with open_skill when the request needs it: .+\.\n)?In the library, not on: .+\. When one would help, tell the user its name; they turn it on under Skills\.$/);
             expect(list.find((event) => event.type === 'tool')).toMatchObject({ tool: 'Skill', input: 'Copywriting' });
             expect(list.at(-1).reply.steps.map(({ tool, input, failed }) => ({ tool, input, failed: failed || null }))).toEqual([{ tool: 'Skill', input: 'Copywriting', failed: null }]);
             expect(list.at(-1).reply.content).toBe('Here is the headline.');
@@ -4298,7 +4302,7 @@ describe('Chat endpoints', () => {
             state.toolPlan = [[['Grilling', {}], ['open_skill', { skill: 'nothing here' }]]];
             const { events: more } = await send(chat.id, { content: 'grill me' });
             const answers = state.chatCalls[1].messages.filter((message) => message.role === 'tool');
-            expect(answers[0].content).toBe(grill.text);
+            expect(answers[0].content.startsWith(grill.text)).toBe(true);
             expect(answers[1].content).toMatch(/^There is no skill by that name in this chat\. The skills are: Grilling\.$/);
             expect(more.at(-1).reply.steps.map(({ tool, input, failed }) => ({ tool, input, failed: failed || null }))).toEqual([{ tool: 'Skill', input: 'Grilling', failed: null }, { tool: 'Skill', input: 'nothing here', failed: 'failed' }]);
 
@@ -4307,6 +4311,47 @@ describe('Chat endpoints', () => {
             await send(chat.id, { content: 'thanks' });
             expect((state.chatCalls[0].tools || []).some((tool) => tool.function.name === 'open_skill')).toBe(false);
             expect(state.chatCalls[0].messages[0].content).toContain(grill.text);
+        });
+
+        test('skills are linked by what they say about each other, with no model: only names written as skills count', async () => {
+            const skill = (id, name, text, source = 'demo') => ({ id: `${source}-${id}`, name, source, text });
+            const all = [
+                skill('cold-email', 'Cold Email', 'Write the email. For the subject line use the `copywriting` skill.'),
+                skill('copywriting', 'Copywriting', 'Pair with the Customer Research skill. See scripts/pr or https://x.example/pr; a PR and a pdf are not skills.'),
+                skill('customer-research', 'Customer Research', 'Run /cold-email when the list is ready.'),
+                skill('pr', 'PR', 'Opens a pull request.'),
+                skill('review', 'Review', 'A review of the week.'),
+                skill('weekly', 'Weekly', 'Every week, review what happened.'),
+                skill('copywriting', 'Copywriting', 'Another project\'s skill of the same name.', 'other'),
+                skill('anatomy', 'Anatomy', 'Draws machines.'),
+                skill('hairline-create', 'Hairline Create', 'Line figures.')
+            ];
+            const links = skillLinks(all, 'Anatomy and Hairline Create together\nAnatomy draws it; Hairline Create moves one part.\n\nA plain question\nNo skill.');
+            const names = (id) => links.get(id).map((one) => all.find((s) => s.id === one).name);
+            // A backtick name, "the X skill" and a /command all count, and every link goes both ways.
+            expect(names('demo-cold-email')).toEqual(expect.arrayContaining(['Copywriting', 'Customer Research']));
+            expect(names('demo-copywriting')).toEqual(expect.arrayContaining(['Cold Email', 'Customer Research']));
+            // A path, an address, or a short or one-word name used as an ordinary word does not.
+            expect(names('demo-pr')).toEqual([]);
+            expect(names('demo-review')).toEqual([]);
+            // Two skills of the same name are never linked to each other.
+            expect(names('other-copywriting')).not.toContain('Copywriting');
+            // The combining guide links the skills it names together.
+            expect(names('demo-anatomy')).toEqual(['Hairline Create']);
+
+            // On the real library: Mollama's own figure skills are linked through the guide, and no skill has more than six links.
+            const real = skillLinks(SKILLS.filter((one) => one.source !== 'mollama'), fs.readFileSync(new URL('../../server/instructions/skills/skill-map/examples/combining.md', import.meta.url), 'utf8'));
+            expect(real.get('anatomy-anatomy')).toEqual(expect.arrayContaining(['hairline-hairline-create']));
+            expect([...real.values()].every((list) => list.length <= 6)).toBe(true);
+        });
+
+        test('find_skill also brings the skills its best matches go with', async () => {
+            const chat = await newChat({ model: 'qwen2.5-coder:7b' });
+            state.toolPlan = [[['find_skill', { query: 'anatomy' }]]];
+            await send(chat.id, { content: 'draw an engine' });
+            const answer = state.chatCalls[1].messages.find((message) => message.role === 'tool').content;
+            expect(answer).toContain('- Anatomy (');
+            expect(answer).toMatch(/- Hairline Create \([^)]+\): .* Goes with Anatomy\./);
         });
 
         test('a model can look in the skill library for a skill that is not on, and is told it cannot turn one on', async () => {
@@ -4323,7 +4368,8 @@ describe('Chat endpoints', () => {
             const cold = SKILLS.find((skill) => skill.id === 'marketing-cold-email');
             expect(answers[0].content.split('\n')[0]).toMatch(/^These skills are not turned on in this chat\. Tell the user by name which one would help/);
             expect(answers[0].content.split('\n')[1]).toBe(`- Cold Email (Marketing (Corey Haines)): ${cold.description}`);
-            expect(answers[0].content.split('\n').length).toBeLessThanOrEqual(6);
+            // Five matches at most, and up to three skills the best two go with.
+            expect(answers[0].content.split('\n').length).toBeLessThanOrEqual(9);
             expect(answers[0].content).not.toContain(cold.text.slice(40, 200));
             expect(answers[1].content).toBe('No skill in the library matches. Answer without one.');
             expect(list.at(-1).reply.steps.map(({ tool, input }) => ({ tool, input }))).toEqual([{ tool: 'Skill library', input: 'cold email' }, { tool: 'Skill library', input: 'zzzz' }]);
