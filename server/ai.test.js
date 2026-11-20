@@ -2577,7 +2577,7 @@ describe('Chat endpoints', () => {
             const answers = state.chatCalls[1].messages.filter((message) => message.role === 'tool');
             expect(answers[0].content).toBe(COMPONENT_PAGES.find((page) => page.name === 'Badge').text);
             expect(answers[1].content).toMatch(/4/);
-            expect(answers[2].content).toMatch(/^There is no function called fly_to_the_moon\. The functions you can call are: open_component, open_skill, find_skill, ask_user, date_time, calculator, read_web_page\.$/);
+            expect(answers[2].content).toMatch(/^There is no function called fly_to_the_moon\. The functions you can call are: open_component, find_skill, ask_user, date_time, calculator, read_web_page\.$/);
             expect(list.at(-1).reply.steps.map(({ tool, failed }) => ({ tool, failed: failed || null }))).toEqual([{ tool: 'Component', failed: null }, { tool: 'Calculator', failed: null }, { tool: 'fly_to_the_moon', failed: 'failed' }]);
             state.toolPlan = [];
         });
@@ -3682,13 +3682,13 @@ describe('Chat endpoints', () => {
                 state.toolsSeen = [];
                 const chat = await newChat({ model: 'qwen2.5-coder:7b' });
                 await send(chat.id, { content: 'find a duck model' });
-                expect(state.toolsSeen[0].map((tool) => tool.function.name)).toEqual(['web_search', 'web_fetch', 'open_component', 'open_skill', 'find_skill', 'ask_user', 'date_time', 'calculator']);
+                expect(state.toolsSeen[0].map((tool) => tool.function.name)).toEqual(['web_search', 'web_fetch', 'open_component', 'find_skill', 'ask_user', 'date_time', 'calculator']);
 
                 // Switched off for the chat, the search tools go and the built-in reader is back.
                 state.toolsSeen = [];
                 const quiet = await newChat({ model: 'qwen2.5-coder:7b', webSearch: false });
                 await send(quiet.id, { content: 'find a duck model' });
-                expect(state.toolsSeen[0].map((tool) => tool.function.name)).toEqual(['open_component', 'open_skill', 'find_skill', 'ask_user', 'date_time', 'calculator', 'read_web_page']);
+                expect(state.toolsSeen[0].map((tool) => tool.function.name)).toEqual(['open_component', 'find_skill', 'ask_user', 'date_time', 'calculator', 'read_web_page']);
             });
         });
 
@@ -4046,7 +4046,7 @@ describe('Chat endpoints', () => {
             const listed = (await get('/skills')).data.skills;
             expect(listed.map((skill) => skill.id)).toEqual(SKILLS.map((skill) => skill.id));
             expect(listed.find((skill) => skill.id === 'components')).toMatchObject({ default: true });
-            expect(listed.filter((skill) => skill.default).map((skill) => [skill.id, skill.default])).toEqual([['components', true], ['taste-taste-skill', 'tools']]);
+            expect(listed.filter((skill) => skill.default).map((skill) => [skill.id, skill.default])).toEqual([['components', true]]);
             expect(listed.find((skill) => skill.id === 'marketing-copywriting')).toMatchObject({ name: 'Copywriting', source: 'marketing', credit: 'coreyhaines31/marketingskills (MIT)', default: false });
             expect(listed[0].text).toBeUndefined();
 
@@ -4065,7 +4065,7 @@ describe('Chat endpoints', () => {
             const none = (await client.patch(`/api/v1/chats/${chat.id}`, { skills: [] })).data.chat;
             expect(none.skills).toEqual([]);
             const back = (await client.patch(`/api/v1/chats/${chat.id}`, { skills: null })).data.chat;
-            expect(back.skills).toEqual(['components', 'taste-taste-skill']);
+            expect(back.skills).toEqual(['components']);
             expect((await client.patch(`/api/v1/chats/${chat.id}`, { skills: ['Bad Id'] })).status).toBe(400);
         });
 
@@ -4127,7 +4127,7 @@ describe('Chat endpoints', () => {
             const { events: list } = await send(chat.id, { content: 'write a cold email' });
 
             const finder = state.toolsSeen[0].find((tool) => tool.function.name === 'find_skill');
-            expect(finder.function.description).toContain(`Search the library of ${SKILLS.length - 2} skills`);
+            expect(finder.function.description).toContain(`Search the library of ${SKILLS.length - 1} skills`);
             expect(finder.function.description).toMatch(/You cannot turn a skill on yourself: when one would help, tell the user its name/);
             const answers = state.chatCalls[1].messages.filter((message) => message.role === 'tool');
             const cold = SKILLS.find((skill) => skill.id === 'marketing-cold-email');
@@ -4138,7 +4138,7 @@ describe('Chat endpoints', () => {
             expect(answers[1].content).toBe('No skill in the library matches. Answer without one.');
             expect(list.at(-1).reply.steps.map(({ tool, input }) => ({ tool, input }))).toEqual([{ tool: 'Skill library', input: 'cold email' }, { tool: 'Skill library', input: 'zzzz' }]);
             // Looking is all it does: the chat's skills are unchanged.
-            expect((await get(`/chats/${chat.id}`)).data.chat.skills).toEqual(['components', 'taste-taste-skill']);
+            expect((await get(`/chats/${chat.id}`)).data.chat.skills).toEqual(['components']);
 
             // A skill that is already on is not offered again by the search.
             state.toolsSeen = [];
@@ -6127,7 +6127,7 @@ describe('Online model providers', () => {
         expect(call.body.messages.at(-1)).toEqual({ role: 'user', content: 'Say hello' });
         // Besides the conversation, the functions every chat is offered: the search of the skill library and the built-in tools.
         expect(Object.keys(call.body).sort()).toEqual(['messages', 'model', 'stream', 'stream_options', 'tools']);
-        expect(call.body.tools.map((tool) => tool.function.name)).toEqual(['open_component', 'open_skill', 'find_skill', 'ask_user', 'date_time', 'calculator', 'read_web_page']);
+        expect(call.body.tools.map((tool) => tool.function.name)).toEqual(['open_component', 'find_skill', 'ask_user', 'date_time', 'calculator', 'read_web_page']);
         expect(call.body.options).toBeUndefined();
         expect(call.body.keep_alive).toBeUndefined();
 
@@ -6283,7 +6283,7 @@ describe('Tools in chats', () => {
         state.toolsSeen = [];
         state.toolPlan = [[['calculator', { expression: '6 * 7' }]]];
         const events = await send(chat.id, 'what is six times seven');
-        expect(state.toolsSeen[0].map((tool) => tool.function.name)).toEqual(['open_component', 'open_skill', 'find_skill', 'ask_user', 'date_time', 'calculator', 'read_web_page']);
+        expect(state.toolsSeen[0].map((tool) => tool.function.name)).toEqual(['open_component', 'find_skill', 'ask_user', 'date_time', 'calculator', 'read_web_page']);
         expect(JSON.stringify(state.chatCalls[0].messages)).not.toContain('You have tools for this chat');
         expect(events.find((event) => event.type === 'tool')).toMatchObject({ tool: 'Calculator', input: '{"expression":"6 * 7"}' });
         expect(toolTurns(state.chatCalls[1])).toEqual([{ role: 'tool', tool_name: 'calculator', content: '42' }]);
