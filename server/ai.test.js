@@ -998,7 +998,14 @@ describe('Model validation', () => {
 });
 
 describe('Model endpoints', () => {
-    const post = (path, body) => client.post(`/api/v1${path}`, body);
+    // A removal or download names the computer it is for, as the page does; here, the suite's stand-in computer.
+    const CONFIRMED = ['/models/delete', '/models/pull'];
+    let standIn = null;
+    const post = async (path, body) => {
+        if (!CONFIRMED.includes(path)) return client.post(`/api/v1${path}`, body);
+        standIn = standIn || String((await Device.findOne({ kind: 'local', service: 'ai-base' }))._id);
+        return client.post(`/api/v1${path}`, body, { headers: { 'X-Mollama-Device': standIn } });
+    };
     const get = (path) => client.get(`/api/v1${path}`);
     const signOut = () => {
         client.clearCookies();
@@ -1159,6 +1166,22 @@ describe('Model endpoints', () => {
             const response = await post('/models/delete', { name: 'custom-thing:latest' });
             expect(response.status).toBe(200);
             expect(state.models.map((model) => model.name)).toEqual(['qwen2.5-coder:7b']);
+        });
+
+        test('a removal or download that names no computer of the person\'s is refused, and nothing is removed', async () => {
+            await testStartup.loginAsUser('admin');
+            const before = state.models.map((model) => model.name);
+            const unnamed = { validateStatus: () => true };
+            const elsewhere = { headers: { 'X-Mollama-Device': '64b7f0c2a1b2c3d4e5f60718' }, validateStatus: () => true };
+            for (const [path, body] of [['/models/delete', { name: before[0] }], ['/models/pull', { name: 'llama3.2:3b' }]]) {
+                for (const config of [unnamed, elsewhere]) {
+                    const response = await client.post(`/api/v1${path}`, body, config);
+                    expect(response.status).toBe(400);
+                    expect(response.data).toMatchObject({ code: 'DEVICE_NOT_NAMED', message: 'Choose the computer first. Nothing was removed or downloaded.' });
+                }
+            }
+            expect(state.models.map((model) => model.name)).toEqual(before);
+            expect((await get('/models/downloads')).data.downloads.some((job) => job.model === 'llama3.2:3b' && job.status !== 'cancelled')).toBe(false);
         });
 
         test('deleting a model that is not there answers 404', async () => {
@@ -5642,7 +5665,8 @@ describe('Linked devices', () => {
         const { id, key } = await link('second-computer');
         const app = await fakeApp(id, key, { holdPull: true });
 
-        const onServer = await client.post('/api/v1/models/pull', { name: model });
+        const standIn = String((await Device.findOne({ kind: 'local', service: 'ai-base' }))._id);
+        const onServer = await client.client.post('/api/v1/models/pull', { name: model }, through(standIn));
         const onLinked = await client.client.post('/api/v1/models/pull', { name: model }, through(id));
         expect(onServer.status).toBe(202);
         expect(onLinked.status).toBe(202);
