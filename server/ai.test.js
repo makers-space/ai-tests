@@ -11,7 +11,7 @@ import {
     mapOllamaError, OllamaError, ERROR_CODES,
     parseNvidiaSmi, appleGpus, parseDisplayAdapters, detectHardware,
     fitModel, rankCatalogue, memoryNeededMb, VERDICTS,
-    GenerationQueue, extractText, estimateTokens, setFilesFetch, setFilesWakeMs, setRunnerFetch, setSandboxClient, MAX_ATTACHMENT_BYTES,
+    GenerationQueue, extractText, estimateTokens, setFilesFetch, setFilesWakeMs, setRunnerFetch, setSandboxClient, releaseSandboxes, MAX_ATTACHMENT_BYTES,
     isPublicAddress, setRemoteTransport, MAX_REMOTE_BYTES, setSearchFetch,
     setToolConnector, ToolSignInError, TOOL_HEALTH, TOOL_CATALOGUE, TOOL_LOCAL_CATALOGUE, CLOUD_PROVIDERS, PROVIDER_HEALTH, setCloudFetch, ollamaOnlineNames, runsOnline, seal, unseal, deviceGateway, DeviceGateway, cloudTitle
 } from '../../server/middleware/ai.middleware.js';
@@ -4561,6 +4561,7 @@ describe('Chat endpoints', () => {
                 exec: async (id, line) => {
                     lines.push(line);
                     if (fault === 'run' && line.includes('timeout')) throw new Error('stream lost');
+                    if (fault === 'gone' && id === 'sbx-1') throw new Error('sandbox not found');
                     const events = line.includes('timeout') ? [{ type: 'output', stream: 'stdout', data: 'made it\n' }, { type: 'exit', exit_code: 0 }]
                         : line.startsWith('cd /root/work && find') ? [{ type: 'output', stream: 'stdout', data: madeList }, { type: 'exit', exit_code: 0 }]
                             : [{ type: 'exit', exit_code: 0 }];
@@ -4604,19 +4605,39 @@ describe('Chat endpoints', () => {
                 expect(lines.find((line) => line.includes('timeout'))).toMatch(/^cd \/root\/work && export .*timeout -k 5 300 python \/root\/job\/main\.py$/);
                 expect(lines.join('\n')).not.toMatch(/rnd_test|tea-test/);
                 expect(uploads).toEqual([{ folder: '/docs', paths: '["out/summary.pdf","notes.txt"]', conflict: 'rename' }]);
-                expect(ended).toEqual(['sbx-1']);
+                // The sandbox is kept for this chat, so what the run left is there for the next one.
+                expect(ended).toEqual([]);
                 expect(told).toMatch(/^The python program finished with exit code 0\.\n\nIt printed:\nmade it/);
                 expect(told).toMatch(/Saved in \/docs: out\/summary\.pdf, notes\.txt\./);
                 const offered = state.chatCalls[0].tools.find((tool) => tool.function.name === 'run_program');
                 expect(offered.function.description).toMatch(/no network/);
                 expect(offered.function.description).toMatch(/PDF in \/root\/skills\/pdf/);
+                expect(offered.function.parameters.properties.minutes).toMatchObject({ minimum: 1, maximum: 30 });
 
-                // A sandbox that cannot start, and a run that breaks, each say nothing was run; a started one still goes.
+                // The next run in the chat uses the same sandbox, and may be given longer to run.
+                lines.length = 0;
+                expect(await turn({ ...work, minutes: 20 }, 'once')).toMatch(/^The python program finished/);
+                expect(made).toHaveLength(1);
+                expect(lines.find((line) => line.includes('timeout'))).toMatch(/timeout -k 5 1200 python/);
+
+                // A kept sandbox that has gone is replaced, and the model is told the earlier files are gone.
+                fault = 'gone';
+                expect(await turn(work, 'once')).toMatch(/^This run started on a fresh computer: the files earlier runs left are gone\.\n\nThe python program finished/);
+                expect(made).toHaveLength(2);
+                expect(ended).toEqual(['sbx-1']);
+                fault = null;
+
+                // Left alone, a kept sandbox is let go.
+                await releaseSandboxes();
+                expect(ended).toEqual(['sbx-1', 'sbx-2']);
+
+                // A sandbox that cannot start, and a run that breaks, each say nothing was run.
                 fault = 'start';
                 expect(await turn(work, 'once')).toBe('Nothing was run. A sandbox could not be started: quota reached');
                 fault = 'run';
                 expect(await turn(work, 'once')).toBe('Nothing was run. stream lost');
-                expect(ended).toEqual(['sbx-1', 'sbx-2']);
+                await releaseSandboxes();
+                expect(ended).toEqual(['sbx-1', 'sbx-2', 'sbx-3']);
                 fault = null;
                 expect(await turn({ language: 'ruby', code: 'puts 1', files: ['/docs/report.pdf'] }, 'once')).toMatch(/^Nothing was run\. Say what the program is written in/);
 
@@ -4664,6 +4685,7 @@ describe('Chat endpoints', () => {
                 expect((state.chatCalls[0].tools || []).some((tool) => tool.function.name === 'run_program')).toBe(false);
                 expect(await lacks('anatomy-anatomy')).toEqual(['commands']);
             } finally {
+                await releaseSandboxes();
                 setSandboxClient(null);
                 setFilesFetch(fakeFilesystemOne);
                 delete process.env.SANDBOX_API_KEY;
