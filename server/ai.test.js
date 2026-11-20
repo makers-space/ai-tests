@@ -752,7 +752,7 @@ const fakeOllama = (host, signal) => ({
             modelfile: `FROM ${model}`,
             parameters: 'temperature 0.7',
             template: '{{ .Prompt }}',
-            capabilities: state.noTools ? ['completion'] : state.thinkingModel ? ['completion', 'tools', 'thinking'] : ['completion', 'tools'],
+            capabilities: [...(state.noTools ? ['completion'] : state.thinkingModel ? ['completion', 'tools', 'thinking'] : ['completion', 'tools']), ...(state.vision ? ['vision'] : [])],
             model_info: { 'testfam.context_length': state.contextLength },
             details: { family: 'testfam' }
         };
@@ -3116,6 +3116,40 @@ describe('Chat endpoints', () => {
     });
 
     describe('Attachments', () => {
+        test('an image is kept as it is for a model that can see, sent with the next message, and refused for one that cannot', async () => {
+            const png = Buffer.concat([Buffer.from('89504e470d0a1a0a0000000d49484452', 'hex'), Buffer.alloc(200, 7)]);
+            state.vision = true;
+            try {
+                const chat = await newChat({ model: 'qwen2.5-coder:7b' });
+                const attached = await upload(chat.id, 'photo.png', png);
+                expect(attached.status).toBe(201);
+                expect(attached.data.chat.pendingAttachments[0]).toMatchObject({ name: 'photo.png', image: true, chars: 0, tokens: 1000 });
+                expect(JSON.stringify(attached.data)).not.toContain(png.toString('base64'));
+
+                state.chatCalls.length = 0;
+                await send(chat.id, { content: 'what is this?' });
+                const sentNow = state.chatCalls[0].messages.at(-1);
+                expect(sentNow.images).toEqual([png.toString('base64')]);
+                expect(sentNow.content).toBe('what is this?');
+
+                // Too large to keep with a chat.
+                const large = await upload(chat.id, 'big.jpg', Buffer.alloc(4 * 1024 * 1024 + 1, 1));
+                expect(large.status).toBe(413);
+                expect(large.data.code).toBe('IMAGE_TOO_LARGE');
+
+                // A model that cannot see is not sent images, and a new one is refused.
+                state.vision = false;
+                state.chatCalls.length = 0;
+                await send(chat.id, { content: 'and now?' });
+                expect(state.chatCalls[0].messages.some((message) => message.images)).toBe(false);
+                const refused = await upload(chat.id, 'photo.png', png);
+                expect(refused.status).toBe(400);
+                expect(refused.data).toMatchObject({ code: 'NO_VISION', message: 'This model cannot see images.' });
+            } finally {
+                state.vision = false;
+            }
+        });
+
         test.each([
             ['notes.txt', () => Buffer.from('The harbour is twelve metres deep.'), 'twelve metres'],
             ['figures.csv', () => Buffer.from('port,depth\nHarwich,12'), 'Harwich,12'],
@@ -3146,7 +3180,7 @@ describe('Chat endpoints', () => {
 
         test('a file that is not text is refused in plain words', async () => {
             const chat = await newChat();
-            const response = await upload(chat.id, 'photo.png', Buffer.from([0x89, 0x50, 0x4e, 0x47, 0, 0, 0, 13]));
+            const response = await upload(chat.id, 'bundle.zip', Buffer.from([0x50, 0x4b, 3, 4, 0, 0, 0, 13, 0, 1, 2, 0xff]));
             expect(response.status).toBe(415);
             expect(response.data).toMatchObject({ success: false, code: 'FILE_UNREADABLE' });
         });
