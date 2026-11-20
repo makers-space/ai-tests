@@ -11,7 +11,7 @@ import {
     mapOllamaError, OllamaError, ERROR_CODES,
     parseNvidiaSmi, appleGpus, parseDisplayAdapters, detectHardware,
     fitModel, rankCatalogue, memoryNeededMb, VERDICTS,
-    GenerationQueue, extractText, estimateTokens, setFilesFetch, setRunnerFetch, MAX_ATTACHMENT_BYTES,
+    GenerationQueue, extractText, estimateTokens, setFilesFetch, setRunnerFetch, setSandboxClient, MAX_ATTACHMENT_BYTES,
     isPublicAddress, setRemoteTransport, MAX_REMOTE_BYTES, setSearchFetch,
     setToolConnector, ToolSignInError, TOOL_HEALTH, TOOL_CATALOGUE, TOOL_LOCAL_CATALOGUE, CLOUD_PROVIDERS, PROVIDER_HEALTH, setCloudFetch, ollamaOnlineNames, runsOnline, seal, unseal, deviceGateway, DeviceGateway, cloudTitle
 } from '../../server/middleware/ai.middleware.js';
@@ -4366,6 +4366,105 @@ describe('Chat endpoints', () => {
                 setRunnerFetch(null);
                 delete process.env.SKILL_RUNNER_URL;
                 delete process.env.SKILL_RUNNER_SECRET;
+            }
+        });
+
+        test('a program the model writes runs in a sandbox with no network, on the person\'s files, once they allow it, and the sandbox is always thrown away', async () => {
+            const made = [];
+            const uploads = [];
+            const lines = [];
+            const sent = [];
+            const ended = [];
+            let fault = null;
+            process.env.SANDBOX_API_KEY = 'rnd_test';
+            process.env.SANDBOX_WORKSPACE_ID = 'tea-test';
+            process.env.SANDBOX_SNAPSHOT = 'mollama-skills';
+            setSandboxClient({
+                create: async (options) => {
+                    if (fault === 'start') throw new Error('quota reached');
+                    made.push(options);
+                    return { id: `sbx-${made.length}`, status: 'running' };
+                },
+                exec: async (id, line) => {
+                    lines.push(line);
+                    if (fault === 'run' && line.includes('timeout')) throw new Error('stream lost');
+                    const events = line.includes('timeout') ? [{ type: 'output', stream: 'stdout', data: 'made it\n' }, { type: 'exit', exit_code: 0 }]
+                        : line.startsWith('cd /root/work && find') ? [{ type: 'output', stream: 'stdout', data: 'out/summary.pdf\nnotes.txt\n' }, { type: 'exit', exit_code: 0 }]
+                            : [{ type: 'exit', exit_code: 0 }];
+                    return (async function* () { yield* events; })();
+                },
+                upload: async (id, where, data) => { sent.push({ id, where, data: Buffer.from(data).toString() }); },
+                download: async (id, where) => ({ data: Buffer.from(`content of ${where}`) }),
+                terminate: async (id) => { ended.push(id); }
+            });
+            setFilesFetch(async (url, options) => {
+                if (!String(url).endsWith('/files/upload')) return fakeFilesystemOne(url, options);
+                uploads.push({ folder: options.body.get('basePath'), paths: options.body.get('relativePaths'), conflict: options.body.get('onConflict') });
+                return json(201, { success: true });
+            });
+            try {
+                const chat = await newChat({ model: 'qwen2.5-coder:7b', skills: ['anthropic-pdf'] });
+                const turn = async (input, answer) => {
+                    state.toolPlan = [[['run_program', input]]];
+                    state.chatCalls = [];
+                    const pending = send(chat.id, { content: 'make a summary' });
+                    for (let tries = 0; tries < 200 && !waitingPermissions().some((waiting) => waiting.chatId === chat.id); tries += 1) await wait(25);
+                    const waiting = waitingPermissions().find((one) => one.chatId === chat.id);
+                    expect(waiting).toBeTruthy();
+                    expect((await post(`/chats/${chat.id}/permission`, { id: waiting.id, answer })).status).toBe(200);
+                    await pending;
+                    return state.chatCalls[1].messages.at(-1).content;
+                };
+                const work = { language: 'python', code: 'print("made it")', files: ['/docs/report.pdf'] };
+
+                // It changes the person's files, so it waits for them; refused, no sandbox is started.
+                await turn(work, 'no');
+                expect(made).toHaveLength(0);
+
+                // Allowed: a sandbox starts from the prepared snapshot with the network shut, the person's file and the
+                // program go in, the program runs, what it made comes back and is saved beside the file, and the sandbox goes.
+                const told = await turn(work, 'once');
+                expect(made).toEqual([expect.objectContaining({ snapshotName: 'mollama-skills', networkPolicy: { type: 'deny-all' } })]);
+                expect(sent.map((one) => one.where)).toEqual(['/root/work/report.pdf', '/root/job/main.py']);
+                expect(sent[0].data).toBe(fsFiles['/docs/report.pdf'].bytes.toString());
+                expect(sent[1].data).toBe('print("made it")');
+                expect(lines.find((line) => line.includes('timeout'))).toMatch(/^cd \/root\/work && export .*timeout -k 5 300 python \/root\/job\/main\.py$/);
+                expect(lines.join('\n')).not.toMatch(/rnd_test|tea-test/);
+                expect(uploads).toEqual([{ folder: '/docs', paths: '["out/summary.pdf","notes.txt"]', conflict: 'rename' }]);
+                expect(ended).toEqual(['sbx-1']);
+                expect(told).toMatch(/^The python program finished with exit code 0\.\n\nIt printed:\nmade it/);
+                expect(told).toMatch(/Saved in \/docs: out\/summary\.pdf, notes\.txt\./);
+                const offered = state.chatCalls[0].tools.find((tool) => tool.function.name === 'run_program');
+                expect(offered.function.description).toMatch(/no network/);
+                expect(offered.function.description).toMatch(/PDF in \/root\/skills\/pdf/);
+
+                // A sandbox that cannot start, and a run that breaks, each say nothing was run; a started one still goes.
+                fault = 'start';
+                expect(await turn(work, 'once')).toBe('Nothing was run. A sandbox could not be started: quota reached');
+                fault = 'run';
+                expect(await turn(work, 'once')).toBe('Nothing was run. stream lost');
+                expect(ended).toEqual(['sbx-1', 'sbx-2']);
+                fault = null;
+                expect(await turn({ language: 'ruby', code: 'puts 1' }, 'once')).toMatch(/^Nothing was run\. Say what the program is written in/);
+
+                // With sandboxes set up, a skill whose files are in the snapshot lacks nothing.
+                const lacks = async (id) => (await get('/skills')).data.skills.find((skill) => skill.id === id).needs;
+                expect(await lacks('anthropic-pdf')).toEqual([]);
+                expect(await lacks('anatomy-anatomy')).toEqual([]);
+
+                // Without the settings, nothing is offered, and the skills say what they lack again.
+                delete process.env.SANDBOX_SNAPSHOT;
+                state.toolPlan = [];
+                state.chatCalls = [];
+                await send(chat.id, { content: 'hello' });
+                expect((state.chatCalls[0].tools || []).some((tool) => tool.function.name === 'run_program')).toBe(false);
+                expect(await lacks('anatomy-anatomy')).toEqual(['commands', 'files']);
+            } finally {
+                setSandboxClient(null);
+                setFilesFetch(fakeFilesystemOne);
+                delete process.env.SANDBOX_API_KEY;
+                delete process.env.SANDBOX_WORKSPACE_ID;
+                delete process.env.SANDBOX_SNAPSHOT;
             }
         });
 
