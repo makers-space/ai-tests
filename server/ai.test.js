@@ -733,7 +733,7 @@ const fakePull = (model) => {
     };
 };
 
-const EVERY_CHAT_TOOLS = ['open_component', 'find_skill', 'ask_user', 'date_time', 'calculator', 'read_web_page'];
+const EVERY_CHAT_TOOLS = ['open_component', 'find_skill', 'ask_user', 'save_note', 'date_time', 'calculator', 'read_web_page'];
 const DEFAULT_SKILL_NAMES = SKILLS.filter((skill) => DEFAULT_LIBRARY_SKILLS[skill.id]).map((skill) => skill.name);
 const fakeOllama = (host, signal) => ({
     version: async () => {
@@ -778,6 +778,11 @@ const fakeOllama = (host, signal) => ({
     chat: async (request) => {
         if (!state.up) throw refused();
         if (!state.models.some((existing) => existing.name === request.model)) throw notFound(request.model);
+        // Folding a long chat's memory runs in the background after a reply; it is kept apart from the chat's own calls.
+        if (request.stream === false && String(request.messages?.[0]?.content || '').startsWith('Rewrite the memory')) {
+            (state.memoryCalls ||= []).push(request);
+            return { message: { role: 'assistant', content: state.memoryReply || '- The user asked about ducks.' }, done: true };
+        }
         const lead = request.messages[0];
         // The default skill, the date line and the skill's reminder are taken off, so a test sees only what a chat adds.
         if (lead?.role === 'system') {
@@ -2585,7 +2590,7 @@ describe('Chat endpoints', () => {
             const answers = state.chatCalls[1].messages.filter((message) => message.role === 'tool');
             expect(answers[0].content).toBe(COMPONENT_PAGES.find((page) => page.name === 'Badge').text);
             expect(answers[1].content).toMatch(/4/);
-            expect(answers[2].content).toMatch(/^There is no function called fly_to_the_moon\. The functions you can call are: open_component, open_skill_file, open_skill, find_skill, ask_user, date_time, calculator, read_web_page\.$/);
+            expect(answers[2].content).toMatch(/^There is no function called fly_to_the_moon\. The functions you can call are: open_component, open_skill_file, open_skill, find_skill, ask_user, save_note, date_time, calculator, read_web_page\.$/);
             expect(list.at(-1).reply.steps.map(({ tool, failed }) => ({ tool, failed: failed || null }))).toEqual([{ tool: 'Component', failed: null }, { tool: 'Calculator', failed: null }, { tool: 'fly_to_the_moon', failed: 'failed' }]);
             state.toolPlan = [];
         });
@@ -3708,6 +3713,96 @@ describe('Chat endpoints', () => {
         const search = ['web_search', { query: 'duck 3d model' }];
         const fetchPage = ['web_fetch', { url: 'https://models.example/duck' }];
 
+        test('a long chat folds its older messages into a memory, sends the memory and the recent messages, and drops it when an edit reaches back', async () => {
+            const usual = state.contextLength;
+            state.contextLength = 4096;
+            state.memoryCalls = [];
+            state.memoryReply = '- The user is planning a duck pond.\n- The pond is 3 m across.';
+            try {
+                const chat = await newChat({ model: 'qwen2.5-coder:7b' });
+                const say = (n) => `${n} ${'word '.repeat(120)}`;
+                for (const n of [1, 2, 3]) await send(chat.id, { content: say(n) });
+                // Under the threshold, or with nothing older than the last six messages, nothing is folded.
+                expect(state.memoryCalls).toHaveLength(0);
+                await send(chat.id, { content: say(4) });
+                let saved = null;
+                for (let tries = 0; tries < 100; tries += 1) {
+                    saved = await Chat.findById(chat.id);
+                    if (saved.memoryThrough > 0) break;
+                    await wait(20);
+                }
+                // The first exchange is folded, by the chat's own model, with the last six messages kept word for word.
+                expect(saved.memoryThrough).toBe(2);
+                expect(saved.memory).toBe(state.memoryReply);
+                expect(state.memoryCalls).toHaveLength(1);
+                expect(state.memoryCalls[0]).toMatchObject({ model: 'qwen2.5-coder:7b', stream: false });
+                const asked = state.memoryCalls[0].messages[0].content;
+                expect(asked).toMatch(/^Rewrite the memory of this conversation/);
+                expect(asked).toContain(`The messages to add:\nUser: ${say(1).trim()}`);
+                expect(asked).not.toContain('User: 2 ');
+
+                // The next message is sent with the memory, and only the messages after it.
+                state.chatCalls.length = 0;
+                await send(chat.id, { content: say(5) });
+                const sent = state.chatCalls[0].messages;
+                expect(sent[0]).toMatchObject({ role: 'system', content: expect.stringContaining(`Memory of the earlier part of this conversation (those messages are not repeated below):\n${state.memoryReply}`) });
+                expect(sent.filter((message) => message.role === 'user').map((message) => message.content.split(' ')[0])).toEqual(['2', '3', '4', '5']);
+                expect((await get(`/chats/${chat.id}`)).data.chat.memoryThrough).toBeGreaterThanOrEqual(2);
+                expect((await get(`/chats/${chat.id}`)).data.chat.messages).toHaveLength(10);
+
+                // Editing a message the memory covers drops the memory.
+                await send(chat.id, { content: 'new first', editIndex: 0 });
+                const edited = await Chat.findById(chat.id);
+                expect(edited.memoryThrough).toBe(0);
+                expect(edited.memory).toBe('');
+            } finally {
+                state.contextLength = usual;
+                state.memoryReply = null;
+            }
+        });
+
+        test('within a reply, a tool result the model has moved past is put away, and the same call brings it back whole', async () => {
+            await withKey(async () => {
+                // The search repeats the query in each result, so a long query makes a result long enough to put away.
+                const ask = (n) => `duck model ${n} in glTF with a rig and textures`;
+                state.toolPlan = [...[0, 1, 2, 3].map((n) => [['web_search', { query: ask(n) }]]), [['web_search', { query: ask(0) }]]];
+                state.chatReply = 'Here are the ducks.';
+                const chat = await newChat({ model: 'qwen2.5-coder:7b' });
+                const { events: list } = await send(chat.id, { content: 'find duck models' });
+                expect(list.at(-1).type).toBe('done');
+                // The repeated search is not run again.
+                expect(state.searches).toEqual([0, 1, 2, 3].map(ask));
+                const results = state.chatCalls.at(-1).messages.filter((message) => message.role === 'tool');
+                expect(results).toHaveLength(5);
+                // Three steps back or more: put away, saying how to get it back. The last two steps stay whole.
+                expect(results[0].content).toMatch(/^\[Put away to save room: what web_search returned for \{"query":"duck model 0 in glTF with a rig and textures"\}, [\d,]+ characters, read \d steps ago\. Call web_search again with exactly the same input to see it again, or keep what you need with save_note\.\]$/);
+                expect(results[1].content).toMatch(/^\[Put away to save room: what web_search returned for \{"query":"duck model 1 in glTF/);
+                for (const kept of results.slice(2, 4)) expect(kept.content).not.toMatch(/^\[Put away/);
+                // Asked for again, the put-away result comes back whole, not as a reminder.
+                expect(results[4].content).not.toMatch(/^\[Put away|^You already called/);
+                expect(results[4].content).toContain('duck model 0');
+                expect(results[4].content.length).toBeGreaterThan(600);
+            });
+        });
+
+        test('a model keeps notes with save_note: they go with every later message, a key replaces, and empty text removes', async () => {
+            const chat = await newChat({ model: 'qwen2.5-coder:7b' });
+            state.toolPlan = [[['save_note', { key: 'battery', text: '36 V, 14 Ah' }], ['save_note', { key: 'motor', text: '250 W hub' }]]];
+            const { events: first } = await send(chat.id, { content: 'remember the battery and motor' });
+            expect(first.filter((event) => event.type === 'tool').map((event) => event.tool)).toEqual(['Note', 'Note']);
+            expect((await get(`/chats/${chat.id}`)).data.chat.notes.map(({ key, text }) => ({ key, text }))).toEqual([{ key: 'battery', text: '36 V, 14 Ah' }, { key: 'motor', text: '250 W hub' }]);
+
+            state.chatCalls.length = 0;
+            state.toolPlan = [[['save_note', { key: 'battery', text: '48 V, 14 Ah' }], ['save_note', { key: 'motor', text: '' }]]];
+            await send(chat.id, { content: 'it is 48 V, and forget the motor' });
+            // The notes as they stood go with the message; the changes are kept for the next.
+            expect(state.chatCalls[0].messages[0].content).toContain('Notes saved in this chat with save_note:\n- battery: 36 V, 14 Ah\n- motor: 250 W hub');
+            state.chatCalls.length = 0;
+            await send(chat.id, { content: 'thanks' });
+            expect(state.chatCalls[0].messages[0].content).toContain('Notes saved in this chat with save_note:\n- battery: 48 V, 14 Ah');
+            expect(state.chatCalls[0].messages[0].content).not.toContain('motor');
+        });
+
         test('is off without a search address: no tools are offered, the page is told so, and the model gets no extra instruction', async () => {
             const chat = await newChat({ model: 'qwen2.5-coder:7b' });
             await send(chat.id, { content: 'find a duck model' });
@@ -3747,13 +3842,13 @@ describe('Chat endpoints', () => {
                 state.toolsSeen = [];
                 const chat = await newChat({ model: 'qwen2.5-coder:7b' });
                 await send(chat.id, { content: 'find a duck model' });
-                expect(state.toolsSeen[0].map((tool) => tool.function.name)).toEqual(['web_search', 'web_fetch', 'open_component', 'open_skill_file', 'open_skill', 'find_skill', 'ask_user', 'date_time', 'calculator']);
+                expect(state.toolsSeen[0].map((tool) => tool.function.name)).toEqual(['web_search', 'web_fetch', 'open_component', 'open_skill_file', 'open_skill', 'find_skill', 'ask_user', 'save_note', 'date_time', 'calculator']);
 
                 // Switched off for the chat, the search tools go and the built-in reader is back.
                 state.toolsSeen = [];
                 const quiet = await newChat({ model: 'qwen2.5-coder:7b', webSearch: false });
                 await send(quiet.id, { content: 'find a duck model' });
-                expect(state.toolsSeen[0].map((tool) => tool.function.name)).toEqual(['open_component', 'open_skill_file', 'open_skill', 'find_skill', 'ask_user', 'date_time', 'calculator', 'read_web_page']);
+                expect(state.toolsSeen[0].map((tool) => tool.function.name)).toEqual(['open_component', 'open_skill_file', 'open_skill', 'find_skill', 'ask_user', 'save_note', 'date_time', 'calculator', 'read_web_page']);
             });
         });
 
@@ -4093,7 +4188,7 @@ describe('Chat endpoints', () => {
             const bare = await newChat({ model: 'qwen2.5-coder:7b', skills: [], tools: [] });
             await send(bare.id, { content: 'hello' });
             expect(state.chatCalls.at(-1).messages.map((message) => message.role)).toEqual(['user']);
-            expect(state.toolsSeen.at(-1).map((tool) => tool.function.name)).toEqual(['find_skill', 'ask_user', 'date_time', 'calculator', 'read_web_page']);
+            expect(state.toolsSeen.at(-1).map((tool) => tool.function.name)).toEqual(['find_skill', 'ask_user', 'save_note', 'date_time', 'calculator', 'read_web_page']);
 
             const suggested = skills.filter((skill) => skill.suggested);
             expect(suggested.map((skill) => skill.id).sort()).toEqual([...SUGGESTED_SKILLS].sort());
@@ -6308,7 +6403,7 @@ describe('Online model providers', () => {
         expect(call.body.messages.at(-1)).toEqual({ role: 'user', content: 'Say hello' });
         // Besides the conversation, the functions every chat is offered: the search of the skill library and the built-in tools.
         expect(Object.keys(call.body).sort()).toEqual(['messages', 'model', 'stream', 'stream_options', 'tools']);
-        expect(call.body.tools.map((tool) => tool.function.name)).toEqual(['open_component', 'open_skill_file', 'open_skill', 'find_skill', 'ask_user', 'date_time', 'calculator', 'read_web_page']);
+        expect(call.body.tools.map((tool) => tool.function.name)).toEqual(['open_component', 'open_skill_file', 'open_skill', 'find_skill', 'ask_user', 'save_note', 'date_time', 'calculator', 'read_web_page']);
         expect(call.body.options).toBeUndefined();
         expect(call.body.keep_alive).toBeUndefined();
 
@@ -6464,7 +6559,7 @@ describe('Tools in chats', () => {
         state.toolsSeen = [];
         state.toolPlan = [[['calculator', { expression: '6 * 7' }]]];
         const events = await send(chat.id, 'what is six times seven');
-        expect(state.toolsSeen[0].map((tool) => tool.function.name)).toEqual(['open_component', 'open_skill_file', 'open_skill', 'find_skill', 'ask_user', 'date_time', 'calculator', 'read_web_page']);
+        expect(state.toolsSeen[0].map((tool) => tool.function.name)).toEqual(['open_component', 'open_skill_file', 'open_skill', 'find_skill', 'ask_user', 'save_note', 'date_time', 'calculator', 'read_web_page']);
         expect(JSON.stringify(state.chatCalls[0].messages)).not.toContain('You have tools for this chat');
         expect(events.find((event) => event.type === 'tool')).toMatchObject({ tool: 'Calculator', input: '{"expression":"6 * 7"}' });
         expect(toolTurns(state.chatCalls[1])).toEqual([{ role: 'tool', tool_name: 'calculator', content: '42' }]);
