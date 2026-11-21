@@ -13,7 +13,7 @@ import {
     fitModel, rankCatalogue, memoryNeededMb, VERDICTS,
     GenerationQueue, extractText, estimateTokens, setFilesFetch, setFilesWakeMs, setSandboxClient, releaseSandboxes, MAX_ATTACHMENT_BYTES,
     isPublicAddress, setRemoteTransport, MAX_REMOTE_BYTES, setSearchFetch,
-    setToolConnector, ToolSignInError, TOOL_HEALTH, TOOL_CATALOGUE, TOOL_LOCAL_CATALOGUE, CLOUD_PROVIDERS, PROVIDER_HEALTH, setCloudFetch, ollamaOnlineNames, runsOnline, seal, unseal, deviceGateway, DeviceGateway, cloudTitle
+    poolGroups, subnetOf, privateKind, setToolConnector, ToolSignInError, TOOL_HEALTH, TOOL_CATALOGUE, TOOL_LOCAL_CATALOGUE, CLOUD_PROVIDERS, PROVIDER_HEALTH, setCloudFetch, ollamaOnlineNames, runsOnline, seal, unseal, deviceGateway, DeviceGateway, cloudTitle
 } from '../../server/middleware/ai.middleware.js';
 import { Device, Setting, Download, PersonalModel, Chat, Prompt, Guide, GUIDE_STEPS, MANAGER_GUIDE_STEPS, deviceSchemas, modelSchemas, chatSchemas, promptSchemas, ToolServer, TOOL_HEALTH_STATES, toolSchemas, Provider, PROVIDER_HEALTH_STATES, providerSchemas, Skill } from '../../server/models/ai.model.js';
 import { downloads, health, queue, SKILLS, DEFAULT_LIBRARY_SKILLS, COMPONENT_PAGES, COMPONENT_VALUES_PAGE, componentFaults, rankSkills, writtenToolCalls, BUILTIN_TOOLS, waitingPermissions, todayLine, SKILL_SOURCES, MAX_CHAT_SKILLS, SUGGESTED_SKILLS, setHairlineWait, setToolCallLimit, skillLinks } from '../../server/controllers/ai.controller.js';
@@ -5422,7 +5422,7 @@ describe('Linked devices', () => {
     const open = [];
 
     // Stands in for the desktop app: connects, says hello, and answers what the server asks of it.
-    const fakeApp = (deviceId, key, { holdPull = false } = {}) => new Promise((resolve) => {
+    const fakeApp = (deviceId, key, { holdPull = false, network = null } = {}) => new Promise((resolve) => {
         const ws = new WebSocket(`ws://localhost:${testStartup.port}/devices`);
         const held = [];
         const app = { ws, welcomed: false, requests: [], closed: new Promise((done) => ws.addEventListener('close', done)), release: () => held.splice(0).forEach((answer) => answer()) };
@@ -5437,7 +5437,7 @@ describe('Linked devices', () => {
                 return resolve(app);
             }
             if (message.type === 'ask') {
-                return send({ id: message.id, type: 'answer', data: message.what === 'disk' ? { diskFreeMb: 4242, diskTotalMb: 9000 } : { ...hardware, memoryMb: 32768 } });
+                return send({ id: message.id, type: 'answer', data: message.what === 'disk' ? { diskFreeMb: 4242, diskTotalMb: 9000 } : { ...hardware, memoryMb: 32768, ...(network ? { network } : {}) } });
             }
             if (message.type !== 'request') return undefined;
             app.requests.push(`${message.method} ${message.path}`);
@@ -5465,6 +5465,64 @@ describe('Linked devices', () => {
         return { id: response.data.device.id, key: response.data.key };
     };
     const listed = async () => (await client.get('/api/v1/devices')).data.devices;
+    test('which computers can pool is worked out from their private addresses: same home network or a direct cable, never a Public network', () => {
+        expect(subnetOf('10.0.0.135', 24)).toBe('10.0.0.0/24');
+        expect(subnetOf('172.26.140.9', 20)).toBe('172.26.128.0/20');
+        expect(subnetOf('169.254.40.2', 16)).toBe('169.254.0.0/16');
+        expect(subnetOf('not an address', 24)).toBeNull();
+        expect(['10.1.2.3', '172.16.0.1', '172.32.0.1', '192.168.1.5', '169.254.9.9', '8.8.8.8'].map(privateKind)).toEqual(['home', 'home', null, 'home', 'cable', null]);
+        const pc = (id, publicAddress, addresses, more = {}) => ({ id, name: id, online: true, paused: false, publicAddress, hardware: { memoryMb: 32768, gpuMemoryMb: 8192, network: { addresses } }, ...more });
+        const { groups, left } = poolGroups([
+            pc('pc', '1.1.1.1', [{ address: '10.0.0.135', prefix: 24, wired: false }, { address: '169.254.1.1', prefix: 16, wired: true }]),
+            pc('mac', '1.1.1.1', [{ address: '10.0.0.66', prefix: 24, wired: false }, { address: '169.254.1.2', prefix: 16, wired: true }]),
+            pc('away', '2.2.2.2', [{ address: '10.0.0.70', prefix: 24 }]),
+            pc('cafe', '1.1.1.1', [{ address: '10.0.0.80', prefix: 24, category: 'public' }]),
+            pc('asleep', '1.1.1.1', [{ address: '10.0.0.90', prefix: 24 }], { online: false }),
+            pc('resting', '1.1.1.1', [{ address: '10.0.0.91', prefix: 24 }], { paused: true }),
+            { id: 'old', name: 'old', online: true, publicAddress: '1.1.1.1', hardware: { memoryMb: 8192 } }
+        ]);
+        // A direct cable comes first, then the home network; both name the same two computers.
+        expect(groups.map((group) => [group.via, group.network, group.computers.map((one) => one.id)])).toEqual([['cable', '169.254.0.0/16', ['pc', 'mac']], ['home', '10.0.0.0/24', ['pc', 'mac']]]);
+        expect(groups[0]).toMatchObject({ wired: true, combined: { gpuMemoryMb: 16384, memoryMb: 65536 } });
+        // Another home with the same private addresses is not the same network.
+        expect(Object.fromEntries(left.map((one) => [one.id, one.reason]))).toEqual({ away: 'alone', cafe: 'public', asleep: 'offline', resting: 'paused', old: 'update' });
+        expect(left.find((one) => one.id === 'cafe').message).toMatch(/Public/);
+    });
+
+    test('a person sees which of their linked computers can pool, read from what each desktop app reports when it connects', async () => {
+        await testStartup.loginAsUser('admin');
+        const home = (address, extra = {}) => ({ addresses: [{ address, prefix: 24, interface: 'Wi-Fi', wired: false, ...extra }] });
+        const pc = await link('pool-pc');
+        const mac = await link('pool-mac');
+        const cafe = await link('pool-cafe');
+        const old = await link('pool-old');
+        const asleep = await link('pool-asleep');
+        await fakeApp(pc.id, pc.key, { network: home('10.9.0.10') });
+        await fakeApp(mac.id, mac.key, { network: home('10.9.0.20') });
+        await fakeApp(cafe.id, cafe.key, { network: home('10.9.0.30', { category: 'public' }) });
+        await fakeApp(old.id, old.key);
+        let pools = null;
+        for (let tries = 0; tries < 60; tries += 1) {
+            pools = (await client.get('/api/v1/devices/pools')).data;
+            if (pools.groups.some((group) => group.network === '10.9.0.0/24' && group.computers.length === 2)) break;
+            await new Promise((resolve) => setTimeout(resolve, 50));
+        }
+        const group = pools.groups.find((one) => one.network === '10.9.0.0/24');
+        expect(group.computers.map((one) => one.address).sort()).toEqual(['10.9.0.10', '10.9.0.20']);
+        expect(group).toMatchObject({ via: 'home', wired: false });
+        expect(group.combined.memoryMb).toBe(65536);
+        const reason = (id) => pools.left.find((one) => one.id === id)?.reason;
+        expect([reason(cafe.id), reason(old.id), reason(asleep.id)]).toEqual(['public', 'update', 'offline']);
+        // The public address each link came from is never sent to the page.
+        expect(JSON.stringify(pools)).not.toMatch(/publicAddress|127\.0\.0\.1|::1/);
+
+        // Another person sees none of these computers.
+        await testStartup.loginAsUser('user');
+        const theirs = (await client.get('/api/v1/devices/pools')).data;
+        expect(JSON.stringify(theirs)).not.toContain(pc.id);
+        await testStartup.loginAsUser('admin');
+    });
+
     test('a hello that cannot be checked just now asks the app to try again instead of forgetting its link', async () => {
         const gateway = new DeviceGateway();
         const closed = [];
